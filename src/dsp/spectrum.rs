@@ -1,0 +1,168 @@
+//! Windowed real FFT producing a calibrated power spectrum.
+
+use super::window::{coherent_gain, enbw_bins, make_window, WindowKind};
+use realfft::num_complex::Complex;
+use realfft::{RealFftPlanner, RealToComplex};
+use std::sync::Arc;
+
+pub struct Spectrum {
+    fft: Arc<dyn RealToComplex<f32>>,
+    window: Vec<f32>,
+    input: Vec<f32>,
+    output: Vec<Complex<f32>>,
+    scratch: Vec<Complex<f32>>,
+    scale: f32,
+    enbw: f32,
+    size: usize,
+}
+
+impl Spectrum {
+    pub fn new(size: usize, kind: WindowKind) -> Self {
+        let mut planner = RealFftPlanner::<f32>::new();
+        let fft = planner.plan_fft_forward(size);
+        let window = make_window(kind, size);
+        let cg = coherent_gain(&window);
+        let enbw = enbw_bins(&window) as f32;
+        let input = fft.make_input_vec();
+        let output = fft.make_output_vec();
+        let scratch = fft.make_scratch_vec();
+        let amp = 2.0 / (size as f64 * cg);
+        Spectrum {
+            fft,
+            window,
+            input,
+            output,
+            scratch,
+            scale: (amp * amp) as f32,
+            enbw,
+            size,
+        }
+    }
+
+    pub fn size(&self) -> usize {
+        self.size
+    }
+
+    pub fn bins(&self) -> usize {
+        self.size / 2 + 1
+    }
+
+    pub fn enbw(&self) -> f32 {
+        self.enbw
+    }
+
+    /// Power spectrum of `samples` (length `size`) into `out` (length `bins`),
+    /// scaled so a bin-centred sine of amplitude A reads A².
+    pub fn power(&mut self, samples: &[f32], out: &mut [f32]) {
+        debug_assert_eq!(samples.len(), self.size);
+        for ((d, &s), &w) in self.input.iter_mut().zip(samples).zip(&self.window) {
+            *d = s * w;
+        }
+        // Length mismatches are impossible: buffers come from the plan.
+        let _ = self
+            .fft
+            .process_with_scratch(&mut self.input, &mut self.output, &mut self.scratch);
+        let scale = self.scale;
+        for (o, c) in out.iter_mut().zip(&self.output) {
+            *o = c.norm_sqr() * scale;
+        }
+    }
+}
+
+/// Dominant frequency in bins `[lo, hi]`, refined with parabolic interpolation on
+/// the dB magnitude. Returns `(frequency_hz, level_db)` or `None` for silence.
+pub fn peak_frequency(power: &[f32], bin_hz: f32, lo: usize, hi: usize) -> Option<(f32, f32)> {
+    if power.is_empty() {
+        return None;
+    }
+    let hi = hi.min(power.len() - 1);
+    if lo > hi {
+        return None;
+    }
+    let mut k = lo;
+    for i in lo..=hi {
+        if power[i] > power[k] {
+            k = i;
+        }
+    }
+    if power[k] <= 1e-14 {
+        return None;
+    }
+    let db = |i: usize| 10.0 * power[i].max(1e-20).log10();
+    let b = db(k);
+    if k == 0 || k + 1 >= power.len() {
+        return Some((k as f32 * bin_hz, b));
+    }
+    let (a, c) = (db(k - 1), db(k + 1));
+    let denom = a - 2.0 * b + c;
+    let p = if denom.abs() > 1e-9 { (0.5 * (a - c) / denom).clamp(-0.5, 0.5) } else { 0.0 };
+    Some(((k as f32 + p) * bin_hz, b - 0.25 * (a - c) * p))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sine(freq: f32, amp: f32, sr: f32, n: usize) -> Vec<f32> {
+        (0..n)
+            .map(|i| amp * (2.0 * std::f32::consts::PI * freq * i as f32 / sr).sin())
+            .collect()
+    }
+
+    #[test]
+    fn calibrated_amplitude_all_windows() {
+        let n = 2048;
+        let sr = 48000.0;
+        let bin_hz = sr / n as f32;
+        for kind in [
+            WindowKind::Rect,
+            WindowKind::Hann,
+            WindowKind::Hamming,
+            WindowKind::Blackman,
+            WindowKind::BlackmanHarris,
+        ] {
+            let mut s = Spectrum::new(n, kind);
+            let mut p = vec![0.0; s.bins()];
+            s.power(&sine(100.0 * bin_hz, 0.25, sr, n), &mut p);
+            let db = 10.0 * p[100].log10();
+            assert!((db - 20.0 * 0.25f32.log10()).abs() < 0.05, "{kind:?}: {db}");
+        }
+    }
+
+    #[test]
+    fn silence_is_zero() {
+        let mut s = Spectrum::new(512, WindowKind::Hann);
+        let mut p = vec![1.0; s.bins()];
+        s.power(&vec![0.0; 512], &mut p);
+        assert!(p.iter().all(|&v| v == 0.0));
+        assert_eq!(peak_frequency(&p, 10.0, 0, 256), None);
+        assert_eq!(peak_frequency(&[], 10.0, 0, 256), None);
+        assert_eq!(peak_frequency(&p, 10.0, 300, 256), None);
+    }
+
+    #[test]
+    fn dc_and_bins() {
+        let mut s = Spectrum::new(1024, WindowKind::Rect);
+        assert_eq!(s.bins(), 513);
+        assert_eq!(s.size(), 1024);
+        let mut p = vec![0.0; s.bins()];
+        s.power(&vec![0.5; 1024], &mut p);
+        let (k, _) = p.iter().enumerate().fold((0, 0.0), |m, (i, &v)| if v > m.1 { (i, v) } else { m });
+        assert_eq!(k, 0);
+    }
+
+    #[test]
+    fn peak_frequency_interpolates() {
+        let n = 4096;
+        let sr = 48000.0;
+        let mut s = Spectrum::new(n, WindowKind::Hann);
+        let mut p = vec![0.0; s.bins()];
+        for &f in &[440.0f32, 1234.5, 3001.7, 9876.0] {
+            s.power(&sine(f, 0.5, sr, n), &mut p);
+            let (est, db) = peak_frequency(&p, sr / n as f32, 1, s.bins() - 1).unwrap();
+            assert!((est - f).abs() < 1.0, "{f} -> {est}");
+            // Parabolic fit recovers level within the Hann scalloping bound.
+            assert!((db - 20.0 * 0.5f32.log10()).abs() < 1.5, "level {db}");
+        }
+    }
+}
