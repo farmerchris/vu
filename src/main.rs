@@ -70,21 +70,33 @@ fn run() -> Result<()> {
 type Term = Terminal<CrosstermBackend<Stdout>>;
 
 fn setup_terminal(mouse: bool) -> Result<Term> {
-    enable_raw_mode()?;
-    let mut out = stdout();
-    execute!(out, EnterAlternateScreen)?;
-    if mouse {
-        execute!(out, EnableMouseCapture)?;
+    let res = (|| -> Result<Term> {
+        enable_raw_mode()?;
+        let mut out = stdout();
+        execute!(out, EnterAlternateScreen)?;
+        if mouse {
+            execute!(out, EnableMouseCapture)?;
+        }
+        let mut t = Terminal::new(CrosstermBackend::new(out))?;
+        t.hide_cursor()?;
+        t.clear()?;
+        Ok(t)
+    })();
+    if res.is_err() {
+        restore_terminal(mouse);
+        return res;
     }
+    // Only a panic on the UI thread tears down the terminal; worker panics
+    // surface through the source's disconnected channel instead.
+    let main_id = std::thread::current().id();
     let hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        restore_terminal(true);
+        if std::thread::current().id() == main_id {
+            restore_terminal(true);
+        }
         hook(info);
     }));
-    let mut t = Terminal::new(CrosstermBackend::new(out))?;
-    t.hide_cursor()?;
-    t.clear()?;
-    Ok(t)
+    res
 }
 
 fn restore_terminal(mouse: bool) {
@@ -103,18 +115,22 @@ fn run_tui(cli: &Cli, source: Source, mut analyzer: Analyzer) -> Result<()> {
         app.start_recording()?;
     }
     let mouse = !cli.no_mouse;
-    let mut term = setup_terminal(mouse)?;
-    let res = event_loop(&mut term, &mut app, &mut analyzer, &source, cli);
-    restore_terminal(mouse);
-    let saved = app.recorder.as_ref().map(|r| r.path.clone());
-    app.stop_recording()?;
-    if let Some(p) = saved {
+    let res = setup_terminal(mouse).and_then(|mut term| {
+        let r = event_loop(&mut term, &mut app, &mut analyzer, &source, cli);
+        restore_terminal(mouse);
+        r
+    });
+    let finished = app.stop_recording();
+    for p in &app.saved_recordings {
         eprintln!("vu: recorded {}", p.display());
     }
     if let Some(e) = source.control.take_error() {
         eprintln!("vu: {e}");
     }
-    res
+    if let Some(n) = source.dropped_chunks() {
+        eprintln!("vu: {n} audio buffers were dropped because the UI fell behind");
+    }
+    res.and(finished)
 }
 
 fn event_loop(term: &mut Term, app: &mut App, analyzer: &mut Analyzer, source: &Source, cli: &Cli) -> Result<()> {
@@ -168,8 +184,9 @@ fn event_loop(term: &mut Term, app: &mut App, analyzer: &mut Analyzer, source: &
         let now = Instant::now();
         if now >= next_frame {
             if dirty || app.message.is_some() {
+                let t = Instant::now();
                 term.draw(|f| ui::draw(f, app))?;
-                app.fps.tick(Instant::now());
+                app.fps.tick(t, t.elapsed());
                 dirty = false;
                 if app.message.as_ref().is_some_and(|(_, t)| t.elapsed() > Duration::from_secs(5)) {
                     app.message = None;

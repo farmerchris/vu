@@ -12,9 +12,13 @@ use ratatui::widgets::{Block, Widget};
 
 /// Max peak and max RMS (over channels and frames) for frames `[a, b]`.
 pub fn bucket_levels(h: &History, a: usize, b: usize) -> Option<(f32, f32)> {
-    let mut it = h.range(a, b).peekable();
-    it.peek()?;
-    Some(it.fold((FLOOR_DB, FLOOR_DB), |(p, r), f| (p.max(f.max_peak()), r.max(f.max_rms()))))
+    let (mut any, mut p, mut r) = (false, FLOOR_DB, FLOOR_DB);
+    for f in h.range(a, b) {
+        any = true;
+        p = p.max(f.max_peak());
+        r = r.max(f.max_rms());
+    }
+    any.then_some((p, r))
 }
 
 pub fn render(app: &mut App, area: Rect, buf: &mut Buffer) -> Rect {

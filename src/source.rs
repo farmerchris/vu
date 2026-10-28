@@ -7,7 +7,7 @@ use anyhow::{bail, Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use std::io::Read;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -33,6 +33,7 @@ pub struct SourceInfo {
 #[derive(Default)]
 pub struct Control {
     pub paused: AtomicBool,
+    pub dropped: AtomicU64,
     pub stop: AtomicBool,
     pub error: Mutex<Option<String>>,
 }
@@ -58,6 +59,14 @@ pub struct Source {
     pub rx: Receiver<Vec<f32>>,
     pub control: Arc<Control>,
     _stream: Option<cpal::Stream>,
+}
+
+impl Source {
+    /// Number of device buffers dropped because the consumer fell behind, if any.
+    pub fn dropped_chunks(&self) -> Option<u64> {
+        let n = self.control.dropped.load(Ordering::Relaxed);
+        (n > 0).then_some(n)
+    }
 }
 
 impl Drop for Source {
@@ -243,7 +252,32 @@ fn find_device(host: &cpal::Host, want: &str) -> Result<cpal::Device> {
         .with_context(|| format!("no input device matching '{want}' (see --list-devices)"))
 }
 
+/// Print a hint if opening the device stalls, which on macOS usually means the
+/// system is waiting for microphone permission.
+fn stall_hint() -> Arc<AtomicBool> {
+    let done = Arc::new(AtomicBool::new(false));
+    let d = done.clone();
+    thread::spawn(move || {
+        thread::sleep(Duration::from_secs(3));
+        if !d.load(Ordering::Relaxed) {
+            eprintln!(
+                "vu: still waiting for the audio input... if this persists, allow microphone access \
+                 for this terminal (macOS: System Settings > Privacy & Security > Microphone), \
+                 or use -f FILE / -g SIGNAL"
+            );
+        }
+    });
+    done
+}
+
 fn open_device(cli: &Cli) -> Result<Source> {
+    let hint = stall_hint();
+    let res = open_device_inner(cli);
+    hint.store(true, Ordering::Relaxed);
+    res
+}
+
+fn open_device_inner(cli: &Cli) -> Result<Source> {
     let host = cpal::default_host();
     let device = match &cli.device {
         Some(name) => find_device(&host, name)?,
@@ -254,7 +288,7 @@ fn open_device(cli: &Cli) -> Result<Source> {
         Some(sr) => device
             .supported_input_configs()?
             .filter(|c| c.min_sample_rate().0 <= sr && sr <= c.max_sample_rate().0)
-            .filter(|c| cli.channels.map_or(true, |ch| c.channels() as usize == ch))
+            .filter(|c| cli.channels.is_none_or(|ch| c.channels() as usize == ch))
             .max_by_key(|c| c.sample_format() == cpal::SampleFormat::F32)
             .map(|c| c.with_sample_rate(cpal::SampleRate(sr)))
             .with_context(|| format!("'{name}' does not support {sr} Hz"))?,
@@ -313,12 +347,15 @@ where
     T: cpal::SizedSample,
     f32: cpal::FromSample<T>,
 {
+    let drop_ctl = ctl.clone();
     let stream = device.build_input_stream(
         config,
         move |data: &[T], _: &cpal::InputCallbackInfo| {
             let v: Vec<f32> = data.iter().map(|&s| s.to_sample::<f32>()).collect();
-            // Never block the audio thread; drop data if the UI falls far behind.
-            let _ = tx.try_send(v);
+            // Never block the audio thread; drop (and count) data if the UI falls far behind.
+            if tx.try_send(v).is_err() {
+                drop_ctl.dropped.fetch_add(1, Ordering::Relaxed);
+            }
         },
         move |e| ctl.set_error(format!("input stream error: {e}")),
         None,
@@ -327,18 +364,23 @@ where
 }
 
 pub fn list_devices() -> Result<()> {
+    use std::io::Write;
+    let hint = stall_hint();
     let host = cpal::default_host();
     let default = host.default_input_device().and_then(|d| d.name().ok());
     println!("Input devices ({}):", host.id().name());
     for (i, d) in host.input_devices()?.enumerate() {
         let name = d.name().unwrap_or_else(|_| "?".into());
         let mark = if Some(&name) == default.as_ref() { "*" } else { " " };
+        print!(" {mark} {i:>2}: {name}  ");
+        let _ = std::io::stdout().flush();
         let cfg = d
             .default_input_config()
             .map(|c| format!("{} Hz, {} ch, {:?}", c.sample_rate().0, c.channels(), c.sample_format()))
             .unwrap_or_else(|e| format!("unavailable: {e}"));
-        println!(" {mark} {i:>2}: {name}  [{cfg}]");
+        println!("[{cfg}]");
     }
+    hint.store(true, Ordering::Relaxed);
     println!("\n* = default. Select with --device <index or name substring>.");
     Ok(())
 }
@@ -360,7 +402,7 @@ mod tests {
         let t = Instant::now();
         p.wait(500);
         let e = t.elapsed().as_secs_f64();
-        assert!(e >= 0.045 && e < 0.5, "{e}");
+        assert!((0.045..0.5).contains(&e), "{e}");
     }
 
     #[test]

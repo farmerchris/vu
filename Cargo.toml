@@ -24,3 +24,7 @@ codegen-units = 1
 
 [profile.dev]
 opt-level = 1
+
+[[bench]]
+name = "perf"
+harness = false

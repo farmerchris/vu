@@ -141,7 +141,59 @@ pub struct Analyzer {
     pub loudness: LoudnessMeter,
     samples: u64,
     peak_bins: (usize, usize),
+    quant: PowerQuant,
     pub stats: Stats,
+}
+
+/// Table-driven `db_to_q(power_to_db(p))`, bit-identical to the direct form.
+/// Positive f32 bit patterns order like their values, so each quantization step
+/// starts at a fixed bit threshold. A coarse table indexed by exponent and top
+/// mantissa bits (1/16 octave, well under one 0.5 dB step, so at most one
+/// threshold per cell) gives the step at the cell start; one compare finishes.
+struct PowerQuant {
+    /// `thresholds[q]`: smallest bit pattern quantizing to at least `q`.
+    thresholds: [u32; 257],
+    coarse: Box<[u8]>,
+}
+
+impl PowerQuant {
+    const SHIFT: u32 = 19;
+
+    fn reference(bits: u32) -> u8 {
+        db_to_q(power_to_db(f32::from_bits(bits)))
+    }
+
+    fn new() -> Self {
+        let mut thresholds = [u32::MAX; 257];
+        thresholds[0] = 0;
+        let top = f32::INFINITY.to_bits();
+        for (q, t) in thresholds.iter_mut().enumerate().take(256).skip(1) {
+            if Self::reference(top) < q as u8 {
+                continue;
+            }
+            let (mut lo, mut hi) = (0u32, top);
+            while lo < hi {
+                let mid = lo + (hi - lo) / 2;
+                if Self::reference(mid) >= q as u8 {
+                    hi = mid;
+                } else {
+                    lo = mid + 1;
+                }
+            }
+            *t = lo;
+        }
+        let coarse = (0..=top >> Self::SHIFT).map(|i| Self::reference(i << Self::SHIFT)).collect();
+        PowerQuant { thresholds, coarse }
+    }
+
+    #[inline]
+    fn quantize(&self, p: f32) -> u8 {
+        let bits = p.to_bits();
+        match self.coarse.get((bits >> Self::SHIFT) as usize) {
+            Some(&q) if p > 0.0 => q + (bits >= self.thresholds[q as usize + 1]) as u8,
+            _ => Self::reference(bits),
+        }
+    }
 }
 
 impl Analyzer {
@@ -172,6 +224,7 @@ impl Analyzer {
             loudness: LoudnessMeter::new(cfg.sample_rate, cfg.channels),
             samples: 0,
             peak_bins,
+            quant: PowerQuant::new(),
             stats: Stats::new(cfg.channels, bins),
             bands,
             spectrum,
@@ -205,12 +258,10 @@ impl Analyzer {
                         self.hop_peak[c] = a;
                     }
                     self.hop_sumsq[c] += (s as f64) * (s as f64);
-                    if a >= CLIP_LEVEL {
-                        self.stats.clipped[c] += 1;
-                    }
                 }
                 if a >= CLIP_LEVEL {
                     self.hop_clip = true;
+                    self.stats.clipped[c] += 1;
                 }
                 if a > self.stats.peak[c] {
                     self.stats.peak[c] = a;
@@ -249,7 +300,7 @@ impl Analyzer {
             *acc += p as f64;
         }
         self.stats.spectra += 1;
-        let spectrum: Box<[u8]> = self.power.iter().map(|&p| db_to_q(power_to_db(p))).collect();
+        let spectrum: Box<[u8]> = self.power.iter().map(|&p| self.quant.quantize(p)).collect();
         self.bands.compute(&self.power, self.spectrum.enbw(), &mut self.band_db);
         let bands: Box<[u8]> = self.band_db.iter().map(|&d| db_to_q(d)).collect();
         let peak_freq = peak_frequency(&self.power, self.cfg.bin_hz(), self.peak_bins.0, self.peak_bins.1);
@@ -398,7 +449,7 @@ pub mod tests {
     #[test]
     fn peak_decay_falls_back() {
         let mut data = stereo_sine(1000.0, 1.0, 1.0, 4800);
-        data.extend(std::iter::repeat(0.0).take(2 * 48000));
+        data.extend(std::iter::repeat_n(0.0, 2 * 48000));
         let (_, frames) = run(config(2), &data);
         let last = frames.last().unwrap();
         assert_eq!(last.peak[0], FLOOR_DB);
@@ -444,6 +495,41 @@ pub mod tests {
         let (a, frames) = run(config(ch), &data);
         assert_eq!(frames[0].channels as usize, MAX_CHANNELS);
         assert!((a.stats.peak[9] - 0.5).abs() < 1e-6);
+        // Clipping is counted on unmetered channels too.
+        let data: Vec<f32> = (0..4096 * ch).map(|i| if i % ch == 9 { 1.0 } else { 0.0 }).collect();
+        let (a, _) = run(config(ch), &data);
+        assert_eq!(a.stats.clipped[9], 4096);
+    }
+
+    #[test]
+    fn power_quant_matches_direct() {
+        let pq = PowerQuant::new();
+        let check = |b: u32| assert_eq!(pq.quantize(f32::from_bits(b)), PowerQuant::reference(b), "bits {b:#x}");
+        for i in 0..pq.coarse.len() as u32 - 1 {
+            let (a, b) = (i << PowerQuant::SHIFT, ((i + 1) << PowerQuant::SHIFT) - 1);
+            assert!(PowerQuant::reference(b) - PowerQuant::reference(a) <= 1, "cell {i}");
+        }
+        for b in (0..=f32::INFINITY.to_bits()).step_by(4099) {
+            check(b);
+        }
+        for &t in &pq.thresholds[1..256] {
+            for b in t.saturating_sub(2)..=t.saturating_add(2).min(f32::INFINITY.to_bits()) {
+                check(b);
+            }
+        }
+        for p in [0.0f32, -0.0, -1.0, f32::NAN, f32::INFINITY, f32::MIN_POSITIVE, 1e-12, 1.0, 1e3] {
+            assert_eq!(pq.quantize(p), db_to_q(power_to_db(p)), "{p}");
+        }
+    }
+
+    /// Every positive f32; run with `cargo test --release -- --ignored`.
+    #[test]
+    #[ignore]
+    fn power_quant_exhaustive() {
+        let pq = PowerQuant::new();
+        for b in 0..=f32::INFINITY.to_bits() {
+            assert_eq!(pq.quantize(f32::from_bits(b)), PowerQuant::reference(b), "bits {b:#x}");
+        }
     }
 
     #[test]

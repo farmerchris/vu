@@ -225,10 +225,14 @@ fn render_status(app: &mut App, area: Rect, buf: &mut Buffer) {
             spans.push(Span::styled(format!("  {msg}"), Style::default().fg(Color::LightBlue)));
         }
     }
+    let dropped = app.control.dropped.load(std::sync::atomic::Ordering::Relaxed);
+    if dropped > 0 {
+        spans.push(Span::styled(format!("  {dropped} buffers dropped"), Style::default().fg(Color::LightRed)));
+    }
     if let Some(e) = app.control.error.lock().ok().and_then(|g| g.clone()) {
         spans.push(Span::styled(format!("  {e}"), Style::default().fg(Color::Red)));
     }
-    let right = format!("{:.0} fps  ? help ", app.fps.fps);
+    let right = format!("{} fps {:.1} ms  ? help ", app.fps.fps, app.fps.draw_ms);
     Paragraph::new(Line::from(spans)).render(area, buf);
     let rw = right.chars().count() as u16;
     if area.width > rw {

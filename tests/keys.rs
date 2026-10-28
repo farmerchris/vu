@@ -1,0 +1,335 @@
+//! Keyboard handling tests driven through App::handle_event.
+
+use clap::Parser;
+use std::sync::Arc;
+use vu::analyzer::{Analyzer, AnalyzerConfig};
+use vu::app::App;
+use vu::cli::Cli;
+use vu::generator::{parse_spec, Generator};
+use vu::source::{Control, SourceInfo, SourceKind};
+use vu::ui::colormap::ColorMode;
+
+const SR: u32 = 48_000;
+
+/// Build an app fed with `secs` seconds of a test signal (0.0 = empty history).
+fn make_app(args: &[&str], channels: usize, secs: f64) -> App {
+    let cli = Cli::try_parse_from(std::iter::once("vu").chain(args.iter().copied())).unwrap();
+    cli.validate().unwrap();
+    let mut analyzer = Analyzer::new(AnalyzerConfig {
+        sample_rate: SR,
+        channels,
+        fft_size: cli.fft_size,
+        hop: cli.hop(),
+        window: cli.window,
+        weighting: cli.weighting,
+        bands: cli.bands,
+        min_freq: cli.min_freq,
+        max_freq: cli.max_freq,
+        rms_tau: cli.rms_time / 1000.0,
+        peak_decay_db_s: cli.peak_decay,
+        spectrum_channel: cli.channel.map(|c| c - 1),
+    });
+    let info = SourceInfo {
+        name: "test-gen".into(),
+        sample_rate: SR,
+        channels,
+        total_frames: None,
+        kind: SourceKind::Generator,
+    };
+    let mut app = App::new(&cli, info, &analyzer, Arc::new(Control::default()), ColorMode::TrueColor);
+    let mut gen = Generator::new(parse_spec("sweep:50:15000:2:-10").unwrap(), SR);
+    let total = (secs * SR as f64) as usize;
+    let mut done = 0;
+    while done < total {
+        let n = (total - done).min(4096);
+        let mut chunk = vec![0.0f32; n * channels];
+        gen.fill(&mut chunk, channels);
+        analyzer.push(&chunk, |f| app.history.push(f));
+        done += n;
+    }
+    app
+}
+
+use ratatui::backend::TestBackend;
+use ratatui::crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use ratatui::Terminal;
+use std::sync::atomic::Ordering;
+use vu::app::Action;
+use vu::cli::Panel;
+use vu::dsp::scale::FreqScale;
+use vu::ui::colormap::ColorMap;
+
+fn key(app: &mut App, code: KeyCode) -> Action {
+    app.handle_event(Event::Key(KeyEvent::new(code, KeyModifiers::NONE)))
+}
+
+fn mod_key(app: &mut App, code: KeyCode, m: KeyModifiers) -> Action {
+    app.handle_event(Event::Key(KeyEvent::new(code, m)))
+}
+
+/// App with data and a laid-out view (width set by drawing once).
+fn ready(args: &[&str]) -> App {
+    let mut all = vec!["--zoom", "1"];
+    all.extend_from_slice(args);
+    let mut app = make_app(&all, 2, 2.0);
+    let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+    term.draw(|f| vu::ui::draw(f, &mut app)).unwrap();
+    app
+}
+
+#[test]
+fn left_unfollows_and_moves_one_frame() {
+    let mut app = ready(&[]);
+    let last = app.history.last().unwrap();
+    assert!(app.view.follow);
+    assert_eq!(key(&mut app, KeyCode::Left), Action::Redraw);
+    assert!(!app.view.follow);
+    assert_eq!(app.view.cursor, last - 1);
+}
+
+#[test]
+fn right_moves_and_refollows_at_live_edge() {
+    let mut app = ready(&[]);
+    let last = app.history.last().unwrap();
+    for _ in 0..3 {
+        key(&mut app, KeyCode::Left);
+    }
+    assert_eq!(app.view.cursor, last - 3);
+    key(&mut app, KeyCode::Right);
+    assert_eq!(app.view.cursor, last - 2);
+    assert!(!app.view.follow);
+    key(&mut app, KeyCode::Right);
+    key(&mut app, KeyCode::Right);
+    assert!(app.view.follow);
+    assert_eq!(app.view.cursor, last);
+}
+
+#[test]
+fn right_while_following_is_noop() {
+    let mut app = ready(&[]);
+    key(&mut app, KeyCode::Right);
+    assert!(app.view.follow);
+}
+
+#[test]
+fn shift_left_moves_ten() {
+    let mut app = ready(&[]);
+    let last = app.history.last().unwrap();
+    mod_key(&mut app, KeyCode::Left, KeyModifiers::SHIFT);
+    assert_eq!(app.view.cursor, last - 10);
+    mod_key(&mut app, KeyCode::Right, KeyModifiers::SHIFT);
+    assert!(app.view.follow, "shift+right by 10 reaches the live edge");
+}
+
+#[test]
+fn page_up_and_down() {
+    let mut app = ready(&[]);
+    let last = app.history.last().unwrap();
+    let span = app.view.span();
+    key(&mut app, KeyCode::PageUp);
+    assert!(!app.view.follow);
+    assert_eq!(app.view.cursor, last.saturating_sub(span).max(app.history.first()));
+    key(&mut app, KeyCode::PageDown);
+    assert!(app.view.follow, "paging back to the end resumes following");
+    assert_eq!(app.view.cursor, last);
+}
+
+#[test]
+fn home_and_end() {
+    let mut app = ready(&[]);
+    let first = app.history.first();
+    let last = app.history.last().unwrap();
+    key(&mut app, KeyCode::Home);
+    assert!(!app.view.follow);
+    assert_eq!(app.view.cursor, first);
+    assert_eq!(app.view.cursor_column(), Some(0));
+    key(&mut app, KeyCode::End);
+    assert!(app.view.follow);
+    assert_eq!(app.view.cursor, last);
+}
+
+#[test]
+fn left_at_start_is_clamped() {
+    let mut app = ready(&[]);
+    key(&mut app, KeyCode::Home);
+    for _ in 0..5 {
+        key(&mut app, KeyCode::Left);
+    }
+    assert_eq!(app.view.cursor, app.history.first());
+}
+
+#[test]
+fn space_toggles_hold() {
+    let mut app = ready(&[]);
+    let last = app.history.last().unwrap();
+    key(&mut app, KeyCode::Char(' '));
+    assert!(!app.view.follow);
+    assert_eq!(app.view.cursor, last);
+    key(&mut app, KeyCode::Char(' '));
+    assert!(app.view.follow);
+}
+
+#[test]
+fn plus_minus_zoom() {
+    let mut app = ready(&[]);
+    assert_eq!(app.view.zoom, 1);
+    key(&mut app, KeyCode::Char('-'));
+    key(&mut app, KeyCode::Char('-'));
+    assert_eq!(app.view.zoom, 4);
+    key(&mut app, KeyCode::Char('+'));
+    assert_eq!(app.view.zoom, 2);
+    key(&mut app, KeyCode::Char('+'));
+    key(&mut app, KeyCode::Char('+'));
+    assert_eq!(app.view.zoom, 1, "zoom floors at 1");
+    for _ in 0..20 {
+        key(&mut app, KeyCode::Char('-'));
+    }
+    assert_eq!(app.view.zoom, vu::app::MAX_ZOOM);
+}
+
+#[test]
+fn zoomed_left_steps_by_zoom_frames() {
+    let mut app = ready(&[]);
+    let last = app.history.last().unwrap();
+    key(&mut app, KeyCode::Char('-'));
+    key(&mut app, KeyCode::Char('-'));
+    key(&mut app, KeyCode::Left);
+    assert_eq!(app.view.cursor, last - 4);
+}
+
+#[test]
+fn panel_toggles() {
+    let mut app = ready(&[]);
+    assert!(app.display.shown(Panel::Meter));
+    key(&mut app, KeyCode::Char('1'));
+    assert!(!app.display.shown(Panel::Meter));
+    key(&mut app, KeyCode::Char('1'));
+    assert!(app.display.shown(Panel::Meter));
+    key(&mut app, KeyCode::Char('2'));
+    assert!(!app.display.shown(Panel::Eq));
+    key(&mut app, KeyCode::Char('3'));
+    assert!(!app.display.shown(Panel::Spectrogram));
+    key(&mut app, KeyCode::Char('4'));
+    assert!(!app.display.shown(Panel::Timeline));
+    // Only the meter is left: it cannot be hidden.
+    key(&mut app, KeyCode::Char('1'));
+    assert!(app.display.shown(Panel::Meter));
+    assert_eq!(app.display.panels.iter().filter(|&&b| b).count(), 1);
+    key(&mut app, KeyCode::Char('4'));
+    assert!(app.display.shown(Panel::Timeline));
+}
+
+#[test]
+fn last_visible_panel_survives_every_order() {
+    for first in ['1', '2', '3', '4'] {
+        let mut app = ready(&["-p", "eq,timeline"]);
+        let _ = first;
+        key(&mut app, KeyCode::Char('2'));
+        key(&mut app, KeyCode::Char('4'));
+        assert!(app.display.shown(Panel::Timeline));
+        assert!(!app.display.shown(Panel::Eq));
+    }
+}
+
+#[test]
+fn colormap_cycles() {
+    let mut app = ready(&[]);
+    let start = app.display.colormap;
+    key(&mut app, KeyCode::Char('c'));
+    assert_ne!(app.display.colormap, start);
+    assert_eq!(app.display.colormap, start.next());
+    assert!(app.message.is_some());
+    for _ in 0..4 {
+        key(&mut app, KeyCode::Char('c'));
+    }
+    assert_eq!(app.display.colormap, start, "five maps cycle back");
+    let _ = ColorMap::Magma;
+}
+
+#[test]
+fn freq_scale_cycles() {
+    let mut app = ready(&[]);
+    let start = app.display.freq_scale;
+    key(&mut app, KeyCode::Char('s'));
+    assert_eq!(app.display.freq_scale, start.next());
+    key(&mut app, KeyCode::Char('s'));
+    key(&mut app, KeyCode::Char('s'));
+    assert_eq!(app.display.freq_scale, start);
+    let _ = FreqScale::Log;
+}
+
+#[test]
+fn brackets_adjust_db_floor() {
+    let mut app = ready(&[]);
+    let (lo, hi) = (app.display.db_min, app.display.db_max);
+    key(&mut app, KeyCode::Char('['));
+    assert_eq!(app.display.db_min, lo - 6.0);
+    key(&mut app, KeyCode::Char(']'));
+    assert_eq!(app.display.db_min, lo);
+    for _ in 0..100 {
+        key(&mut app, KeyCode::Char('['));
+    }
+    assert_eq!(app.display.db_min, -120.0);
+    for _ in 0..100 {
+        key(&mut app, KeyCode::Char(']'));
+    }
+    assert!(app.display.db_min <= app.display.db_max - 12.0);
+    assert_eq!(app.display.db_max, hi);
+}
+
+#[test]
+fn help_toggles_and_esc_closes_it() {
+    let mut app = ready(&[]);
+    key(&mut app, KeyCode::Char('?'));
+    assert!(app.show_help);
+    assert_eq!(key(&mut app, KeyCode::Esc), Action::Redraw);
+    assert!(!app.show_help);
+    key(&mut app, KeyCode::Char('?'));
+    key(&mut app, KeyCode::Char('?'));
+    assert!(!app.show_help);
+    // Esc with no help open quits.
+    assert_eq!(key(&mut app, KeyCode::Esc), Action::Quit);
+}
+
+#[test]
+fn quit_keys() {
+    let mut app = ready(&[]);
+    assert_eq!(key(&mut app, KeyCode::Char('q')), Action::Quit);
+    assert_eq!(mod_key(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL), Action::Quit);
+    // Plain 'c' is the colormap key, not quit.
+    assert_eq!(key(&mut app, KeyCode::Char('c')), Action::Redraw);
+}
+
+#[test]
+fn p_toggles_pause() {
+    let mut app = ready(&[]);
+    assert!(!app.control.paused.load(Ordering::Relaxed));
+    key(&mut app, KeyCode::Char('p'));
+    assert!(app.control.paused.load(Ordering::Relaxed));
+    assert!(app.paused());
+    key(&mut app, KeyCode::Char('p'));
+    assert!(!app.control.paused.load(Ordering::Relaxed));
+}
+
+#[test]
+fn unknown_key_and_release_do_nothing() {
+    let mut app = ready(&[]);
+    assert_eq!(key(&mut app, KeyCode::Char('z')), Action::None);
+    let mut ev = KeyEvent::new(KeyCode::Left, KeyModifiers::NONE);
+    ev.kind = KeyEventKind::Release;
+    assert_eq!(app.handle_event(Event::Key(ev)), Action::None);
+    assert!(app.view.follow);
+    assert_eq!(app.handle_event(Event::Resize(10, 10)), Action::Redraw);
+}
+
+#[test]
+fn keys_on_empty_history_do_not_panic() {
+    let mut app = make_app(&[], 2, 0.0);
+    for code in [
+        KeyCode::Left, KeyCode::Right, KeyCode::PageUp, KeyCode::PageDown, KeyCode::Home,
+        KeyCode::End, KeyCode::Char(' '), KeyCode::Char('+'), KeyCode::Char('-'),
+    ] {
+        key(&mut app, code);
+    }
+    assert!(app.view.follow);
+}

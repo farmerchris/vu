@@ -1,9 +1,11 @@
 //! Scrolling spectrogram. Each cell holds two pixels (upper-half block with
-//! fg = top, bg = bottom). Pixel-to-bin ranges and the colour LUT are cached.
+//! fg = top, bg = bottom). Pixel-to-bin ranges, the colour LUT and each visible
+//! frame's folded pixel column are cached, so a draw only folds new frames.
 
 use super::colormap::{build_lut, ColorMap, ColorMode};
 use super::{fmt_freq, split_axis, title};
 use crate::app::App;
+use crate::analyzer::Frame;
 use crate::dsp::scale::{pixel_bin_ranges, to_unit, FreqScale};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -17,6 +19,42 @@ pub struct SpecCache {
     lut_key: Option<(ColorMap, ColorMode, u32, u32)>,
     pub lut: Vec<Color>,
     col: Vec<u8>,
+    pixels: PixelCache,
+}
+
+/// Folded pixel columns of recent frames in a ring addressed by frame index.
+#[derive(Default)]
+struct PixelCache {
+    key: Option<(usize, FreqScale, u32, u32, usize)>,
+    pixels: usize,
+    /// Frame index and time bits held by each slot.
+    tags: Vec<(usize, u64)>,
+    data: Vec<u8>,
+}
+
+impl PixelCache {
+    /// Make room for `slots` frames of `pixels` each, dropping everything on a change.
+    fn prepare(&mut self, key: (usize, FreqScale, u32, u32, usize), pixels: usize, slots: usize) {
+        if self.key != Some(key) || self.pixels != pixels || self.tags.len() < slots {
+            self.key = Some(key);
+            self.pixels = pixels;
+            self.tags = vec![(usize::MAX, 0); slots.max(1)];
+            self.data = vec![0; self.tags.len() * pixels];
+        }
+    }
+
+    /// Pixel column of frame `i`, folding it on a miss.
+    fn column(&mut self, i: usize, f: &Frame, ranges: &[(u32, u32)]) -> &[u8] {
+        let slot = i % self.tags.len();
+        let tag = (i, f.time.to_bits());
+        let px = &mut self.data[slot * self.pixels..(slot + 1) * self.pixels];
+        if self.tags[slot] != tag {
+            px.fill(0);
+            fold_column(&f.spectrum, ranges, px);
+            self.tags[slot] = tag;
+        }
+        px
+    }
 }
 
 impl SpecCache {
@@ -25,6 +63,7 @@ impl SpecCache {
         if self.range_key != Some(key) {
             self.ranges = pixel_bin_ranges(scale, pixels, min as f64, max as f64, bin_hz as f64, bins);
             self.range_key = Some(key);
+            self.pixels.key = None;
         }
         &self.ranges
     }
@@ -94,8 +133,11 @@ pub fn render(app: &mut App, area: Rect, buf: &mut Buffer) -> Rect {
     let cache = &mut app.spec_cache;
     cache.ensure_lut(d.colormap, d.color_mode, d.db_min, d.db_max);
     cache.ranges(pixels, d.freq_scale, a.min_freq, a.max_freq, a.bin_hz, a.bins);
-    let SpecCache { ranges, lut, col, .. } = cache;
+    let SpecCache { ranges, lut, col, pixels: pcache, range_key, .. } = cache;
     col.resize(pixels, 0);
+    if let Some(key) = *range_key {
+        pcache.prepare(key, pixels, v.span());
+    }
 
     let first = app.history.first();
     let cursor_col = v.cursor_column();
@@ -104,8 +146,10 @@ pub fn render(app: &mut App, area: Rect, buf: &mut Buffer) -> Rect {
         let fs = (fe + 1).saturating_sub(v.zoom).max(first);
         col.fill(0);
         let mut any = false;
-        for fr in app.history.range(fs, fe) {
-            fold_column(&fr.spectrum, ranges, col);
+        for (i, fr) in (fs..).zip(app.history.range(fs, fe)) {
+            for (o, &p) in col.iter_mut().zip(pcache.column(i, fr, ranges)) {
+                *o = (*o).max(p);
+            }
             any = true;
         }
         if !any {

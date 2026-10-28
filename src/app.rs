@@ -58,6 +58,12 @@ impl View {
         self.width.max(1) * self.zoom
     }
 
+    /// End of the zoom bucket containing frame `f`. Anchoring buckets to multiples
+    /// of `zoom` keeps columns stable as live data scrolls in.
+    pub fn bucket_end(&self, f: usize) -> usize {
+        f + (self.zoom - 1 - f % self.zoom)
+    }
+
     /// Re-establish invariants after data arrives or the width changes.
     pub fn sync(&mut self, first: usize, last: Option<usize>) {
         let Some(last) = last else {
@@ -67,12 +73,14 @@ impl View {
         };
         if self.follow {
             self.cursor = last;
-            self.view_end = last;
+            self.view_end = self.bucket_end(last);
             return;
         }
         self.cursor = self.cursor.clamp(first, last);
-        self.view_end = self.view_end.clamp(first, last);
         let span = self.span();
+        let max_end = self.bucket_end(last);
+        // Never scroll back past the oldest frame while there is data to fill the view.
+        self.view_end = self.view_end.clamp((first + span - 1).min(max_end), max_end);
         if self.cursor > self.view_end {
             self.view_end = self.cursor;
         } else if self.cursor + span <= self.view_end {
@@ -145,7 +153,7 @@ impl View {
         if self.follow {
             self.follow = false;
             self.cursor = last;
-            self.view_end = last;
+            self.view_end = self.bucket_end(last);
         }
     }
 
@@ -167,26 +175,26 @@ impl View {
     }
 }
 
-/// Exponentially smoothed frames-per-second estimate.
+/// Redraws in the last second and the most recent draw time.
+#[derive(Default)]
 pub struct FpsMeter {
-    last: Option<Instant>,
-    pub fps: f64,
+    draws: std::collections::VecDeque<Instant>,
+    pub fps: usize,
+    pub draw_ms: f64,
 }
 
 impl FpsMeter {
     pub fn new() -> Self {
-        FpsMeter { last: None, fps: 0.0 }
+        Self::default()
     }
 
-    pub fn tick(&mut self, now: Instant) {
-        if let Some(prev) = self.last {
-            let dt = now.duration_since(prev).as_secs_f64();
-            if dt > 0.0 {
-                let inst = 1.0 / dt;
-                self.fps = if self.fps == 0.0 { inst } else { self.fps * 0.9 + inst * 0.1 };
-            }
+    pub fn tick(&mut self, now: Instant, draw_time: std::time::Duration) {
+        self.draws.push_back(now);
+        while self.draws.front().is_some_and(|&t| now.duration_since(t) >= std::time::Duration::from_secs(1)) {
+            self.draws.pop_front();
         }
-        self.last = Some(now);
+        self.fps = self.draws.len();
+        self.draw_ms = draw_time.as_secs_f64() * 1000.0;
     }
 }
 
@@ -243,6 +251,7 @@ pub struct App {
     pub ingest_done: bool,
     pub message: Option<(String, Instant)>,
     pub recorder: Option<Recorder>,
+    pub saved_recordings: Vec<PathBuf>,
     record_base: Option<PathBuf>,
     record_format: RecordFormat,
     record_count: usize,
@@ -258,7 +267,9 @@ impl App {
         let frame_dt = cfg.frame_dt();
         let mut cap = (cli.history / frame_dt).ceil() as usize;
         if let (SourceKind::File, Some(total), false) = (info.kind, info.total_frames, cli.looping) {
-            cap = cap.max(total as usize / cfg.hop + 2);
+            // Keep whole files for browsing, up to an hour (~1.3 KB per frame).
+            let hour = (3600.0 / frame_dt) as usize;
+            cap = cap.max((total as usize / cfg.hop + 2).min(hour));
         }
         if let Some(d) = cli.duration {
             cap = cap.max((d / frame_dt).ceil() as usize + 2);
@@ -302,6 +313,7 @@ impl App {
             ingest_done: false,
             message: None,
             recorder: None,
+            saved_recordings: Vec::new(),
             record_base: cli.record.clone(),
             record_format: cli.record_format,
             record_count: 0,
@@ -343,6 +355,7 @@ impl App {
     pub fn stop_recording(&mut self) -> Result<()> {
         if let Some(mut r) = self.recorder.take() {
             r.finish()?;
+            self.saved_recordings.push(r.path.clone());
             let secs = r.samples as f64 / (self.info.channels.max(1) as f64 * self.info.sample_rate as f64);
             self.flash(format!("saved {} ({secs:.1} s)", r.path.display()));
         }
@@ -531,6 +544,22 @@ mod tests {
     }
 
     #[test]
+    fn paging_stops_at_oldest_frame() {
+        let mut v = view(10);
+        v.sync(0, Some(99));
+        for _ in 0..20 {
+            v.apply(Nav::PageLeft, 0, Some(99));
+        }
+        assert_eq!((v.cursor, v.view_end), (0, 9));
+        assert_eq!(v.column_frame(0), Some(0));
+        // With less data than the width, the view stays right-aligned.
+        let mut v = view(10);
+        v.sync(0, Some(4));
+        v.apply(Nav::Home, 0, Some(4));
+        assert_eq!(v.view_end, 4);
+    }
+
+    #[test]
     fn eviction_clamps_cursor() {
         let mut v = view(10);
         v.sync(0, Some(50));
@@ -579,6 +608,22 @@ mod tests {
     }
 
     #[test]
+    fn live_buckets_are_aligned() {
+        let mut v = view(10);
+        v.zoom = 4;
+        v.sync(0, Some(100));
+        assert_eq!(v.view_end, 103);
+        assert_eq!(v.cursor_column(), Some(9));
+        v.sync(0, Some(102));
+        assert_eq!(v.view_end, 103);
+        v.sync(0, Some(104));
+        assert_eq!(v.view_end, 107);
+        v.apply(Nav::ToggleHold, 0, Some(104));
+        assert_eq!((v.cursor, v.view_end), (104, 107));
+        assert_eq!(v.bucket_end(8), 11);
+    }
+
+    #[test]
     fn click_sets_cursor() {
         let mut v = view(10);
         v.sync(0, Some(99));
@@ -602,13 +647,17 @@ mod tests {
 
     #[test]
     fn fps_meter() {
+        use std::time::Duration;
         let mut m = FpsMeter::new();
         let t = Instant::now();
-        m.tick(t);
-        assert_eq!(m.fps, 0.0);
-        m.tick(t + std::time::Duration::from_millis(20));
-        assert!((m.fps - 50.0).abs() < 1e-6);
-        m.tick(t + std::time::Duration::from_millis(30));
-        assert!((m.fps - (50.0 * 0.9 + 100.0 * 0.1)).abs() < 1e-6);
+        for i in 0..90 {
+            m.tick(t + Duration::from_millis(i * 1000 / 60), Duration::from_micros(800));
+        }
+        // 90 draws at 60 Hz: only the last second's worth count.
+        assert_eq!(m.fps, 60);
+        assert!((m.draw_ms - 0.8).abs() < 1e-9);
+        m.tick(t + Duration::from_secs(10), Duration::ZERO);
+        assert_eq!(m.fps, 1);
     }
+
 }

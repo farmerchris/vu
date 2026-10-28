@@ -66,6 +66,14 @@ impl Spectrum {
         for (o, c) in out.iter_mut().zip(&self.output) {
             *o = c.norm_sqr() * scale;
         }
+        // DC and Nyquist have no mirrored negative-frequency half.
+        let n = out.len().min(self.output.len());
+        if n > 0 {
+            out[0] *= 0.25;
+            if self.size.is_multiple_of(2) && n == self.size / 2 + 1 {
+                out[n - 1] *= 0.25;
+            }
+        }
     }
 }
 
@@ -79,10 +87,10 @@ pub fn peak_frequency(power: &[f32], bin_hz: f32, lo: usize, hi: usize) -> Optio
     if lo > hi {
         return None;
     }
-    let mut k = lo;
-    for i in lo..=hi {
-        if power[i] > power[k] {
-            k = i;
+    let (mut k, mut best) = (lo, power[lo]);
+    for (i, &p) in power[lo..=hi].iter().enumerate() {
+        if p > best {
+            (k, best) = (lo + i, p);
         }
     }
     if power[k] <= 1e-14 {
@@ -147,6 +155,8 @@ mod tests {
         assert_eq!(s.size(), 1024);
         let mut p = vec![0.0; s.bins()];
         s.power(&vec![0.5; 1024], &mut p);
+        // A DC offset reads its own power.
+        assert!((p[0] - 0.25).abs() < 1e-6, "{}", p[0]);
         let (k, _) = p.iter().enumerate().fold((0, 0.0), |m, (i, &v)| if v > m.1 { (i, v) } else { m });
         assert_eq!(k, 0);
     }

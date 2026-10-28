@@ -1,5 +1,7 @@
 //! vu — terminal sound meter library: analysis, sources, recording and UI.
 
+#![allow(clippy::needless_range_loop)]
+
 pub mod analyzer;
 pub mod app;
 pub mod cli;

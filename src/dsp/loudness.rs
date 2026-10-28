@@ -43,9 +43,9 @@ impl Biquad {
 
 /// K-weighting stage 1 (high-shelf, head effects) for any sample rate.
 pub fn k_shelf(fs: f64) -> Biquad {
-    let f0 = 1681.974_450_955_533;
+    let f0 = 1681.974450955533;
     let g = 3.999_843_853_973_347;
-    let q = 0.707_175_236_955_419_6;
+    let q = 0.7071752369554196;
     let k = (PI * f0 / fs).tan();
     let vh = 10f64.powf(g / 20.0);
     let vb = vh.powf(0.499_666_774_154_541_6);
