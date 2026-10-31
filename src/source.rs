@@ -59,9 +59,86 @@ pub struct Source {
     pub rx: Receiver<Vec<f32>>,
     pub control: Arc<Control>,
     _stream: Option<cpal::Stream>,
+    device: Option<DeviceParams>,
+}
+
+/// What is needed to reopen a device stream into the same channel.
+struct DeviceParams {
+    device: cpal::Device,
+    config: cpal::StreamConfig,
+    format: cpal::SampleFormat,
+    tx: SyncSender<Vec<f32>>,
+}
+
+/// Watches a live input for digital silence: a run of samples that are all
+/// exactly zero, which a real microphone never produces (even a quiet room has
+/// hiss). It means the device has stopped delivering audio.
+pub struct SilenceWatch {
+    threshold: u64,
+    run: u64,
+    fired: bool,
+}
+
+impl SilenceWatch {
+    /// Fire after `threshold` consecutive zero samples (per channel frame count
+    /// times channels, i.e. interleaved samples).
+    pub fn new(threshold: u64) -> Self {
+        SilenceWatch { threshold: threshold.max(1), run: 0, fired: false }
+    }
+
+    /// Feed a chunk; returns true once each time the zero run reaches the threshold.
+    pub fn feed(&mut self, chunk: &[f32]) -> bool {
+        match chunk.iter().rposition(|&x| x != 0.0) {
+            Some(i) => {
+                self.run = (chunk.len() - 1 - i) as u64;
+                self.fired = false;
+            }
+            None => self.run += chunk.len() as u64,
+        }
+        if !self.fired && self.run >= self.threshold {
+            self.fired = true;
+            return true;
+        }
+        false
+    }
+
+    /// Start counting again (after reopening the device).
+    pub fn reset(&mut self) {
+        self.run = 0;
+        self.fired = false;
+    }
+
+    /// Whether the input is currently silent past the threshold.
+    pub fn silent(&self) -> bool {
+        self.run >= self.threshold
+    }
 }
 
 impl Source {
+    /// Whether this source can be reopened (live devices only).
+    pub fn can_reopen(&self) -> bool {
+        self.device.is_some()
+    }
+
+    /// Close and reopen the device stream, looking the device up again by name
+    /// in case it reconnected. Data keeps arriving on the same channel.
+    pub fn reopen(&mut self) -> Result<()> {
+        let Some(p) = &mut self.device else { bail!("not a live input") };
+        self._stream = None;
+        let host = cpal::default_host();
+        if let Some(d) = host
+            .input_devices()
+            .ok()
+            .and_then(|mut it| it.find(|d| d.name().ok().as_deref() == Some(self.info.name.as_str())))
+        {
+            p.device = d;
+        }
+        let stream = build_any(&p.device, &p.config, p.format, p.tx.clone(), self.control.clone())?;
+        stream.play().context("restarting input stream")?;
+        self._stream = Some(stream);
+        Ok(())
+    }
+
     /// Number of device buffers dropped because the consumer fell behind, if any.
     pub fn dropped_chunks(&self) -> Option<u64> {
         let n = self.control.dropped.load(Ordering::Relaxed);
@@ -171,7 +248,7 @@ fn open_file(path: &Path, fast: bool, looping: bool) -> Result<Source> {
             ctl.set_error(format!("file read error: {e:#}"));
         }
     })?;
-    Ok(Source { info, rx, control, _stream: None })
+    Ok(Source { info, rx, control, _stream: None, device: None })
 }
 
 fn file_thread(
@@ -235,7 +312,7 @@ fn open_generator(spec: &str, sample_rate: u32, channels: usize, fast: bool) -> 
             }
         }
     })?;
-    Ok(Source { info, rx, control, _stream: None })
+    Ok(Source { info, rx, control, _stream: None, device: None })
 }
 
 fn find_device(host: &cpal::Host, want: &str) -> Result<cpal::Device> {
@@ -321,20 +398,31 @@ fn open_device_inner(cli: &Cli) -> Result<Source> {
     };
     let (tx, rx) = sync_channel(1024);
     let control = Arc::new(Control::default());
-    use cpal::SampleFormat as F;
-    let stream = match format {
-        F::F32 => build_stream::<f32>(&device, &config, tx, control.clone())?,
-        F::F64 => build_stream::<f64>(&device, &config, tx, control.clone())?,
-        F::I16 => build_stream::<i16>(&device, &config, tx, control.clone())?,
-        F::I32 => build_stream::<i32>(&device, &config, tx, control.clone())?,
-        F::I8 => build_stream::<i8>(&device, &config, tx, control.clone())?,
-        F::U8 => build_stream::<u8>(&device, &config, tx, control.clone())?,
-        F::U16 => build_stream::<u16>(&device, &config, tx, control.clone())?,
-        F::U32 => build_stream::<u32>(&device, &config, tx, control.clone())?,
-        other => bail!("unsupported sample format {other:?}"),
-    };
+    let stream = build_any(&device, &config, format, tx.clone(), control.clone())?;
     stream.play().context("starting input stream")?;
-    Ok(Source { info, rx, control, _stream: Some(stream) })
+    let device = Some(DeviceParams { device, config, format, tx });
+    Ok(Source { info, rx, control, _stream: Some(stream), device })
+}
+
+fn build_any(
+    device: &cpal::Device,
+    config: &cpal::StreamConfig,
+    format: cpal::SampleFormat,
+    tx: SyncSender<Vec<f32>>,
+    control: Arc<Control>,
+) -> Result<cpal::Stream> {
+    use cpal::SampleFormat as F;
+    Ok(match format {
+        F::F32 => build_stream::<f32>(device, config, tx, control)?,
+        F::F64 => build_stream::<f64>(device, config, tx, control)?,
+        F::I16 => build_stream::<i16>(device, config, tx, control)?,
+        F::I32 => build_stream::<i32>(device, config, tx, control)?,
+        F::I8 => build_stream::<i8>(device, config, tx, control)?,
+        F::U8 => build_stream::<u8>(device, config, tx, control)?,
+        F::U16 => build_stream::<u16>(device, config, tx, control)?,
+        F::U32 => build_stream::<u32>(device, config, tx, control)?,
+        other => bail!("unsupported sample format {other:?}"),
+    })
 }
 
 fn build_stream<T>(
@@ -388,6 +476,27 @@ pub fn list_devices() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn silence_watch_fires_once_per_run() {
+        let mut w = SilenceWatch::new(100);
+        assert!(!w.feed(&[0.0; 60]));
+        assert!(!w.silent());
+        assert!(w.feed(&[0.0; 60]), "120 zeros reach the threshold");
+        assert!(w.silent());
+        assert!(!w.feed(&[0.0; 500]), "fires only once per run");
+        // Any non-zero sample ends the run; trailing zeros start a new one.
+        assert!(!w.feed(&[0.0, 1e-6, 0.0, 0.0]));
+        assert!(!w.silent());
+        assert!(w.feed(&[0.0; 98]), "2 trailing + 98 = 100");
+        w.reset();
+        assert!(!w.silent());
+        assert!(!w.feed(&[0.0; 99]));
+        assert!(w.feed(&[0.0]));
+        // Quiet but real signal never counts as silence.
+        let mut w = SilenceWatch::new(10);
+        assert!(!w.feed(&[1e-7; 1000]));
+    }
 
     #[test]
     fn pacer_due_times() {

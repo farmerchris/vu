@@ -18,6 +18,8 @@ cargo test                 # unit + integration tests
 
 On macOS, the terminal needs microphone permission (System Settings → Privacy & Security → Microphone). Without it the input is silent.
 
+If a live input starts delivering pure digital silence (every sample exactly zero, which a working microphone never does) for 1.5 s, `vu` reopens the device, up to three times, and shows a yellow warning in the status bar. If it stays silent, the warning says so: the microphone is probably muted or in use by another device.
+
 ## Usage
 
 ```sh

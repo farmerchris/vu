@@ -11,7 +11,7 @@ use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
 use ratatui::prelude::CrosstermBackend;
 use ratatui::Terminal;
-use vu::source::{Source, SourceKind};
+use vu::source::{SilenceWatch, Source, SourceKind};
 use std::io::{stdout, Stdout};
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::TryRecvError;
@@ -108,7 +108,7 @@ fn restore_terminal(mouse: bool) {
     let _ = execute!(out, LeaveAlternateScreen, ratatui::crossterm::cursor::Show);
 }
 
-fn run_tui(cli: &Cli, source: Source, mut analyzer: Analyzer) -> Result<()> {
+fn run_tui(cli: &Cli, mut source: Source, mut analyzer: Analyzer) -> Result<()> {
     let mode = cli.color.resolve(std::env::var("COLORTERM").ok().as_deref());
     let mut app = App::new(cli, source.info.clone(), &analyzer, source.control.clone(), mode);
     if cli.record.is_some() {
@@ -116,7 +116,7 @@ fn run_tui(cli: &Cli, source: Source, mut analyzer: Analyzer) -> Result<()> {
     }
     let mouse = !cli.no_mouse;
     let res = setup_terminal(mouse).and_then(|mut term| {
-        let r = event_loop(&mut term, &mut app, &mut analyzer, &source, cli);
+        let r = event_loop(&mut term, &mut app, &mut analyzer, &mut source, cli);
         restore_terminal(mouse);
         r
     });
@@ -127,15 +127,25 @@ fn run_tui(cli: &Cli, source: Source, mut analyzer: Analyzer) -> Result<()> {
     if let Some(e) = source.control.take_error() {
         eprintln!("vu: {e}");
     }
+    if app.reopens > 0 {
+        eprintln!("vu: the input went digitally silent; reopened it {} time(s)", app.reopens);
+    }
     if let Some(n) = source.dropped_chunks() {
         eprintln!("vu: {n} audio buffers were dropped because the UI fell behind");
     }
     res.and(finished)
 }
 
-fn event_loop(term: &mut Term, app: &mut App, analyzer: &mut Analyzer, source: &Source, cli: &Cli) -> Result<()> {
+/// Seconds of exact-zero input before a live device is considered stalled.
+const SILENCE_SECS: f64 = 1.5;
+/// Reopen attempts per stall before reporting the input as silent.
+const MAX_REOPENS: u32 = 3;
+
+fn event_loop(term: &mut Term, app: &mut App, analyzer: &mut Analyzer, source: &mut Source, cli: &Cli) -> Result<()> {
     let frame_dt = Duration::from_secs_f64(1.0 / cli.fps as f64);
     let ch = source.info.channels;
+    let mut watch = SilenceWatch::new((SILENCE_SECS * (source.info.sample_rate as usize * ch) as f64) as u64);
+    let mut attempts = 0u32;
     let limit = cli.duration.map(|d| (d * source.info.sample_rate as f64).round() as u64);
     let live = source.info.kind == SourceKind::Device;
     let mut next_frame = Instant::now();
@@ -159,6 +169,28 @@ fn event_loop(term: &mut Term, app: &mut App, analyzer: &mut Analyzer, source: &
                     let history = &mut app.history;
                     analyzer.push(&chunk, |f| history.push(f));
                     dirty = true;
+                    if source.can_reopen() {
+                        let stalled = watch.feed(&chunk);
+                        if app.input_warning.is_some() && chunk.iter().any(|&x| x != 0.0) {
+                            app.input_warning = None;
+                            app.flash("input restored");
+                            attempts = 0;
+                        }
+                        if stalled {
+                            if attempts < MAX_REOPENS {
+                                attempts += 1;
+                                app.reopens += 1;
+                                app.input_warning = Some(format!("input silent (all zeros), reopening ({attempts}/{MAX_REOPENS})"));
+                                if let Err(e) = source.reopen() {
+                                    app.input_warning = Some(format!("input lost: {e:#}"));
+                                }
+                                watch.reset();
+                            } else {
+                                app.input_warning =
+                                    Some("input is sending pure silence: mic muted, or taken by another app/device?".into());
+                            }
+                        }
+                    }
                     if limit.is_some_and(|l| analyzer.samples() >= l) {
                         app.ingest_done = true;
                         source.control.stop.store(true, Ordering::Relaxed);

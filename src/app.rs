@@ -305,6 +305,10 @@ pub struct App {
     pub source_done: bool,
     pub ingest_done: bool,
     pub message: Option<(String, Instant)>,
+    /// Persistent problem with a live input (e.g. it went digitally silent).
+    pub input_warning: Option<String>,
+    /// Times the live input was reopened after going silent.
+    pub reopens: u32,
     pub recorder: Option<Recorder>,
     pub saved_recordings: Vec<PathBuf>,
     record_base: Option<PathBuf>,
@@ -367,6 +371,8 @@ impl App {
             source_done: false,
             ingest_done: false,
             message: None,
+            input_warning: None,
+            reopens: 0,
             recorder: None,
             saved_recordings: Vec::new(),
             record_base: cli.record.clone(),

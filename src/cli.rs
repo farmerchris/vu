@@ -133,7 +133,7 @@ pub struct Cli {
     pub freq_scale: FreqScale,
 
     /// Bottom of the spectrogram/equalizer/timeline dB range
-    #[arg(long, default_value_t = -96.0, allow_hyphen_values = true)]
+    #[arg(long, default_value_t = -70.0, allow_hyphen_values = true)]
     pub db_min: f32,
 
     /// Top of the dB range
