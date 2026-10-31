@@ -134,16 +134,16 @@ fn bench_draw(minutes: f64, fft: usize, hop: usize) {
     println!("draw: {} frames of history (fft {}, hop {})", app.history.len(), app.analysis.fft_size, app.analysis.hop);
     for (w, h) in [(300u16, 100u16), (160, 48)] {
         let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
-        for zoom in [1usize, 4, 64] {
+        for span in [1.0f64, 10.0, 300.0] {
             for scrolled in [false, true] {
-                app.view.zoom = zoom;
+                app.view.span_secs = span;
                 app.nav(Nav::End);
                 if scrolled {
                     app.nav(Nav::Home);
                 }
                 let (ms, cold) = time_draw(&mut term, &mut app, 50, !scrolled);
                 println!(
-                    "  {w:>3}x{h:<3} zoom {zoom:>2} {:<8}: {ms:>6.3} ms/draw  (first {cold:.3} ms)",
+                    "  {w:>3}x{h:<3} span {span:>3}s {:<8}: {ms:>6.3} ms/draw  (first {cold:.3} ms)",
                     if scrolled { "home" } else { "live" }
                 );
             }
@@ -152,7 +152,7 @@ fn bench_draw(minutes: f64, fft: usize, hop: usize) {
     let mut term = Terminal::new(TestBackend::new(300, 100)).unwrap();
     let ms = time_draw_with(&mut term, 50, |_| {});
     println!("  300x100 empty draw (terminal overhead): {ms:.3} ms");
-    app.view.zoom = 4;
+    app.view.span_secs = vu::app::DEFAULT_SPAN;
     app.nav(Nav::End);
     for (i, name) in ["meter", "eq", "spectrogram", "timeline"].iter().enumerate() {
         let saved = app.display.panels;
@@ -160,7 +160,7 @@ fn bench_draw(minutes: f64, fft: usize, hop: usize) {
         app.display.panels[i] = true;
         let (ms, _) = time_draw(&mut term, &mut app, 50, true);
         app.display.panels = saved;
-        println!("  300x100 zoom  4 {name:<12} only: {ms:>6.3} ms/draw");
+        println!("  300x100 span 10s {name:<12} only: {ms:>6.3} ms/draw");
     }
 }
 

@@ -41,9 +41,9 @@ pub fn render(app: &mut App, area: Rect, buf: &mut Buffer) -> Rect {
         let x = chart.x + c as u16;
         let is_cursor = cursor_col == Some(c);
         let levels = v
-            .column_frame(c)
-            .filter(|&f| f >= first)
-            .and_then(|fe| bucket_levels(&app.history, (fe + 1).saturating_sub(v.zoom), fe));
+            .column_frames(c)
+            .filter(|&(_, hi)| hi >= first)
+            .and_then(|(lo, hi)| bucket_levels(&app.history, lo, hi));
         let (hp, hr) = match levels {
             Some((p, r)) => (db_to_height(p, lo, hi, rows), db_to_height(r, lo, hi, rows)),
             None => (0.0, 0.0),

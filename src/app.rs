@@ -16,16 +16,19 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Instant;
 
-/// Scroll/cursor state over the history. Columns map to buckets of `zoom` frames;
-/// the rightmost column ends at `view_end`.
+/// Scroll/cursor state over the history. The charts show `span_secs` seconds
+/// whatever their width, so each column covers a fractional number of frames.
+/// Columns are buckets anchored at frame 0; the rightmost holds `view_end`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct View {
     /// Follow live data (cursor pinned to the newest frame).
     pub follow: bool,
     pub cursor: usize,
     pub view_end: usize,
-    /// Frames per column.
-    pub zoom: usize,
+    /// Seconds shown across the chart width (the zoom level).
+    pub span_secs: f64,
+    /// Seconds per analysis frame.
+    pub dt: f64,
     /// Chart width in columns.
     pub width: usize,
 }
@@ -44,24 +47,58 @@ pub enum Nav {
     Column(usize),
 }
 
-pub const MAX_ZOOM: usize = 256;
+/// Zoom levels (seconds across the chart) stepped through by + and -.
+pub const ZOOM_SPANS: [f64; 11] = [0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 30.0, 60.0, 120.0, 300.0, 600.0];
+pub const DEFAULT_SPAN: f64 = 10.0;
+
+/// Tolerance for float bucket arithmetic.
+const EPS: f64 = 1e-9;
 
 impl Default for View {
     fn default() -> Self {
-        View { follow: true, cursor: 0, view_end: 0, zoom: 1, width: 1 }
+        View { follow: true, cursor: 0, view_end: 0, span_secs: DEFAULT_SPAN, dt: 0.01, width: 1 }
     }
 }
 
 impl View {
-    /// Frames spanned by the visible chart.
-    pub fn span(&self) -> usize {
-        self.width.max(1) * self.zoom
+    /// Frames per column (below 1 when zoomed in past one frame per column).
+    pub fn frames_per_col(&self) -> f64 {
+        self.span_secs / (self.width.max(1) as f64 * self.dt)
     }
 
-    /// End of the zoom bucket containing frame `f`. Anchoring buckets to multiples
-    /// of `zoom` keeps columns stable as live data scrolls in.
+    /// Frames spanned by the visible chart.
+    pub fn span(&self) -> usize {
+        ((self.span_secs / self.dt - EPS).ceil() as usize).max(1)
+    }
+
+    /// Bucket (absolute column index) holding frame `f`.
+    fn bucket(&self, f: usize) -> usize {
+        (f as f64 / self.frames_per_col() + EPS).floor() as usize
+    }
+
+    /// Frames `[lo, hi]` of bucket `b`. A bucket narrower than a frame holds no
+    /// frame start of its own and shows the frame it falls within.
+    pub fn bucket_frames(&self, b: usize) -> (usize, usize) {
+        let fpc = self.frames_per_col();
+        let lo = (b as f64 * fpc - EPS).ceil() as usize;
+        let end = ((b + 1) as f64 * fpc - EPS).ceil() as usize;
+        if end > lo {
+            (lo, end - 1)
+        } else {
+            let f = (b as f64 * fpc + EPS).floor() as usize;
+            (f, f)
+        }
+    }
+
+    /// Last frame of the bucket containing frame `f`. Anchoring buckets at frame
+    /// 0 keeps columns stable as live data scrolls in.
     pub fn bucket_end(&self, f: usize) -> usize {
-        f + (self.zoom - 1 - f % self.zoom)
+        self.bucket_frames(self.bucket(f)).1
+    }
+
+    /// Frames moved by `n` columns of cursor movement (at least one).
+    fn step(&self, n: usize) -> usize {
+        ((n as f64 * self.frames_per_col()).round() as usize).max(1)
     }
 
     /// Re-establish invariants after data arrives or the width changes.
@@ -90,16 +127,14 @@ impl View {
 
     pub fn apply(&mut self, nav: Nav, first: usize, last: Option<usize>) {
         let Some(last) = last else { return };
-        let zoom = self.zoom;
-        let step = |n: usize| n * zoom;
         match nav {
             Nav::Left(n) => {
                 self.unfollow(last);
-                self.cursor = self.cursor.saturating_sub(step(n)).max(first);
+                self.cursor = self.cursor.saturating_sub(self.step(n)).max(first);
             }
             Nav::Right(n) => {
                 if !self.follow {
-                    let c = self.cursor + step(n);
+                    let c = self.cursor + self.step(n);
                     if c >= last {
                         self.follow = true;
                     } else {
@@ -137,8 +172,16 @@ impl View {
                     self.follow = true;
                 }
             }
-            Nav::ZoomIn => self.zoom = (self.zoom / 2).max(1),
-            Nav::ZoomOut => self.zoom = (self.zoom * 2).min(MAX_ZOOM),
+            Nav::ZoomIn => {
+                if let Some(&s) = ZOOM_SPANS.iter().rev().find(|&&s| s < self.span_secs - EPS) {
+                    self.span_secs = s;
+                }
+            }
+            Nav::ZoomOut => {
+                if let Some(&s) = ZOOM_SPANS.iter().find(|&&s| s > self.span_secs + EPS) {
+                    self.span_secs = s;
+                }
+            }
             Nav::Column(col) => {
                 if let Some(f) = self.column_frame(col.min(self.width.saturating_sub(1))) {
                     self.unfollow(last);
@@ -157,12 +200,18 @@ impl View {
         }
     }
 
-    /// Newest frame in column `col`'s bucket, or `None` if it lies before frame 0.
-    pub fn column_frame(&self, col: usize) -> Option<usize> {
+    /// Frames `[lo, hi]` shown in column `col`, or `None` if it lies before frame 0.
+    pub fn column_frames(&self, col: usize) -> Option<(usize, usize)> {
         if col >= self.width {
             return None;
         }
-        self.view_end.checked_sub((self.width - 1 - col) * self.zoom)
+        let b = self.bucket(self.view_end).checked_sub(self.width - 1 - col)?;
+        Some(self.bucket_frames(b))
+    }
+
+    /// Newest frame in column `col`'s bucket, or `None` if it lies before frame 0.
+    pub fn column_frame(&self, col: usize) -> Option<usize> {
+        self.column_frames(col).map(|(_, hi)| hi)
     }
 
     /// Column containing the cursor, if visible.
@@ -170,12 +219,13 @@ impl View {
         self.frame_column(self.cursor)
     }
 
-    /// Column whose bucket holds frame `f`, if visible.
+    /// Column whose bucket holds frame `f`, if visible. When zoomed in past one
+    /// frame per column this is the first of the columns showing `f`.
     pub fn frame_column(&self, f: usize) -> Option<usize> {
         if f > self.view_end {
             return None;
         }
-        let back = (self.view_end - f) / self.zoom;
+        let back = self.bucket(self.view_end) - self.bucket(f);
         (back < self.width).then(|| self.width - 1 - back)
     }
 }
@@ -285,7 +335,7 @@ impl App {
         }
         App {
             history: History::new(cap),
-            view: View { zoom: cli.zoom, ..View::default() },
+            view: View { span_secs: cli.span, dt: frame_dt, ..View::default() },
             analysis: AnalysisInfo {
                 sample_rate: cfg.sample_rate,
                 channels: cfg.channels,
@@ -470,8 +520,9 @@ impl App {
 mod tests {
     use super::*;
 
+    /// One frame per column: 1 s frames, span equal to the width.
     fn view(width: usize) -> View {
-        View { width, ..View::default() }
+        View { width, dt: 1.0, span_secs: width as f64, ..View::default() }
     }
 
     #[test]
@@ -590,32 +641,92 @@ mod tests {
     #[test]
     fn zoom_buckets() {
         let mut v = view(10);
-        v.apply(Nav::ZoomOut, 0, Some(999));
-        v.apply(Nav::ZoomOut, 0, Some(999));
-        assert_eq!(v.zoom, 4);
+        v.span_secs = 40.0;
+        assert_eq!(v.frames_per_col(), 4.0);
         assert_eq!(v.span(), 40);
+        v.sync(0, Some(999));
         assert_eq!(v.column_frame(8), Some(995));
+        assert_eq!(v.column_frames(8), Some((992, 995)));
         v.apply(Nav::Left(1), 0, Some(999));
         assert_eq!(v.cursor, 995);
         assert_eq!(v.cursor_column(), Some(8));
-        v.cursor = 993;
+        v.cursor = 992;
         assert_eq!(v.cursor_column(), Some(8));
         v.cursor = 991;
         assert_eq!(v.cursor_column(), Some(7));
+    }
+
+    #[test]
+    fn zoom_steps_through_round_spans() {
+        let mut v = View { width: 137, dt: 512.0 / 48000.0, ..View::default() };
+        assert_eq!(v.span_secs, 10.0);
+        v.apply(Nav::ZoomOut, 0, Some(9999));
+        assert_eq!(v.span_secs, 20.0);
+        v.apply(Nav::ZoomIn, 0, Some(9999));
+        v.apply(Nav::ZoomIn, 0, Some(9999));
+        assert_eq!(v.span_secs, 5.0);
         for _ in 0..20 {
-            v.apply(Nav::ZoomOut, 0, Some(999));
+            v.apply(Nav::ZoomIn, 0, Some(9999));
         }
-        assert_eq!(v.zoom, MAX_ZOOM);
+        assert_eq!(v.span_secs, ZOOM_SPANS[0]);
         for _ in 0..20 {
-            v.apply(Nav::ZoomIn, 0, Some(999));
+            v.apply(Nav::ZoomOut, 0, Some(9999));
         }
-        assert_eq!(v.zoom, 1);
+        assert_eq!(v.span_secs, ZOOM_SPANS[ZOOM_SPANS.len() - 1]);
+        // An off-list span (from --span) snaps to the neighbouring levels.
+        v.span_secs = 7.0;
+        v.apply(Nav::ZoomIn, 0, Some(9999));
+        assert_eq!(v.span_secs, 5.0);
+        v.span_secs = 7.0;
+        v.apply(Nav::ZoomOut, 0, Some(9999));
+        assert_eq!(v.span_secs, 10.0);
+    }
+
+    #[test]
+    fn resizing_stretches_the_same_span() {
+        let dt = 512.0 / 48000.0;
+        for width in [37, 100, 141, 300] {
+            let mut v = View { width, dt, ..View::default() };
+            v.sync(0, Some(5000));
+            // The columns tile exactly 10 s of frames, oldest to newest.
+            let (lo, _) = v.column_frames(0).unwrap();
+            let (_, hi) = v.column_frames(width - 1).unwrap();
+            let shown = (hi - lo + 1) as f64 * dt;
+            assert!((shown - 10.0).abs() <= 2.0 * dt * v.frames_per_col().max(1.0), "{width}: {shown}");
+            for c in 1..width {
+                let (a, b) = (v.column_frames(c - 1).unwrap(), v.column_frames(c).unwrap());
+                assert_eq!(a.1 + 1, b.0, "{width}: columns {c} contiguous");
+            }
+            // Every frame maps back to the column that shows it.
+            for c in 0..width {
+                let (a, b) = v.column_frames(c).unwrap();
+                assert_eq!(v.frame_column(a), Some(c));
+                assert_eq!(v.frame_column(b), Some(c));
+            }
+        }
+    }
+
+    #[test]
+    fn zoomed_in_past_one_frame_per_column() {
+        // 0.5 s over 100 columns at 0.01 s frames: half a frame per column.
+        let mut v = View { width: 100, dt: 0.01, span_secs: 0.5, ..View::default() };
+        assert_eq!(v.frames_per_col(), 0.5);
+        v.sync(0, Some(999));
+        // Each frame fills two columns; the live edge shows the newest frame's first half.
+        assert_eq!(v.column_frames(99), Some((999, 999)));
+        assert_eq!(v.column_frames(98), Some((998, 998)));
+        assert_eq!(v.column_frames(97), Some((998, 998)));
+        assert_eq!(v.column_frames(96), Some((997, 997)));
+        assert_eq!(v.cursor_column(), Some(99));
+        v.apply(Nav::Left(1), 0, Some(999));
+        assert_eq!(v.cursor, 998);
+        assert_eq!(v.cursor_column(), Some(97));
     }
 
     #[test]
     fn live_buckets_are_aligned() {
         let mut v = view(10);
-        v.zoom = 4;
+        v.span_secs = 40.0;
         v.sync(0, Some(100));
         assert_eq!(v.view_end, 103);
         assert_eq!(v.cursor_column(), Some(9));
@@ -626,6 +737,11 @@ mod tests {
         v.apply(Nav::ToggleHold, 0, Some(104));
         assert_eq!((v.cursor, v.view_end), (104, 107));
         assert_eq!(v.bucket_end(8), 11);
+        // Fractional buckets: 2.5 frames per column.
+        v.span_secs = 25.0;
+        assert_eq!(v.bucket_end(0), 2);
+        assert_eq!(v.bucket_end(3), 4);
+        assert_eq!(v.bucket_end(5), 7);
     }
 
     #[test]

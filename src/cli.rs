@@ -168,9 +168,9 @@ pub struct Cli {
     #[arg(long, default_value_t = 60)]
     pub fps: u32,
 
-    /// Initial time zoom: analysis frames per screen column (1-256)
-    #[arg(short = 'z', long, default_value_t = 4)]
-    pub zoom: usize,
+    /// Seconds shown across the charts (+/- step through 0.5, 1, 2, 5, 10, 20, 30, 60, 120, 300, 600)
+    #[arg(short = 'z', long, default_value_t = crate::app::DEFAULT_SPAN)]
+    pub span: f64,
 
     /// Seconds of history kept for scrolling back (file inputs keep the whole file)
     #[arg(long, default_value_t = 600.0)]
@@ -205,8 +205,8 @@ impl Cli {
         if !(1..=480).contains(&self.fps) {
             bail!("--fps must be between 1 and 480");
         }
-        if !(1..=crate::app::MAX_ZOOM).contains(&self.zoom) {
-            bail!("--zoom must be between 1 and {}", crate::app::MAX_ZOOM);
+        if !(0.1..=3600.0).contains(&self.span) {
+            bail!("--span must be between 0.1 and 3600 seconds");
         }
         if self.history <= 0.0 {
             bail!("--history must be positive");
@@ -274,8 +274,8 @@ mod tests {
             &["--channel", "0"],
             &["--duration", "0"],
             &["--meter-floor", "3"],
-            &["--zoom", "0"],
-            &["--zoom", "1000"],
+            &["--span", "0"],
+            &["--span", "5000"],
         ] {
             assert!(parse(args).validate().is_err(), "{args:?}");
         }

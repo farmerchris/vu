@@ -67,12 +67,13 @@ fn mod_key(app: &mut App, code: KeyCode, m: KeyModifiers) -> Action {
     app.handle_event(Event::Key(KeyEvent::new(code, m)))
 }
 
-/// App with data and a laid-out view (width set by drawing once).
+/// App with data and a laid-out view (width set by drawing once), zoomed to
+/// one analysis frame per column.
 fn ready(args: &[&str]) -> App {
-    let mut all = vec!["--zoom", "1"];
-    all.extend_from_slice(args);
-    let mut app = make_app(&all, 2, 2.0);
+    let mut app = make_app(args, 2, 2.0);
     let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+    term.draw(|f| vu::ui::draw(f, &mut app)).unwrap();
+    app.view.span_secs = app.view.width as f64 * app.view.dt;
     term.draw(|f| vu::ui::draw(f, &mut app)).unwrap();
     app
 }
@@ -171,28 +172,35 @@ fn space_toggles_hold() {
 
 #[test]
 fn plus_minus_zoom() {
-    let mut app = ready(&[]);
-    assert_eq!(app.view.zoom, 1);
+    let mut app = make_app(&[], 2, 2.0);
+    assert_eq!(app.view.span_secs, 10.0);
     key(&mut app, KeyCode::Char('-'));
     key(&mut app, KeyCode::Char('-'));
-    assert_eq!(app.view.zoom, 4);
+    assert_eq!(app.view.span_secs, 30.0);
     key(&mut app, KeyCode::Char('+'));
-    assert_eq!(app.view.zoom, 2);
-    key(&mut app, KeyCode::Char('+'));
-    key(&mut app, KeyCode::Char('+'));
-    assert_eq!(app.view.zoom, 1, "zoom floors at 1");
+    assert_eq!(app.view.span_secs, 20.0);
+    for _ in 0..20 {
+        key(&mut app, KeyCode::Char('+'));
+    }
+    assert_eq!(app.view.span_secs, vu::app::ZOOM_SPANS[0], "zoom stops at the shortest span");
     for _ in 0..20 {
         key(&mut app, KeyCode::Char('-'));
     }
-    assert_eq!(app.view.zoom, vu::app::MAX_ZOOM);
+    assert_eq!(app.view.span_secs, *vu::app::ZOOM_SPANS.last().unwrap());
 }
 
 #[test]
-fn zoomed_left_steps_by_zoom_frames() {
+fn span_option_sets_initial_zoom() {
+    let app = make_app(&["--span", "5"], 2, 2.0);
+    assert_eq!(app.view.span_secs, 5.0);
+}
+
+#[test]
+fn zoomed_left_steps_by_one_column() {
     let mut app = ready(&[]);
     let last = app.history.last().unwrap();
-    key(&mut app, KeyCode::Char('-'));
-    key(&mut app, KeyCode::Char('-'));
+    // Four frames per column.
+    app.view.span_secs *= 4.0;
     key(&mut app, KeyCode::Left);
     assert_eq!(app.view.cursor, last - 4);
 }

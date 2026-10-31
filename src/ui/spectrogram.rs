@@ -142,8 +142,8 @@ pub fn render(app: &mut App, area: Rect, buf: &mut Buffer) -> Rect {
     let first = app.history.first();
     let cursor_col = v.cursor_column();
     for c in 0..chart.width as usize {
-        let Some(fe) = v.column_frame(c).filter(|&f| f >= first) else { continue };
-        let fs = (fe + 1).saturating_sub(v.zoom).max(first);
+        let Some((fs, fe)) = v.column_frames(c).filter(|&(_, hi)| hi >= first) else { continue };
+        let fs = fs.max(first);
         col.fill(0);
         let mut any = false;
         for (i, fr) in (fs..).zip(app.history.range(fs, fe)) {
@@ -187,7 +187,10 @@ pub fn render(app: &mut App, area: Rect, buf: &mut Buffer) -> Rect {
         buf.set_string(axis.x, axis.y + row, label, style);
         last_row = Some(row);
     }
-    super::draw_time_axis(buf, app, area, chart);
+    // The timeline carries the time axis when it is shown.
+    if !app.display.shown(crate::cli::Panel::Timeline) {
+        super::draw_time_axis(buf, app, area, chart);
+    }
     chart
 }
 

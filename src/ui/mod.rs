@@ -102,11 +102,10 @@ impl Clock {
 
 /// Tick positions `(column, seconds)` at round times across the view.
 pub fn time_ticks(view: &crate::app::View, clock: Clock, min_cols: usize) -> (f64, Vec<(usize, f64)>) {
-    let step = tick_step(clock.dt * view.zoom as f64, min_cols);
-    let Some(start) = view.column_frame(0).or_else(|| view.column_frame(view.width - 1).map(|_| 0)) else {
+    let step = tick_step(view.span_secs / view.width.max(1) as f64, min_cols);
+    let Some(start) = view.column_frames(0).map(|(lo, _)| lo).or_else(|| view.column_frame(view.width - 1).map(|_| 0)) else {
         return (step, Vec::new());
     };
-    let start = (start + 1).saturating_sub(view.zoom);
     let (t0, t1) = (clock.time(start).max(0.0), clock.time(view.view_end));
     let mut ticks = Vec::new();
     let mut k = (t0 / step).ceil() as i64;
@@ -156,12 +155,12 @@ pub fn draw_time_axis(buf: &mut Buffer, app: &App, area: Rect, chart: Rect) {
 
 /// Visible time range `start – end (span)` for chart titles.
 pub fn view_range_text(app: &App) -> String {
-    let span = app.analysis.frame_dt * (app.view.zoom * app.view.width) as f64;
-    let span_txt = if span < 10.0 { format!("{span:.2} s") } else { format!("{span:.1} s") };
+    let span = app.view.span_secs;
+    let span_txt = if span < 60.0 { format!("{span} s") } else { format!("{} min", span / 60.0) };
     let Some(clock) = Clock::of(app) else { return span_txt };
     let v = &app.view;
     let last = app.history.last().unwrap_or(v.view_end).min(v.view_end);
-    let start = (v.view_end + 1).saturating_sub(v.zoom * v.width);
+    let start = v.column_frames(0).map_or(0, |(lo, _)| lo);
     format!(
         "{} – {} ({span_txt})",
         fmt_time(clock.time(start).max(0.0)),
@@ -458,7 +457,7 @@ mod tests {
     fn tick_columns() {
         use crate::app::View;
         // 100 columns, 4 frames per column, 0.01 s per frame: 0.04 s/col, 4 s visible.
-        let v = View { follow: true, cursor: 999, view_end: 999, zoom: 4, width: 100 };
+        let v = View { follow: true, cursor: 999, view_end: 999, span_secs: 4.0, dt: 0.01, width: 100 };
         let clock = Clock { frame: 0, time: 0.01, dt: 0.01 };
         let (step, ticks) = time_ticks(&v, clock, 10);
         assert_eq!(step, 0.5);
@@ -470,7 +469,7 @@ mod tests {
             assert!((12..=13).contains(&(w[1].0 - w[0].0)));
         }
         // A view reaching back before the stream start begins ticking at 0 s.
-        let v = View { follow: true, cursor: 99, view_end: 99, zoom: 4, width: 100 };
+        let v = View { follow: true, cursor: 99, view_end: 99, span_secs: 4.0, dt: 0.01, width: 100 };
         let (_, ticks) = time_ticks(&v, clock, 10);
         assert_eq!(ticks.first().unwrap().1, 0.5);
         assert_eq!(ticks.last().unwrap(), &(99, 1.0));

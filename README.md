@@ -37,7 +37,7 @@ vu -g sine:997:-20 -t 3 --report     # check the loudness meter
 
 Test signals for `-g`: `sine:FREQ[:DB]`, `square:FREQ[:DB]`, `noise[:DB]`, `pink[:DB]`, `sweep:F0:F1:SECS[:DB]`, `silence`.
 
-Other options (see `vu --help`): `--fft-size`, `--hop`, `--window`, `-w/--weighting a|c|z`, `-b/--bands`, `--min-freq`, `--max-freq`, `--freq-scale`, `--db-min`, `--db-max`, `--meter-floor`, `--rms-time`, `--peak-decay`, `--peak-hold`, `--colormap`, `--color auto|truecolor|256`, `--fps`, `-z/--zoom`, `--history`, `--channel`, `--channels`, `--sample-rate`, `--buffer-size`, `--record-format int16|int24|float32`, `--no-mouse`.
+Other options (see `vu --help`): `--fft-size`, `--hop`, `--window`, `-w/--weighting a|c|z`, `-b/--bands`, `--min-freq`, `--max-freq`, `--freq-scale`, `--db-min`, `--db-max`, `--meter-floor`, `--rms-time`, `--peak-decay`, `--peak-hold`, `--colormap`, `--color auto|truecolor|256`, `--fps`, `-z/--span SECONDS` (time shown across the charts, default 10), `--history`, `--channel`, `--channels`, `--sample-rate`, `--buffer-size`, `--record-format int16|int24|float32`, `--no-mouse`.
 
 ## Keys
 
@@ -48,7 +48,7 @@ Other options (see `vu --help`): `--fft-size`, `--hop`, `--window`, `-w/--weight
 | Home / End (g / G) | jump to the oldest data / return to live |
 | space | hold or release the display |
 | mouse click / wheel | place the cursor / scroll |
-| + / - (↑ / ↓) | zoom the time axis in or out |
+| + / - (↑ / ↓) | zoom the time axis in or out (0.5 s, 1, 2, 5, 10, 20, 30 s, 1, 2, 5, 10 min across the chart) |
 | p | pause or resume the input |
 | r | start or stop recording |
 | 1 2 3 4 | toggle the meter, equalizer, spectrogram and timeline |
@@ -57,7 +57,7 @@ Other options (see `vu --help`): `--fft-size`, `--hop`, `--window`, `-w/--weight
 | ? | help |
 | q / Esc | quit |
 
-The bottom edges of the spectrogram and timeline carry a time axis with ticks at round times (0.5 s, 1 s, 5 s, 10 s, … depending on zoom), and the timeline title shows the visible range, e.g. `0:08.032 – 0:13.845 (5.85 s)`.
+The charts always show a whole number of seconds (10 s by default), whatever the terminal width: resizing stretches the same time range rather than showing more of it. The timeline's bottom edge (the spectrogram's, when the timeline is hidden) carries a time axis with ticks at round times, and the timeline title shows the visible range, e.g. `0:03.845 – 0:13.845 (10 s)`.
 
 The cursor (`▼` and a vertical line on the spectrogram and timeline) marks the analysis frame that the level meters and equalizer are showing. Scrolling back moves the cursor through the stored history, and End returns to live.
 
