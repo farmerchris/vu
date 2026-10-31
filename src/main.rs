@@ -166,8 +166,7 @@ fn event_loop(term: &mut Term, app: &mut App, analyzer: &mut Analyzer, source: &
                             app.flash(format!("record error: {e:#}"));
                         }
                     }
-                    let history = &mut app.history;
-                    analyzer.push(&chunk, |f| history.push(f));
+                    analyzer.push(&chunk, |f| app.push_frame(f));
                     dirty = true;
                     if source.can_reopen() {
                         let stalled = watch.feed(&chunk);

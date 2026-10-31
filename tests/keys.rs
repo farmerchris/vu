@@ -44,7 +44,7 @@ fn make_app(args: &[&str], channels: usize, secs: f64) -> App {
         let n = (total - done).min(4096);
         let mut chunk = vec![0.0f32; n * channels];
         gen.fill(&mut chunk, channels);
-        analyzer.push(&chunk, |f| app.history.push(f));
+        analyzer.push(&chunk, |f| app.push_frame(f));
         done += n;
     }
     app

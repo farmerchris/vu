@@ -116,9 +116,9 @@ pub struct Cli {
     #[arg(short = 'w', long, value_enum, default_value = "z")]
     pub weighting: Weighting,
 
-    /// Number of equalizer bands
-    #[arg(short = 'b', long, default_value_t = 31)]
-    pub bands: usize,
+    /// Number of log-spaced equalizer bands (default: the standard 1/3-octave bands)
+    #[arg(short = 'b', long)]
+    pub bands: Option<usize>,
 
     /// Lowest displayed frequency (Hz)
     #[arg(long, default_value_t = 20.0)]
@@ -141,7 +141,7 @@ pub struct Cli {
     pub db_max: f32,
 
     /// Bottom of the level meter scale (dBFS)
-    #[arg(long, default_value_t = -60.0, allow_hyphen_values = true)]
+    #[arg(long, default_value_t = -70.0, allow_hyphen_values = true)]
     pub meter_floor: f32,
 
     /// RMS meter integration time (ms)
@@ -190,7 +190,7 @@ impl Cli {
         if hop == 0 || hop > self.fft_size {
             bail!("--hop must be between 1 and --fft-size");
         }
-        if self.bands == 0 || self.bands > 256 {
+        if self.bands.is_some_and(|b| b == 0 || b > 256) {
             bail!("--bands must be between 1 and 256");
         }
         if !(self.min_freq > 0.0 && self.min_freq < self.max_freq) {

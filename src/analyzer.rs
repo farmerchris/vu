@@ -27,7 +27,8 @@ pub struct AnalyzerConfig {
     pub hop: usize,
     pub window: WindowKind,
     pub weighting: Weighting,
-    pub bands: usize,
+    /// Number of log-spaced equalizer bands, or `None` for the standard 1/3-octave bands.
+    pub bands: Option<usize>,
     pub min_freq: f32,
     pub max_freq: f32,
     /// Time constant of the averaged RMS meter, seconds.
@@ -208,7 +209,10 @@ impl Analyzer {
         let bins = spectrum.bins();
         let bin_hz = cfg.bin_hz();
         let top = cfg.top_freq();
-        let bands = BandLayout::new(cfg.bands, cfg.min_freq, top, bin_hz, bins);
+        let bands = match cfg.bands {
+            Some(n) => BandLayout::new(n, cfg.min_freq, top, bin_hz, bins),
+            None => BandLayout::third_octave(cfg.min_freq, top, bin_hz, bins),
+        };
         let peak_bins = (
             ((cfg.min_freq / bin_hz).floor() as usize).max(1),
             ((top / bin_hz).ceil() as usize).min(bins - 1),
@@ -366,7 +370,7 @@ pub mod tests {
             hop: 512,
             window: WindowKind::Hann,
             weighting: Weighting::Z,
-            bands: 16,
+            bands: Some(16),
             min_freq: 20.0,
             max_freq: 20000.0,
             rms_tau: 0.3,

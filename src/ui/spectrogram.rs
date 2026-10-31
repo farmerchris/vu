@@ -2,7 +2,7 @@
 //! fg = top, bg = bottom). Pixel-to-bin ranges, the colour LUT and each visible
 //! frame's folded pixel column are cached, so a draw only folds new frames.
 
-use super::colormap::{build_lut, ColorMap, ColorMode};
+use super::colormap::{build_lut, to_color, ColorMap, ColorMode};
 use super::{fmt_freq, split_axis, title};
 use crate::app::App;
 use crate::analyzer::Frame;
@@ -110,21 +110,42 @@ pub fn freq_labels(min: f32, max: f32, scale: FreqScale) -> Vec<f32> {
     out
 }
 
+/// Colour key on the top border, right-aligned: ` -70 ▆▆▆▆▆▆▆▆▆▆▆▆ 0 dB `.
+fn draw_legend(buf: &mut Buffer, area: Rect, heading_w: u16, map: ColorMap, mode: ColorMode, lo: f32, hi: f32) {
+    const STRIP: u16 = 12;
+    let (l, h) = (format!(" {lo:.0} "), format!(" {hi:.0} dB "));
+    let w = l.len() as u16 + STRIP + h.len() as u16;
+    if area.height == 0 || area.width < heading_w + w + 4 {
+        return;
+    }
+    let x = area.x + area.width - 1 - w;
+    let style = Style::default().fg(Color::Gray);
+    buf.set_string(x, area.y, &l, style);
+    for i in 0..STRIP {
+        let c = to_color(mode, map.sample((i as f32 + 0.5) / STRIP as f32));
+        buf[(x + l.len() as u16 + i, area.y)].set_char('█').set_fg(c);
+    }
+    buf.set_string(x + l.len() as u16 + STRIP, area.y, &h, style);
+}
+
 /// Draw the spectrogram; returns the chart rectangle (for mouse mapping).
 pub fn render(app: &mut App, area: Rect, buf: &mut Buffer) -> Rect {
     let a = &app.analysis;
     let d = &app.display;
     let v = &app.view;
-    let block = Block::bordered().title(title(format!(
+    let heading = format!(
         " Spectrogram  {} pt {} · {:?} · {}-weighted · {} ",
         a.fft_size,
         a.window,
         d.freq_scale,
         a.weighting,
         format!("{:?}", d.colormap).to_lowercase()
-    )));
+    );
+    let heading_w = heading.chars().count() as u16;
+    let block = Block::bordered().title(title(heading));
     let inner = block.inner(area);
     block.render(area, buf);
+    draw_legend(buf, area, heading_w, d.colormap, d.color_mode, d.db_min, d.db_max);
     let (axis, chart) = split_axis(inner);
     if chart.width == 0 || chart.height == 0 {
         return chart;

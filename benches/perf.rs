@@ -25,7 +25,7 @@ fn config(fft_size: usize, hop: usize) -> AnalyzerConfig {
         hop,
         window: WindowKind::Hann,
         weighting: Weighting::A,
-        bands: 31,
+        bands: None,
         min_freq: 20.0,
         max_freq: 20000.0,
         rms_tau: 0.3,

@@ -2,8 +2,8 @@
 
 A full-screen terminal sound meter written in Rust. It shows:
 
-- **Levels**: per-channel RMS bars (300 ms average) with a decaying peak envelope, a peak-hold marker, a momentary-loudness bar, and readouts for peak, hold, RMS, EBU R128 loudness (momentary, short-term, integrated), the dominant frequency and its musical note (shown only when a tone stands at least 15 dB above nearby bins, so hiss reads `—`), and clipping.
-- **Equalizer**: log-spaced graphic-EQ bands (31 by default) with peak caps.
+- **Levels**: per-channel RMS bars (300 ms average) with a decaying peak envelope, a peak-hold marker, a momentary-loudness bar, and readouts (dBFS) for peak, hold, RMS, the session maximum and clip count, EBU R128 loudness (momentary, short-term, integrated), the strongest tone and its musical note (shown only when a tone stands at least 15 dB above nearby bins, so hiss reads `—`), and clipping.
+- **Equalizer**: the standard 1/3-octave bands (20 Hz – 20 kHz, octave centres labelled) with peak caps; `-b N` switches to N log-spaced bands.
 - **Spectrogram**: a scrolling spectrogram on a log, mel or linear frequency axis. Each terminal cell holds two pixels.
 - **Timeline**: peak and RMS levels over time.
 
@@ -53,6 +53,7 @@ Other options (see `vu --help`): `--fft-size`, `--hop`, `--window`, `-w/--weight
 | + / - (↑ / ↓) | zoom the time axis in or out (0.5 s, 1, 2, 5, 10, 20, 30 s, 1, 2, 5, 10 min across the chart) |
 | p | pause or resume the input |
 | r | start or stop recording |
+| x | reset the session max level and clip count |
 | 1 2 3 4 | toggle the meter, equalizer, spectrogram and timeline |
 | c / s | cycle the colour map / frequency scale |
 | [ ] / { } | lower or raise the display floor / ceiling |

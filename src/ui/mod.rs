@@ -106,12 +106,14 @@ pub fn time_ticks(view: &crate::app::View, clock: Clock, min_cols: usize) -> (f6
     let Some(start) = view.column_frames(0).map(|(lo, _)| lo).or_else(|| view.column_frame(view.width - 1).map(|_| 0)) else {
         return (step, Vec::new());
     };
-    let (t0, t1) = (clock.time(start).max(0.0), clock.time(view.view_end));
+    // The first frame ends one hop in; let the stream start count as 0 s.
+    let (t0, t1) = ((clock.time(start) - clock.dt).max(0.0), clock.time(view.view_end));
     let mut ticks = Vec::new();
     let mut k = (t0 / step).ceil() as i64;
     while (k as f64) * step <= t1 + 1e-9 {
         let t = k as f64 * step;
-        if let Some(c) = clock.frame(t).and_then(|f| view.frame_column(f)) {
+        let frame = clock.frame(t).or_else(|| (t >= 0.0).then_some(0));
+        if let Some(c) = frame.and_then(|f| view.frame_column(f)) {
             if ticks.last().is_none_or(|&(lc, _)| c > lc) {
                 ticks.push((c, t));
             }
@@ -220,6 +222,21 @@ pub fn db_row(db: f32, lo: f32, hi: f32, rows: u16) -> u16 {
     rows.saturating_sub(1).saturating_sub((h.floor() as u16).min(rows.saturating_sub(1)))
 }
 
+/// Where to draw a thin level marker (peak hold, EQ cap) for `db` on `[lo, hi]`
+/// over `rows` rows: `(row from the top, glyph)`. The glyph is the cell's top or
+/// bottom edge, whichever is nearer the level, so the marker is never more than
+/// half a row off. `None` at or below the floor.
+pub fn edge_marker(db: f32, lo: f32, hi: f32, rows: u16) -> Option<(u16, char)> {
+    if rows == 0 || !db.is_finite() || db <= lo {
+        return None;
+    }
+    let h = ((db - lo) / (hi - lo)).clamp(0.0, 1.0) * rows as f32;
+    let rb = (h.floor() as u16).min(rows - 1);
+    let frac = h - rb as f32;
+    let glyph = if frac >= 0.5 { '▔' } else { '▁' };
+    Some((rows - 1 - rb, glyph))
+}
+
 /// Draw dB labels down a left axis.
 pub fn draw_db_axis(buf: &mut Buffer, axis: Rect, lo: f32, hi: f32) {
     if axis.width < 3 || axis.height == 0 {
@@ -248,6 +265,25 @@ fn title(s: impl Into<String>) -> Line<'static> {
     Line::from(Span::styled(s.into(), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)))
 }
 
+/// Rows the top panels need: enough for every level readout, including the
+/// CLIP badge, when the meter is shown.
+pub fn top_min_height(meter: bool, channels: usize) -> u16 {
+    if meter {
+        2 + 6 + channels.clamp(1, crate::analyzer::MAX_CHANNELS) as u16
+    } else {
+        6
+    }
+}
+
+/// Height of the top row: a third of the body (all of it when alone), at least
+/// `min`, while leaving each of the `charts` below 4 rows.
+pub fn top_height(body: u16, min: u16, charts: u16) -> u16 {
+    if charts == 0 {
+        return body;
+    }
+    (body / 3).max(min).min(body.saturating_sub(4 * charts)).max(body / 3)
+}
+
 pub fn draw(f: &mut Frame, app: &mut App) {
     let area = f.area();
     let [status, body] = Layout::vertical([Constraint::Length(1), Constraint::Fill(1)]).areas(area);
@@ -256,7 +292,8 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     let (spec, tl) = (d.shown(Panel::Spectrogram), d.shown(Panel::Timeline));
     let mut cons = Vec::new();
     if top {
-        cons.push(Constraint::Fill(if spec || tl { 3 } else { 1 }));
+        let min = top_min_height(d.shown(Panel::Meter), app.analysis.channels);
+        cons.push(Constraint::Length(top_height(body.height, min, spec as u16 + tl as u16)));
     }
     if spec {
         cons.push(Constraint::Fill(4));
@@ -317,6 +354,8 @@ fn render_status(app: &mut App, area: Rect, buf: &mut Buffer) {
         Span::styled(app.info.name.clone(), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
         Span::styled(format!("  {} Hz {}ch ", a.sample_rate, a.channels), Style::default().fg(Color::Gray)),
     ];
+    // Indices of the spans that give way first when the bar is too narrow.
+    let (name_i, info_i) = (2, 3);
     let (mode, color) = if app.ingest_done {
         ("■ DONE", Color::Blue)
     } else if app.source_done {
@@ -360,48 +399,119 @@ fn render_status(app: &mut App, area: Rect, buf: &mut Buffer) {
     if let Some(e) = app.control.error.lock().ok().and_then(|g| g.clone()) {
         spans.push(Span::styled(format!("  {e}"), Style::default().fg(Color::Red)));
     }
-    let right = format!("{} fps {:.1} ms  ? help ", app.fps.fps, app.fps.draw_ms);
+    // Nothing redraws while idle (e.g. a finished file), so hide a meaningless 0 fps.
+    let right = if app.fps.fps > 0 {
+        format!("{} fps {:.1} ms  ? help ", app.fps.fps, app.fps.draw_ms)
+    } else {
+        "? help ".to_string()
+    };
+    let rw = right.chars().count();
+    let width = area.width as usize;
+    let used = |spans: &[Span]| spans.iter().map(|s| s.content.chars().count()).sum::<usize>();
+    // Give way in order: the fps/help corner, the format, then the device name.
+    let show_right = used(&spans) + rw < width;
+    if used(&spans) > width {
+        spans[info_i].content = "".into();
+    }
+    let over = used(&spans).saturating_sub(width);
+    if over > 0 {
+        let name: Vec<char> = spans[name_i].content.chars().collect();
+        let keep = name.len().saturating_sub(over + 1).max(4).min(name.len());
+        spans[name_i].content = format!("{}…", name[..keep].iter().collect::<String>()).into();
+    }
     Paragraph::new(Line::from(spans)).render(area, buf);
-    let rw = right.chars().count() as u16;
-    if area.width > rw {
-        buf.set_string(area.x + area.width - rw, area.y, right, Style::default().fg(Color::DarkGray));
+    if show_right {
+        buf.set_string(area.x + (width - rw) as u16, area.y, right, Style::default().fg(Color::DarkGray));
     }
 }
 
 const HELP: &[(&str, &str)] = &[
-    ("← / →  h / l", "move cursor one column (Shift/Ctrl or H/L: ×10)"),
+    ("← / →  h / l", "move the cursor (Shift, Ctrl or H / L: 10 columns)"),
     ("PgUp / PgDn  b / f", "page backward / forward"),
     ("Home / End  g / G", "oldest data / back to live"),
     ("space", "hold / release the display"),
-    ("click / wheel", "place cursor / scroll"),
-    ("+ / -  ↑ / ↓", "zoom time axis in / out"),
-    ("p", "pause / resume input"),
+    ("click / wheel", "place the cursor / scroll"),
+    ("+ / -  ↑ / ↓", "zoom the time axis in / out"),
+    ("p", "pause / resume the input"),
     ("r", "start / stop recording"),
-    ("1 2 3 4", "toggle meter, equalizer, spectrogram, timeline"),
-    ("c", "cycle spectrogram colour map"),
-    ("s", "cycle frequency scale (log, mel, linear)"),
-    ("[ / ]", "lower / raise display floor"),
-    ("{ / }", "lower / raise display ceiling"),
+    ("x", "reset the max level and clip count"),
+    ("1 2 3 4", "show / hide levels, equalizer, spectrogram, timeline"),
+    ("c / s", "cycle colour map / frequency scale"),
+    ("[ / ]  { / }", "lower / raise the chart floor / ceiling"),
     ("? / F1", "toggle this help"),
     ("q / Esc", "quit"),
 ];
 
+/// What the level readouts mean.
+const LEGEND: &[(&str, &str)] = &[
+    ("peak  hold", "sample peak now; highest over the last few seconds"),
+    ("rms  avg", "RMS of the latest hop; smoothed average (the bar)"),
+    ("max  clips", "highest peak and clip events since start (x resets)"),
+    ("LUFS", "loudness over 0.4 s, 3 s and since the start"),
+    ("tone", "strongest tone that stands out, with its note"),
+];
+
+/// Width of the key column in the help.
+const HELP_KEY_W: usize = 20;
+
+/// Help rows `(key, text, is_legend)` for an inner width of `w`, wrapping long
+/// descriptions under their own column (or below the key when very narrow).
+pub fn help_rows(w: usize) -> Vec<(String, String, bool)> {
+    let wide = w >= HELP_KEY_W + 1 + 20;
+    let text_w = if wide { w - HELP_KEY_W - 1 } else { w.saturating_sub(3).max(8) };
+    let mut rows = Vec::new();
+    for (entries, legend) in [(HELP, false), (LEGEND, true)] {
+        for (k, v) in entries {
+            let mut chunks = wrap(v, text_w).into_iter();
+            if wide {
+                rows.push((k.to_string(), chunks.next().unwrap_or_default(), legend));
+            } else {
+                rows.push((k.to_string(), String::new(), legend));
+            }
+            rows.extend(chunks.map(|c| (String::new(), c, legend)));
+        }
+    }
+    rows
+}
+
+/// Greedy word wrap to `width` characters.
+fn wrap(s: &str, width: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    for word in s.split(' ') {
+        if !cur.is_empty() && cur.chars().count() + 1 + word.chars().count() > width {
+            out.push(std::mem::take(&mut cur));
+        }
+        if !cur.is_empty() {
+            cur.push(' ');
+        }
+        cur.push_str(word);
+    }
+    out.push(cur);
+    out
+}
+
 fn render_help(area: Rect, buf: &mut Buffer) {
-    let w = 66.min(area.width);
-    let h = (HELP.len() as u16 + 4).min(area.height);
+    let longest = HELP.iter().chain(LEGEND).map(|(_, v)| v.chars().count()).max().unwrap_or(0);
+    let w = ((HELP_KEY_W + 1 + longest + 3) as u16).min(area.width);
+    let rows = help_rows(w.saturating_sub(3) as usize);
+    let h = (rows.len() as u16 + 3).min(area.height);
     let r = Rect { x: area.x + (area.width - w) / 2, y: area.y + (area.height - h) / 2, width: w, height: h };
     Clear.render(r, buf);
-    let lines: Vec<Line> = HELP
-        .iter()
-        .map(|(k, v)| {
-            Line::from(vec![
-                Span::styled(format!(" {k:<20}"), Style::default().fg(Color::Yellow)),
-                Span::raw(*v),
-            ])
-        })
-        .collect();
+    let wide = w as usize >= HELP_KEY_W + 1 + 20 + 3;
+    let mut lines: Vec<Line> = Vec::new();
+    let mut in_legend = false;
+    for (k, v, legend) in rows {
+        if legend && !in_legend {
+            in_legend = true;
+            lines.push(Line::from(""));
+        }
+        let ks = Style::default().fg(if legend { Color::Cyan } else { Color::Yellow });
+        let (k, v) = if wide { (format!(" {k:<HELP_KEY_W$}"), v) } else if k.is_empty() { (String::new(), format!("   {v}")) } else { (format!(" {k}"), v) };
+        lines.push(Line::from(vec![Span::styled(k, ks), Span::raw(v)]));
+    }
     Paragraph::new(lines)
-        .block(Block::bordered().title(title(" Keys ")).title_bottom(" the cursor selects the frame shown by the meters "))
+        .block(Block::bordered().title(title(" Keys ")).title_bottom(" the cursor picks the moment the levels show "))
         .render(r, buf);
 }
 
@@ -431,6 +541,27 @@ mod tests {
         assert_eq!(db_row(-60.0, -60.0, 0.0, 10), 9);
         assert_eq!(db_row(-30.0, -60.0, 0.0, 10), 4);
         assert_eq!(db_row(-30.0, -60.0, 0.0, 0), 0);
+    }
+
+    #[test]
+    fn markers_sit_on_the_nearest_edge() {
+        // 5 rows over -60..0: 12 dB per row; -12 dB is the bottom edge of the top row.
+        assert_eq!(edge_marker(-12.0, -60.0, 0.0, 5), Some((0, '▁')));
+        assert_eq!(edge_marker(0.0, -60.0, 0.0, 5), Some((0, '▔')));
+        assert_eq!(edge_marker(-14.0, -60.0, 0.0, 5), Some((1, '▔')), "near the top of row 1");
+        assert_eq!(edge_marker(-22.0, -60.0, 0.0, 5), Some((1, '▁')), "near the bottom of row 1");
+        assert_eq!(edge_marker(-59.0, -60.0, 0.0, 5), Some((4, '▁')));
+        assert_eq!(edge_marker(-60.0, -60.0, 0.0, 5), None);
+        assert_eq!(edge_marker(f32::NEG_INFINITY, -60.0, 0.0, 5), None);
+        assert_eq!(edge_marker(-10.0, -60.0, 0.0, 0), None);
+        // Error never exceeds half a row.
+        for i in 1..600 {
+            let db = -60.0 + i as f32 * 0.1;
+            let (row, g) = edge_marker(db, -60.0, 0.0, 5).unwrap();
+            let edge = (4 - row) as f32 + if g == '▔' { 1.0 } else { 0.0 };
+            let h = (db + 60.0) / 12.0;
+            assert!((edge - h).abs() <= 0.5 + 1e-4, "{db}: edge {edge} vs {h}");
+        }
     }
 
     #[test]
@@ -474,8 +605,39 @@ mod tests {
         // A view reaching back before the stream start begins ticking at 0 s.
         let v = View { follow: true, cursor: 99, view_end: 99, span_secs: 4.0, dt: 0.01, width: 100 };
         let (_, ticks) = time_ticks(&v, clock, 10);
-        assert_eq!(ticks.first().unwrap().1, 0.5);
+        assert_eq!(ticks.first().unwrap().1, 0.0, "the stream start gets a 0 s tick");
         assert_eq!(ticks.last().unwrap(), &(99, 1.0));
+    }
+
+    #[test]
+    fn help_fits_its_width() {
+        for w in [20usize, 40, 60, 75, 120] {
+            let rows = help_rows(w);
+            assert!(rows.iter().any(|r| r.0 == "x"), "x listed");
+            for (k, v, _) in &rows {
+                let len = if w >= HELP_KEY_W + 21 { HELP_KEY_W + 1 + v.chars().count() } else { (k.chars().count() + 1).max(v.chars().count() + 3) };
+                assert!(len <= w.max(HELP_KEY_W), "{w}: {k:?} {v:?}");
+            }
+            // Nothing is lost: all words appear.
+            let text: String = rows.iter().map(|r| r.1.clone()).collect::<Vec<_>>().join(" ");
+            assert!(text.contains("columns)") && text.contains("note"), "{w}");
+        }
+        assert_eq!(wrap("a bb ccc", 4), ["a bb", "ccc"]);
+        assert_eq!(wrap("", 4), [""]);
+    }
+
+    #[test]
+    fn top_row_fits_readouts() {
+        // 80x24: body 23 rows, stereo needs 10.
+        assert_eq!(top_min_height(true, 2), 10);
+        assert_eq!(top_height(23, 10, 2), 10);
+        // Tall screens keep a third.
+        assert_eq!(top_height(60, 9, 2), 20);
+        // Never squeezes the charts below 4 rows each...
+        assert_eq!(top_height(15, 9, 2), 7);
+        // ...unless even a third would.
+        assert_eq!(top_height(6, 9, 2), 2);
+        assert_eq!(top_height(30, 9, 0), 30);
     }
 
     #[test]

@@ -1,7 +1,7 @@
 //! Graphic equalizer: one bar per band at the cursor frame, with peak caps.
 
 use super::colormap::{eq_gradient, to_color};
-use super::{cell_fill, db_row, db_to_height, draw_db_axis, eighth, fmt_freq, title};
+use super::{cell_fill, db_to_height, draw_db_axis, edge_marker, eighth, fmt_freq, title};
 use crate::app::App;
 use crate::dsp::quant::q_to_db;
 use ratatui::buffer::Buffer;
@@ -39,13 +39,12 @@ pub fn bar_band(i: usize, bars: usize, bands: usize) -> usize {
 }
 
 pub fn render(app: &mut App, area: Rect, buf: &mut Buffer) {
-    let bands = app.analysis.band_centers.len();
-    let block = Block::bordered().title(title(format!(
-        " Equalizer  {} bands · {}-{} Hz ",
-        bands,
-        fmt_freq(app.analysis.min_freq),
-        fmt_freq(app.analysis.max_freq)
-    )));
+    let a = &app.analysis;
+    let bands = a.band_centers.len();
+    let kind = if a.third_octave { "1/3 octave".to_string() } else { format!("{bands} bands") };
+    let full = format!(" Equalizer  {kind} · {}-{} Hz ", fmt_freq(a.min_freq), fmt_freq(a.max_freq));
+    let heading = if full.chars().count() + 2 <= area.width as usize { full } else { " Equalizer ".to_string() };
+    let block = Block::bordered().title(title(heading));
     let inner = block.inner(area);
     block.render(area, buf);
     if inner.height < 3 || inner.width < 8 {
@@ -63,7 +62,6 @@ pub fn render(app: &mut App, area: Rect, buf: &mut Buffer) {
     let mode = app.display.color_mode;
     let colors: Vec<Color> =
         (0..rows).map(|rb| to_color(mode, eq_gradient((rb as f32 + 0.5) / rows as f32))).collect();
-    let mut next_label_x = 0u16;
     for i in 0..bars {
         let b = bar_band(i, bars, bands);
         let (dx0, bw) = bar_span(i, bars, chart.width, gap);
@@ -79,24 +77,48 @@ pub fn render(app: &mut App, area: Rect, buf: &mut Buffer) {
                 buf[(x + dx, y)].set_char(eighth(fill)).set_fg(colors[rb]);
             }
         }
-        if let Some(&cap) = caps.get(b) {
-            let cdb = q_to_db(cap);
-            if cdb > lo {
-                let y = chart.y + db_row(cdb, lo, hi, rows);
-                for dx in 0..bw {
-                    let cell = &mut buf[(x + dx, y)];
-                    if cell.symbol() == " " {
-                        cell.set_char('▔').set_fg(Color::Gray);
-                    }
+        if let Some((row, glyph)) = caps.get(b).and_then(|&cap| edge_marker(q_to_db(cap), lo, hi, rows)) {
+            for dx in 0..bw {
+                let cell = &mut buf[(x + dx, chart.y + row)];
+                if cell.symbol() == " " {
+                    cell.set_char(glyph).set_fg(Color::Gray);
                 }
             }
         }
-        // Frequency labels, spaced so they never overlap.
-        let label = fmt_freq(app.analysis.band_centers[b]);
-        let lw = label.len() as u16;
-        if x >= next_label_x && x + lw <= inner.x + inner.width {
-            buf.set_string(x, chart.y + rows, &label, Style::default().fg(Color::DarkGray));
-            next_label_x = x + lw + 1;
+    }
+    draw_band_labels(app, buf, chart, bars, gap, inner.x + inner.width);
+}
+
+/// Frequency labels centred under their bars. Every band is labelled when the
+/// labels fit; otherwise only the major bands (octave centres for 1/3-octave
+/// bands), still never overlapping.
+fn draw_band_labels(app: &App, buf: &mut Buffer, chart: Rect, bars: usize, gap: u16, right: u16) {
+    let a = &app.analysis;
+    let bands = a.band_labels.len();
+    let y = chart.y + chart.height;
+    let place = |i: usize| {
+        let b = bar_band(i, bars, bands);
+        let (dx, bw) = bar_span(i, bars, chart.width, gap);
+        let lw = a.band_labels[b].chars().count() as u16;
+        let x = (chart.x + dx + bw / 2).saturating_sub(lw / 2).max(chart.x);
+        (b, x, lw)
+    };
+    let all_fit = bars == bands && {
+        let mut free = 0u16;
+        (0..bars).all(|i| {
+            let (_, x, lw) = place(i);
+            let ok = x >= free && x + lw <= right;
+            free = x + lw + 1;
+            ok
+        })
+    };
+    let style = Style::default().fg(Color::DarkGray);
+    let mut free = 0u16;
+    for i in 0..bars {
+        let (b, x, lw) = place(i);
+        if (all_fit || a.band_major[b]) && x >= free && x + lw <= right {
+            buf.set_string(x, y, &a.band_labels[b], style);
+            free = x + lw + 1;
         }
     }
 }

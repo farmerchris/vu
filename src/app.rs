@@ -230,6 +230,41 @@ impl View {
     }
 }
 
+/// Highest sample peak and number of clipping events since the start or the
+/// last reset. A run of consecutive clipped frames counts as one event.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Session {
+    pub max_db: f32,
+    pub clips: u64,
+    in_clip: bool,
+}
+
+impl Default for Session {
+    fn default() -> Self {
+        Session { max_db: crate::dsp::level::FLOOR_DB, clips: 0, in_clip: false }
+    }
+}
+
+impl Session {
+    pub fn add(&mut self, f: &crate::analyzer::Frame) {
+        for &p in &f.peak[..f.n()] {
+            self.max_db = self.max_db.max(p);
+        }
+        if f.clipped && !self.in_clip {
+            self.clips += 1;
+        }
+        self.in_clip = f.clipped;
+    }
+
+    /// Start counting again. A clip run in progress at the reset is not
+    /// counted a second time.
+    pub fn reset(&mut self) {
+        let in_clip = self.in_clip;
+        *self = Session::default();
+        self.in_clip = in_clip;
+    }
+}
+
 /// How often the numeric readouts refresh while following live input.
 pub const READOUT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 
@@ -289,6 +324,9 @@ pub struct AnalysisInfo {
     pub bin_hz: f32,
     pub bins: usize,
     pub band_centers: Vec<f32>,
+    pub band_labels: Vec<String>,
+    pub band_major: Vec<bool>,
+    pub third_octave: bool,
     pub frame_dt: f64,
     pub min_freq: f32,
     pub max_freq: f32,
@@ -335,6 +373,7 @@ pub struct App {
     /// Persistent problem with a live input (e.g. it went digitally silent).
     pub input_warning: Option<String>,
     pub readout: Readout,
+    pub session: Session,
     /// Times the live input was reopened after going silent.
     pub reopens: u32,
     pub recorder: Option<Recorder>,
@@ -376,6 +415,9 @@ impl App {
                 bin_hz: cfg.bin_hz(),
                 bins: analyzer.bins(),
                 band_centers: analyzer.bands.centers.clone(),
+                band_labels: analyzer.bands.labels.clone(),
+                band_major: analyzer.bands.major.clone(),
+                third_octave: analyzer.bands.third_octave,
                 frame_dt,
                 min_freq: cfg.min_freq,
                 max_freq: cfg.top_freq(),
@@ -401,6 +443,7 @@ impl App {
             message: None,
             input_warning: None,
             readout: Readout::default(),
+            session: Session::default(),
             reopens: 0,
             recorder: None,
             saved_recordings: Vec::new(),
@@ -423,6 +466,12 @@ impl App {
 
     pub fn paused(&self) -> bool {
         self.control.is_paused()
+    }
+
+    /// Store a new analysis frame and fold it into the session statistics.
+    pub fn push_frame(&mut self, f: crate::analyzer::Frame) {
+        self.session.add(&f);
+        self.history.push(f);
     }
 
     pub fn flash(&mut self, msg: impl Into<String>) {
@@ -528,6 +577,10 @@ impl App {
                 self.flash(if p { "input paused" } else { "input resumed" });
             }
             KeyCode::Char('r') => self.toggle_recording(),
+            KeyCode::Char('x') => {
+                self.session.reset();
+                self.flash("max level and clip count reset");
+            }
             KeyCode::Char('1') => self.toggle_panel(Panel::Meter),
             KeyCode::Char('2') => self.toggle_panel(Panel::Eq),
             KeyCode::Char('3') => self.toggle_panel(Panel::Spectrogram),
@@ -794,6 +847,53 @@ mod tests {
         assert_eq!(r.pick(5, false, ms(130), all), 5);
         assert_eq!(r.pick(6, false, ms(131), all), 6);
         assert_eq!(r.pick(30, true, ms(140), all), 30, "returning to live refreshes at once");
+    }
+
+    #[test]
+    fn session_tracks_max_and_clip_events() {
+        use crate::analyzer::Frame;
+        let floor = crate::dsp::level::FLOOR_DB;
+        let frame = |peak: f32, clipped: bool| {
+            let mut p = [floor; crate::analyzer::MAX_CHANNELS];
+            p[0] = peak;
+            p[1] = peak - 6.0;
+            Frame {
+                time: 0.0,
+                channels: 2,
+                peak: p,
+                peak_decay: p,
+                rms: p,
+                rms_avg: p,
+                lufs_m: floor,
+                lufs_s: floor,
+                lufs_i: floor,
+                peak_freq: None,
+                clipped,
+                spectrum: Box::new([]),
+                bands: Box::new([]),
+            }
+        };
+        let mut s = Session::default();
+        s.add(&frame(-20.0, false));
+        s.add(&frame(-3.0, false));
+        s.add(&frame(-10.0, false));
+        assert_eq!((s.max_db, s.clips), (-3.0, 0));
+        // Two consecutive clipped frames are one event; a later one is another.
+        s.add(&frame(0.0, true));
+        s.add(&frame(0.0, true));
+        s.add(&frame(-6.0, false));
+        s.add(&frame(0.0, true));
+        assert_eq!((s.max_db, s.clips), (0.0, 2));
+        s.reset();
+        assert_eq!((s.max_db, s.clips), (Session::default().max_db, 0));
+        // Resetting mid-clip does not count the same run again.
+        s.add(&frame(0.0, true));
+        s.reset();
+        s.add(&frame(0.0, true));
+        assert_eq!(s.clips, 0);
+        s.add(&frame(-6.0, false));
+        s.add(&frame(0.0, true));
+        assert_eq!(s.clips, 1);
     }
 
     #[test]

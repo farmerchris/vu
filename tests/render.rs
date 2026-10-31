@@ -13,6 +13,10 @@ const SR: u32 = 48_000;
 
 /// Build an app fed with `secs` seconds of a test signal (0.0 = empty history).
 fn make_app(args: &[&str], channels: usize, secs: f64) -> App {
+    make_app_with(args, channels, secs, "sweep:50:15000:2:-10")
+}
+
+fn make_app_with(args: &[&str], channels: usize, secs: f64, spec: &str) -> App {
     let cli = Cli::try_parse_from(std::iter::once("vu").chain(args.iter().copied())).unwrap();
     cli.validate().unwrap();
     let mut analyzer = Analyzer::new(AnalyzerConfig {
@@ -37,14 +41,14 @@ fn make_app(args: &[&str], channels: usize, secs: f64) -> App {
         kind: SourceKind::Generator,
     };
     let mut app = App::new(&cli, info, &analyzer, Arc::new(Control::default()), ColorMode::TrueColor);
-    let mut gen = Generator::new(parse_spec("sweep:50:15000:2:-10").unwrap(), SR);
+    let mut gen = Generator::new(parse_spec(spec).unwrap(), SR);
     let total = (secs * SR as f64) as usize;
     let mut done = 0;
     while done < total {
         let n = (total - done).min(4096);
         let mut chunk = vec![0.0f32; n * channels];
         gen.fill(&mut chunk, channels);
-        analyzer.push(&chunk, |f| app.history.push(f));
+        analyzer.push(&chunk, |f| app.push_frame(f));
         done += n;
     }
     app
@@ -54,7 +58,8 @@ use ratatui::backend::TestBackend;
 use ratatui::Terminal;
 use vu::app::Nav;
 
-const SIZES: [(u16, u16); 9] = [(1, 1), (2, 2), (5, 3), (10, 4), (20, 6), (40, 10), (80, 24), (200, 60), (300, 100)];
+const SIZES: [(u16, u16); 11] =
+    [(1, 1), (2, 2), (5, 3), (10, 4), (20, 6), (40, 10), (80, 24), (100, 1), (120, 2), (200, 60), (300, 100)];
 
 fn render(app: &mut App, w: u16, h: u16) -> Vec<String> {
     let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
@@ -217,4 +222,14 @@ fn view_width_tracks_terminal() {
     render(&mut app, 120, 20);
     assert!(app.view.width > a);
     assert_eq!(app.chart_rects.len(), 1);
+}
+
+#[test]
+fn clip_badge_and_session_line_fit_at_80x24() {
+    // A full-scale square wave clips continuously.
+    let mut app = make_app_with(&[], 2, 1.0, "square:100:0");
+    let screen = render(&mut app, 80, 24).join("\n");
+    assert!(screen.contains("CLIP"), "{screen}");
+    assert!(screen.contains("max") && screen.contains("1 clip"), "{screen}");
+    assert!(screen.contains("tone"), "{screen}");
 }

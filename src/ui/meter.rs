@@ -3,7 +3,7 @@
 //! and numeric readouts.
 
 use super::colormap::{zone_color, zone_color_dim};
-use super::{cell_fill, db_row, db_to_height, draw_db_axis, eighth, fmt_db, title};
+use super::{cell_fill, db_to_height, draw_db_axis, edge_marker, eighth, fmt_db, title};
 use crate::analyzer::Frame;
 use crate::app::App;
 use ratatui::buffer::Buffer;
@@ -14,17 +14,22 @@ use ratatui::widgets::{Block, Widget};
 const BAR_W: u16 = 3;
 const MAX_BAR_W: u16 = 8;
 const SCALE_W: u16 = 5;
-const TEXT_W: u16 = 34;
+const TEXT_W: u16 = 35;
 
 /// Smallest width that fits every bar and the readouts.
 pub fn preferred_width(channels: usize) -> u16 {
     2 + SCALE_W + bar_count(channels) * (BAR_W + 1) + TEXT_W
 }
 
+/// Narrowest equalizer worth showing beside the meter.
+const MIN_EQ_W: u16 = 24;
+
 /// Panel width when sharing a row of `total` columns with the equalizer: about
-/// two fifths of the row, never less than fits nor more than half.
+/// two fifths of the row, or whatever the readouts need when that is more, as
+/// long as the equalizer keeps `MIN_EQ_W` columns.
 pub fn width(channels: usize, total: u16) -> u16 {
-    (total * 2 / 5).max(preferred_width(channels)).min(total / 2)
+    let want = (total * 2 / 5).max(preferred_width(channels));
+    want.min(total.saturating_sub(MIN_EQ_W)).max(want.min(total / 2))
 }
 
 /// Channel bars plus the loudness bar.
@@ -82,10 +87,9 @@ fn draw_bar(buf: &mut Buffer, x: u16, bw: u16, area: Rect, lo: f32, hi: f32, bar
             }
         }
     }
-    if let Some(h) = bar.hold.filter(|h| *h > lo) {
-        let y = area.y + db_row(h, lo, hi, rows);
+    if let Some((row, glyph)) = bar.hold.and_then(|h| edge_marker(h, lo, hi, rows)) {
         for dx in 0..bw {
-            buf[(x + dx, y)].set_char('▔').set_fg(Color::White).set_bg(Color::Reset);
+            buf[(x + dx, area.y + row)].set_char(glyph).set_fg(Color::White);
         }
     }
     let label_y = area.y + rows;
@@ -145,6 +149,9 @@ pub fn render(app: &mut App, area: Rect, buf: &mut Buffer) {
         return;
     }
     let tw = (bars_end - tx) as usize;
+    // Blank separator rows only when there is room for them.
+    let needed = 1 + n + 1 + 2 + 1 + clipped as usize;
+    let spacious = inner.height as usize >= needed + 2;
     let mut y = inner.y;
     let mut line = |buf: &mut Buffer, s: String, st: Style| {
         if y < inner.y + inner.height {
@@ -155,20 +162,33 @@ pub fn render(app: &mut App, area: Rect, buf: &mut Buffer) {
     };
     let head = Style::default().fg(Color::DarkGray);
     let val = Style::default().fg(Color::White);
-    line(buf, row("", &["peak", "hold", "rms", "avg"]), head);
+    line(buf, row("dBFS", &["peak", "hold", "rms", "avg"]), head);
     for c in 0..n {
         let st = Style::default().fg(zone_color(f.peak[c].max(hold[c])));
         let vals = [f.peak[c], hold[c], f.rms[c], f.rms_avg[c]].map(fmt_db);
         line(buf, row(&channel_label(c, n), &vals), st);
     }
-    line(buf, String::new(), val);
+    let s = &app.session;
+    let clip_style = if s.clips > 0 { Style::default().fg(Color::LightRed) } else { head };
+    line(buf, session_text(s.max_db, s.clips), clip_style);
+    if spacious {
+        line(buf, String::new(), val);
+    }
     line(buf, row("LUFS", &["mom", "short", "integ"]), head);
     line(buf, row("", &[f.lufs_m, f.lufs_s, f.lufs_i].map(fmt_db)), Style::default().fg(Color::Cyan));
-    line(buf, String::new(), val);
-    line(buf, peak_freq_text(f), val);
+    if spacious {
+        line(buf, String::new(), val);
+    }
+    line(buf, tone_text(f), val);
     if clipped {
         line(buf, " CLIP ".into(), Style::default().fg(Color::White).bg(Color::Red).add_modifier(Modifier::BOLD));
     }
+}
+
+/// Session line: highest peak and clip events since the start (or `x`).
+pub fn session_text(max_db: f32, clips: u64) -> String {
+    let unit = if clips == 1 { "clip" } else { "clips" };
+    format!("{} {:>COL_W$} {unit}", row("max", &[fmt_db(max_db)]), clips)
 }
 
 /// Width of each readout column; values are right-aligned under their headers.
@@ -183,10 +203,11 @@ pub fn row<S: AsRef<str>>(label: &str, cols: &[S]) -> String {
     s
 }
 
-fn peak_freq_text(f: &Frame) -> String {
+/// Strongest tone and its nearest note, or a dash when nothing stands out.
+fn tone_text(f: &Frame) -> String {
     match f.peak_freq {
-        Some((hz, db)) if db > -100.0 => format!("peak {hz:>7.1} Hz {:>COL_W$} dB {}", fmt_db(db), note_name(hz)),
-        _ => "peak —".into(),
+        Some((hz, db)) if db > -100.0 => format!("tone {hz:>7.1} Hz {:>COL_W$} dB {}", fmt_db(db), note_name(hz)),
+        _ => "tone —".into(),
     }
 }
 
@@ -219,14 +240,20 @@ mod tests {
 
     #[test]
     fn widths() {
-        // Narrow screens get the minimum, wide ones two fifths, never over half.
-        assert_eq!(width(1, 100), 49);
+        // Wide screens get two fifths; narrow ones what the readouts need.
+        assert_eq!(width(1, 100), 50);
         assert_eq!(width(1, 145), 58);
         assert_eq!(width(1, 300), 120);
-        assert_eq!(width(8, 145), 72);
+        assert_eq!(width(8, 145), 78);
+        // 80 columns: the stereo readouts fit, the equalizer keeps 26.
+        assert_eq!(width(2, 80), preferred_width(2));
+        assert_eq!(80 - width(2, 80), 26);
+        // Too narrow for both: the equalizer keeps its minimum, or half.
+        assert_eq!(width(2, 60), 36);
+        assert_eq!(width(2, 40), 20);
         // Minimum layout keeps 3-column bars; spare room widens them up to 8.
         assert_eq!(bar_width(2, preferred_width(1) - 2), BAR_W);
-        assert_eq!(bar_width(2, 56), 7);
+        assert_eq!(bar_width(2, 56), 6);
         assert_eq!(bar_width(2, 200), MAX_BAR_W);
         assert_eq!(bar_width(9, 20), BAR_W);
     }
@@ -235,7 +262,7 @@ mod tests {
     fn readout_columns_align() {
         // Column i ends at the same character position in every row.
         let ends = |r: &str| -> Vec<usize> { (1..=4).map(|i| 4 + i * (1 + COL_W)).filter(|&e| e <= r.len()).collect() };
-        let head = row("", &["peak", "hold", "rms", "avg"]);
+        let head = row("dBFS", &["peak", "hold", "rms", "avg"]);
         for vals in [["-48.7", "-37.8", "-57.8", "-58.3"], [" -inf", " -inf", "-113.3", "  0.0"]] {
             let r = row("M", &vals);
             assert_eq!(r.len(), head.len());
@@ -245,6 +272,9 @@ mod tests {
             }
         }
         assert_eq!(row("LUFS", &["mom", "short", "integ"]).len(), row("", &["-60.9", "-59.7", "-55.7"]).len());
+        assert_eq!(session_text(-3.04, 0), "max    -3.0      0 clips");
+        assert_eq!(session_text(0.0, 1), "max     0.0      1 clip");
+        assert!(session_text(-3.0, 0).len() <= TEXT_W as usize);
         // The frequency line keeps its layout as the value changes.
         assert_eq!(format!("{:>7.1}", 92.6f32).len(), format!("{:>7.1}", 10298.8f32).len());
     }
