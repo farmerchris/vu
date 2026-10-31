@@ -114,7 +114,7 @@ mod tests {
         assert!(r.contains("-6.02"), "{r}");
         assert!(r.contains("-9.03"), "{r}");
         assert!(r.contains("3.01"), "{r}");
-        assert!(r.contains("A4"), "{r}");
+        assert!(r.contains("A 4"), "{r}");
         // K-weighting is ~0.7 dB lower at 440 Hz than at the 997 Hz reference.
         assert!(r.contains("Integrated    -6.7 LUFS"), "{r}");
         // Short-term needs 3 s of audio.

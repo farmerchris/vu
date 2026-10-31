@@ -230,6 +230,33 @@ impl View {
     }
 }
 
+/// How often the numeric readouts refresh while following live input.
+pub const READOUT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Frame whose values the numeric readouts show. While live it is refreshed
+/// every `READOUT_INTERVAL` so the digits are readable; when the cursor is
+/// placed by hand it tracks the cursor exactly.
+#[derive(Default)]
+pub struct Readout {
+    shown: Option<(usize, Instant)>,
+}
+
+impl Readout {
+    pub fn pick(&mut self, cursor: usize, follow: bool, now: Instant, exists: impl Fn(usize) -> bool) -> usize {
+        if follow {
+            if let Some((f, at)) = self.shown {
+                if now.duration_since(at) < READOUT_INTERVAL && f <= cursor && exists(f) {
+                    return f;
+                }
+            }
+            self.shown = Some((cursor, now));
+        } else {
+            self.shown = None;
+        }
+        cursor
+    }
+}
+
 /// Redraws in the last second and the most recent draw time.
 #[derive(Default)]
 pub struct FpsMeter {
@@ -307,6 +334,7 @@ pub struct App {
     pub message: Option<(String, Instant)>,
     /// Persistent problem with a live input (e.g. it went digitally silent).
     pub input_warning: Option<String>,
+    pub readout: Readout,
     /// Times the live input was reopened after going silent.
     pub reopens: u32,
     pub recorder: Option<Recorder>,
@@ -372,6 +400,7 @@ impl App {
             ingest_done: false,
             message: None,
             input_warning: None,
+            readout: Readout::default(),
             reopens: 0,
             recorder: None,
             saved_recordings: Vec::new(),
@@ -748,6 +777,23 @@ mod tests {
         assert_eq!(v.bucket_end(0), 2);
         assert_eq!(v.bucket_end(3), 4);
         assert_eq!(v.bucket_end(5), 7);
+    }
+
+    #[test]
+    fn readout_refreshes_every_interval_while_live() {
+        let t0 = Instant::now();
+        let ms = |n: u64| t0 + std::time::Duration::from_millis(n);
+        let mut r = Readout::default();
+        let all = |_| true;
+        assert_eq!(r.pick(10, true, ms(0), all), 10);
+        assert_eq!(r.pick(12, true, ms(50), all), 10, "held within the interval");
+        assert_eq!(r.pick(15, true, ms(99), all), 10);
+        assert_eq!(r.pick(19, true, ms(100), all), 19, "refreshed after it");
+        assert_eq!(r.pick(20, true, ms(120), |i| i != 19), 20, "evicted frame is replaced");
+        // Scrolling back shows the cursor's frame immediately.
+        assert_eq!(r.pick(5, false, ms(130), all), 5);
+        assert_eq!(r.pick(6, false, ms(131), all), 6);
+        assert_eq!(r.pick(30, true, ms(140), all), 30, "returning to live refreshes at once");
     }
 
     #[test]

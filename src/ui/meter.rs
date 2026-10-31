@@ -100,6 +100,8 @@ pub fn render(app: &mut App, area: Rect, buf: &mut Buffer) {
     if inner.height < 3 || inner.width < SCALE_W + BAR_W {
         return;
     }
+    let history = &app.history;
+    let shown = app.readout.pick(app.view.cursor, app.view.follow, std::time::Instant::now(), |i| history.get(i).is_some());
     let Some(f) = app.history.get(app.view.cursor) else {
         buf.set_string(inner.x + 1, inner.y, "waiting for audio…", Style::default().fg(Color::DarkGray));
         return;
@@ -108,7 +110,6 @@ pub fn render(app: &mut App, area: Rect, buf: &mut Buffer) {
     let hi = 0.0;
     let n = f.n();
     let hold = app.history.peak_hold(app.view.cursor, app.display.hold_frames);
-    let clipped = app.history.clipped(app.view.cursor, app.display.hold_frames);
 
     let bars_area = Rect { height: inner.height - 1, ..inner };
     let scale = Rect { width: SCALE_W, ..bars_area };
@@ -134,7 +135,11 @@ pub fn render(app: &mut App, area: Rect, buf: &mut Buffer) {
         x += bw + 1;
     }
 
-    // Numeric readouts to the right of the bars.
+    // Numeric readouts to the right of the bars, refreshed at a readable rate
+    // while live, in fixed-width columns.
+    let f = app.history.get(shown).unwrap_or(f);
+    let hold = app.history.peak_hold(shown, app.display.hold_frames);
+    let clipped = app.history.clipped(shown, app.display.hold_frames);
     let tx = x + 1;
     if tx + 20 > bars_end {
         return;
@@ -150,18 +155,15 @@ pub fn render(app: &mut App, area: Rect, buf: &mut Buffer) {
     };
     let head = Style::default().fg(Color::DarkGray);
     let val = Style::default().fg(Color::White);
-    line(buf, "     peak  hold   rms  avg".into(), head);
+    line(buf, row("", &["peak", "hold", "rms", "avg"]), head);
     for c in 0..n {
         let st = Style::default().fg(zone_color(f.peak[c].max(hold[c])));
-        line(
-            buf,
-            format!("{:>2} {} {} {} {}", channel_label(c, n), fmt_db(f.peak[c]), fmt_db(hold[c]), fmt_db(f.rms[c]), fmt_db(f.rms_avg[c])),
-            st,
-        );
+        let vals = [f.peak[c], hold[c], f.rms[c], f.rms_avg[c]].map(fmt_db);
+        line(buf, row(&channel_label(c, n), &vals), st);
     }
     line(buf, String::new(), val);
-    line(buf, "LUFS  mom.  short  integ.".into(), head);
-    line(buf, format!("     {} {}  {}", fmt_db(f.lufs_m), fmt_db(f.lufs_s), fmt_db(f.lufs_i)), Style::default().fg(Color::Cyan));
+    line(buf, row("LUFS", &["mom", "short", "integ"]), head);
+    line(buf, row("", &[f.lufs_m, f.lufs_s, f.lufs_i].map(fmt_db)), Style::default().fg(Color::Cyan));
     line(buf, String::new(), val);
     line(buf, peak_freq_text(f), val);
     if clipped {
@@ -169,14 +171,27 @@ pub fn render(app: &mut App, area: Rect, buf: &mut Buffer) {
     }
 }
 
+/// Width of each readout column; values are right-aligned under their headers.
+const COL_W: usize = 6;
+
+/// A readout row: a 4-character label, then fixed-width right-aligned columns.
+pub fn row<S: AsRef<str>>(label: &str, cols: &[S]) -> String {
+    let mut s = format!("{label:<4}");
+    for c in cols {
+        s.push_str(&format!(" {:>COL_W$}", c.as_ref()));
+    }
+    s
+}
+
 fn peak_freq_text(f: &Frame) -> String {
     match f.peak_freq {
-        Some((hz, db)) if db > -100.0 => format!("peak {hz:.1} Hz {} dB {}", fmt_db(db).trim(), note_name(hz)),
+        Some((hz, db)) if db > -100.0 => format!("peak {hz:>7.1} Hz {:>COL_W$} dB {}", fmt_db(db), note_name(hz)),
         _ => "peak —".into(),
     }
 }
 
-/// Nearest musical note with cents offset, e.g. "A4 +0c".
+/// Nearest musical note with cents offset in a fixed width, e.g. "A 4 +00c",
+/// "F#2 -41c", so the readout does not shift as the note changes.
 pub fn note_name(hz: f32) -> String {
     const NAMES: [&str; 12] = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
     if hz <= 0.0 || !hz.is_finite() {
@@ -186,7 +201,7 @@ pub fn note_name(hz: f32) -> String {
     let n = midi.round();
     let cents = ((midi - n) * 100.0).round() as i32;
     let ni = n as i32;
-    format!("{}{} {:+}c", NAMES[ni.rem_euclid(12) as usize], ni.div_euclid(12) - 1, cents)
+    format!("{:<2}{} {:+03}c", NAMES[ni.rem_euclid(12) as usize], ni.div_euclid(12) - 1, cents)
 }
 
 #[cfg(test)]
@@ -217,11 +232,35 @@ mod tests {
     }
 
     #[test]
+    fn readout_columns_align() {
+        // Column i ends at the same character position in every row.
+        let ends = |r: &str| -> Vec<usize> { (1..=4).map(|i| 4 + i * (1 + COL_W)).filter(|&e| e <= r.len()).collect() };
+        let head = row("", &["peak", "hold", "rms", "avg"]);
+        for vals in [["-48.7", "-37.8", "-57.8", "-58.3"], [" -inf", " -inf", "-113.3", "  0.0"]] {
+            let r = row("M", &vals);
+            assert_eq!(r.len(), head.len());
+            for (e, (h, v)) in ends(&r).into_iter().zip(["peak", "hold", "rms", "avg"].iter().zip(vals)) {
+                assert!(head[..e].ends_with(h), "{head:?} col {h}");
+                assert!(r[..e].ends_with(v.trim()), "{r:?} col {v}");
+            }
+        }
+        assert_eq!(row("LUFS", &["mom", "short", "integ"]).len(), row("", &["-60.9", "-59.7", "-55.7"]).len());
+        // The frequency line keeps its layout as the value changes.
+        assert_eq!(format!("{:>7.1}", 92.6f32).len(), format!("{:>7.1}", 10298.8f32).len());
+    }
+
+    #[test]
     fn notes() {
-        assert_eq!(note_name(440.0), "A4 +0c");
-        assert_eq!(note_name(261.63), "C4 +0c");
-        assert_eq!(note_name(27.5), "A0 +0c");
-        assert_eq!(note_name(446.0), "A4 +23c");
+        assert_eq!(note_name(440.0), "A 4 +00c");
+        assert_eq!(note_name(261.63), "C 4 +00c");
+        assert_eq!(note_name(27.5), "A 0 +00c");
+        assert_eq!(note_name(446.0), "A 4 +23c");
+        assert_eq!(note_name(92.6), "F#2 +02c");
+        assert_eq!(note_name(87.0), "F 2 -06c");
+        // Same width across notes and cents.
+        for hz in [30.0, 92.6, 87.0, 440.0, 1234.5, 9000.0] {
+            assert_eq!(note_name(hz).chars().count(), 8, "{hz}");
+        }
         assert_eq!(note_name(0.0), "—");
     }
 }
