@@ -2,7 +2,7 @@
 
 A full-screen terminal sound meter written in Rust. It shows:
 
-- **Levels**: per-channel RMS bars (300 ms average) with a decaying peak envelope, a peak-hold marker, a momentary-loudness bar, and readouts for peak, hold, RMS, EBU R128 loudness (momentary, short-term, integrated), the dominant frequency and its musical note, and clipping.
+- **Levels**: per-channel RMS bars (300 ms average) with a decaying peak envelope, a peak-hold marker, a momentary-loudness bar, and readouts for peak, hold, RMS, EBU R128 loudness (momentary, short-term, integrated), the dominant frequency and its musical note (shown only when a tone stands at least 15 dB above nearby bins, so hiss reads `—`), and clipping.
 - **Equalizer**: log-spaced graphic-EQ bands (31 by default) with peak caps.
 - **Spectrogram**: a scrolling spectrogram on a log, mel or linear frequency axis. Each terminal cell holds two pixels.
 - **Timeline**: peak and RMS levels over time.
@@ -56,6 +56,8 @@ Other options (see `vu --help`): `--fft-size`, `--hop`, `--window`, `-w/--weight
 | [ ] / { } | lower or raise the display floor / ceiling |
 | ? | help |
 | q / Esc | quit |
+
+The bottom edges of the spectrogram and timeline carry a time axis with ticks at round times (0.5 s, 1 s, 5 s, 10 s, … depending on zoom), and the timeline title shows the visible range, e.g. `0:08.032 – 0:13.845 (5.85 s)`.
 
 The cursor (`▼` and a vertical line on the spectrogram and timeline) marks the analysis frame that the level meters and equalizer are showing. Scrolling back moves the cursor through the stored history, and End returns to live.
 

@@ -43,6 +43,132 @@ pub fn db_to_height(db: f32, lo: f32, hi: f32, rows: u16) -> f32 {
     ((db - lo) / (hi - lo)).clamp(0.0, 1.0) * rows as f32
 }
 
+/// Smallest "round" tick interval (s) that leaves at least `min_cols` columns
+/// between ticks when each column spans `secs_per_col` seconds.
+pub fn tick_step(secs_per_col: f64, min_cols: usize) -> f64 {
+    const STEPS: [f64; 19] = [
+        0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 15.0, 30.0, 60.0, 120.0, 300.0, 600.0, 900.0, 1800.0, 3600.0,
+        7200.0, 14400.0,
+    ];
+    let need = secs_per_col * min_cols as f64;
+    STEPS.into_iter().find(|&s| s >= need).unwrap_or(STEPS[STEPS.len() - 1])
+}
+
+/// Tick label: `5s`, `2.5s`, `0.25s` under a minute, `1:30` / `1:30.5` past it,
+/// `1:02:00` past an hour. Decimals follow the tick step.
+pub fn fmt_tick(t: f64, step: f64) -> String {
+    let dec = if step >= 1.0 { 0 } else if step >= 0.1 { 1 } else { 2 };
+    let scale = 10f64.powi(dec);
+    let t = (t * scale).round() / scale;
+    if t < 60.0 {
+        return format!("{t:.dec$}s", dec = dec as usize);
+    }
+    let whole = t.floor() as u64;
+    let frac = t - whole as f64;
+    let (h, m, s) = (whole / 3600, whole / 60 % 60, whole % 60);
+    let frac = if dec > 0 { format!("{:.dec$}", frac, dec = dec as usize)[1..].to_string() } else { String::new() };
+    if h > 0 {
+        format!("{h}:{m:02}:{s:02}{frac}")
+    } else {
+        format!("{m}:{s:02}{frac}")
+    }
+}
+
+/// Seconds of stream time at each frame, anchored on one known frame.
+#[derive(Clone, Copy)]
+pub struct Clock {
+    pub frame: usize,
+    pub time: f64,
+    pub dt: f64,
+}
+
+impl Clock {
+    pub fn of(app: &App) -> Option<Clock> {
+        let first = app.history.first();
+        let f = app.history.get(first)?;
+        Some(Clock { frame: first, time: f.time, dt: app.analysis.frame_dt })
+    }
+
+    pub fn time(&self, f: usize) -> f64 {
+        self.time + (f as f64 - self.frame as f64) * self.dt
+    }
+
+    /// Nearest frame to time `t`, if not before frame 0.
+    pub fn frame(&self, t: f64) -> Option<usize> {
+        let f = self.frame as f64 + ((t - self.time) / self.dt).round();
+        (f >= 0.0).then_some(f as usize)
+    }
+}
+
+/// Tick positions `(column, seconds)` at round times across the view.
+pub fn time_ticks(view: &crate::app::View, clock: Clock, min_cols: usize) -> (f64, Vec<(usize, f64)>) {
+    let step = tick_step(clock.dt * view.zoom as f64, min_cols);
+    let Some(start) = view.column_frame(0).or_else(|| view.column_frame(view.width - 1).map(|_| 0)) else {
+        return (step, Vec::new());
+    };
+    let start = (start + 1).saturating_sub(view.zoom);
+    let (t0, t1) = (clock.time(start).max(0.0), clock.time(view.view_end));
+    let mut ticks = Vec::new();
+    let mut k = (t0 / step).ceil() as i64;
+    while (k as f64) * step <= t1 + 1e-9 {
+        let t = k as f64 * step;
+        if let Some(c) = clock.frame(t).and_then(|f| view.frame_column(f)) {
+            if ticks.last().is_none_or(|&(lc, _)| c > lc) {
+                ticks.push((c, t));
+            }
+        }
+        k += 1;
+    }
+    (step, ticks)
+}
+
+/// Columns kept between time ticks, enough for a label like `1:02:30`.
+const TICK_SPACING: usize = 10;
+
+/// Draw time ticks into the bottom border of a chart panel: `┴` marks the
+/// column, with its label to the right.
+pub fn draw_time_axis(buf: &mut Buffer, app: &App, area: Rect, chart: Rect) {
+    let Some(clock) = Clock::of(app) else { return };
+    if area.height < 2 {
+        return;
+    }
+    let y = area.y + area.height - 1;
+    let (step, ticks) = time_ticks(&app.view, clock, TICK_SPACING);
+    let end = area.x + area.width - 1;
+    let style = Style::default().fg(Color::Gray);
+    let mut free_x = chart.x;
+    for (c, t) in ticks {
+        let x = chart.x + c as u16;
+        if x < free_x || x >= end {
+            continue;
+        }
+        buf[(x, y)].set_char('┴');
+        let label = fmt_tick(t, step);
+        let lw = label.len() as u16;
+        if x + 1 + lw < end {
+            buf.set_string(x + 1, y, &label, style);
+            free_x = x + 2 + lw;
+        } else {
+            free_x = x + 1;
+        }
+    }
+}
+
+/// Visible time range `start – end (span)` for chart titles.
+pub fn view_range_text(app: &App) -> String {
+    let span = app.analysis.frame_dt * (app.view.zoom * app.view.width) as f64;
+    let span_txt = if span < 10.0 { format!("{span:.2} s") } else { format!("{span:.1} s") };
+    let Some(clock) = Clock::of(app) else { return span_txt };
+    let v = &app.view;
+    let last = app.history.last().unwrap_or(v.view_end).min(v.view_end);
+    let start = (v.view_end + 1).saturating_sub(v.zoom * v.width);
+    format!(
+        "{} – {} ({span_txt})",
+        fmt_time(clock.time(start).max(0.0)),
+        fmt_time(clock.time(last).max(0.0))
+    )
+}
+
 /// `m:ss.mmm`, or `h:mm:ss.mmm` past an hour.
 pub fn fmt_time(secs: f64) -> String {
     let ms_total = (secs.max(0.0) * 1000.0).round() as u64;
@@ -156,7 +282,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         let (m, e) = (app.display.shown(Panel::Meter), app.display.shown(Panel::Eq));
         let (mr, er) = match (m, e) {
             (true, true) => {
-                let mw = meter::preferred_width(app.analysis.channels).min(r.width / 2);
+                let mw = meter::width(app.analysis.channels, r.width);
                 let [a, b] = Layout::horizontal([Constraint::Length(mw), Constraint::Fill(1)]).areas(r);
                 (Some(a), Some(b))
             }
@@ -310,6 +436,44 @@ mod tests {
         assert_eq!(db_label_step(96.0, 40, 2), 6.0);
         assert_eq!(db_label_step(96.0, 10, 2), 20.0);
         assert_eq!(db_label_step(60.0, 1, 2), 120.0);
+    }
+
+    #[test]
+    fn ticks_are_round() {
+        assert_eq!(tick_step(0.0853, 10), 1.0);
+        assert_eq!(tick_step(0.0213, 10), 0.5);
+        assert_eq!(tick_step(0.6, 10), 10.0);
+        assert_eq!(tick_step(1.6, 10), 30.0);
+        assert_eq!(tick_step(1e6, 10), 14400.0);
+        assert_eq!(fmt_tick(10.0, 1.0), "10s");
+        assert_eq!(fmt_tick(2.5, 0.5), "2.5s");
+        assert_eq!(fmt_tick(0.25, 0.05), "0.25s");
+        assert_eq!(fmt_tick(90.0, 10.0), "1:30");
+        assert_eq!(fmt_tick(90.5, 0.5), "1:30.5");
+        assert_eq!(fmt_tick(3720.0, 60.0), "1:02:00");
+        assert_eq!(fmt_tick(59.99, 1.0), "1:00");
+    }
+
+    #[test]
+    fn tick_columns() {
+        use crate::app::View;
+        // 100 columns, 4 frames per column, 0.01 s per frame: 0.04 s/col, 4 s visible.
+        let v = View { follow: true, cursor: 999, view_end: 999, zoom: 4, width: 100 };
+        let clock = Clock { frame: 0, time: 0.01, dt: 0.01 };
+        let (step, ticks) = time_ticks(&v, clock, 10);
+        assert_eq!(step, 0.5);
+        let times: Vec<f64> = ticks.iter().map(|t| t.1).collect();
+        assert_eq!(times, vec![6.5, 7.0, 7.5, 8.0, 8.5, 9.0, 9.5, 10.0]);
+        // 10 s is frame 999, the last column; ticks 0.5 s apart are 12-13 columns apart.
+        assert_eq!(ticks.last().unwrap().0, 99);
+        for w in ticks.windows(2) {
+            assert!((12..=13).contains(&(w[1].0 - w[0].0)));
+        }
+        // A view reaching back before the stream start begins ticking at 0 s.
+        let v = View { follow: true, cursor: 99, view_end: 99, zoom: 4, width: 100 };
+        let (_, ticks) = time_ticks(&v, clock, 10);
+        assert_eq!(ticks.first().unwrap().1, 0.5);
+        assert_eq!(ticks.last().unwrap(), &(99, 1.0));
     }
 
     #[test]

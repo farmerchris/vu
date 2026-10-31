@@ -167,10 +167,15 @@ impl View {
 
     /// Column containing the cursor, if visible.
     pub fn cursor_column(&self) -> Option<usize> {
-        if self.cursor > self.view_end {
+        self.frame_column(self.cursor)
+    }
+
+    /// Column whose bucket holds frame `f`, if visible.
+    pub fn frame_column(&self, f: usize) -> Option<usize> {
+        if f > self.view_end {
             return None;
         }
-        let back = (self.view_end - self.cursor) / self.zoom;
+        let back = (self.view_end - f) / self.zoom;
         (back < self.width).then(|| self.width - 1 - back)
     }
 }

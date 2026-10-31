@@ -9,18 +9,24 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
 use ratatui::widgets::{Block, Widget};
 
-/// Bar geometry: `(bars, bar_width, gap)` for `bands` bands in `width` columns.
-pub fn bar_layout(bands: usize, width: u16) -> (usize, u16, u16) {
+/// Number of bars and the gap between them for `bands` bands in `width` columns.
+pub fn bar_layout(bands: usize, width: u16) -> (usize, u16) {
     let w = width as usize;
     if bands == 0 || w == 0 {
-        return (0, 0, 0);
+        return (0, 0);
     }
     if w < bands {
-        return (w, 1, 0);
+        return (w, 0);
     }
-    let per = w / bands;
-    let gap = if per >= 3 { 1 } else { 0 };
-    (bands, (per - gap as usize) as u16, gap)
+    (bands, if w / bands >= 3 { 1 } else { 0 })
+}
+
+/// Column offset and width of bar `i` of `bars` spread across `width` columns,
+/// so the bars fill the whole width (widths differ by at most one column).
+pub fn bar_span(i: usize, bars: usize, width: u16, gap: u16) -> (u16, u16) {
+    let edge = |j: usize| (j * width as usize / bars.max(1)) as u16;
+    let (a, b) = (edge(i), edge(i + 1));
+    (a, (b - a).saturating_sub(gap).max(1))
 }
 
 /// Band shown by bar `i` of `bars` when bands are resampled to fit.
@@ -52,9 +58,7 @@ pub fn render(app: &mut App, area: Rect, buf: &mut Buffer) {
     draw_db_axis(buf, axis, lo, hi);
     app.history.band_hold(app.view.cursor, app.display.hold_frames, &mut app.band_hold_buf);
     let caps = &app.band_hold_buf;
-    let (bars, bw, gap) = bar_layout(bands, chart.width);
-    let used = bars as u16 * (bw + gap);
-    let x0 = chart.x + (chart.width - used.min(chart.width)) / 2;
+    let (bars, gap) = bar_layout(bands, chart.width);
     let rows = chart.height;
     let mode = app.display.color_mode;
     let colors: Vec<Color> =
@@ -62,7 +66,8 @@ pub fn render(app: &mut App, area: Rect, buf: &mut Buffer) {
     let mut next_label_x = 0u16;
     for i in 0..bars {
         let b = bar_band(i, bars, bands);
-        let x = x0 + i as u16 * (bw + gap);
+        let (dx0, bw) = bar_span(i, bars, chart.width, gap);
+        let x = chart.x + dx0;
         let h = db_to_height(q_to_db(f.bands[b]), lo, hi, rows);
         for rb in 0..rows as usize {
             let fill = cell_fill(h, rb);
@@ -102,15 +107,26 @@ mod tests {
 
     #[test]
     fn layout_fits_width() {
-        assert_eq!(bar_layout(31, 124), (31, 3, 1));
-        assert_eq!(bar_layout(31, 62), (31, 2, 0));
-        assert_eq!(bar_layout(31, 20), (20, 1, 0));
-        assert_eq!(bar_layout(0, 20), (0, 0, 0));
-        assert_eq!(bar_layout(10, 0), (0, 0, 0));
-        for (bands, w) in [(31, 200), (8, 33), (64, 64), (100, 50)] {
-            let (n, bw, gap) = bar_layout(bands, w);
-            assert!(n as u16 * (bw + gap) <= w);
-            assert!(bw >= 1);
+        assert_eq!(bar_layout(31, 124), (31, 1));
+        assert_eq!(bar_layout(31, 62), (31, 0));
+        assert_eq!(bar_layout(31, 20), (20, 0));
+        assert_eq!(bar_layout(0, 20), (0, 0));
+        assert_eq!(bar_layout(10, 0), (0, 0));
+    }
+
+    #[test]
+    fn bars_fill_the_width() {
+        for (bands, w) in [(31, 89), (31, 200), (8, 33), (64, 64), (100, 50), (31, 31)] {
+            let (n, gap) = bar_layout(bands, w);
+            let spans: Vec<_> = (0..n).map(|i| bar_span(i, n, w, gap)).collect();
+            assert_eq!(spans[0].0, 0);
+            let (x, bw) = spans[n - 1];
+            assert_eq!(x + bw + gap, w, "{bands} bands in {w}");
+            for p in spans.windows(2) {
+                assert!(p[0].0 + p[0].1 + gap == p[1].0, "contiguous");
+                assert!(p[0].1.abs_diff(p[1].1) <= 1);
+                assert!(p[0].1 >= 1);
+            }
         }
     }
 

@@ -107,6 +107,29 @@ pub fn peak_frequency(power: &[f32], bin_hz: f32, lo: usize, hi: usize) -> Optio
     Some(((k as f32 + p) * bin_hz, b - 0.25 * (a - c) * p))
 }
 
+/// How far bin `k` stands above the median of its neighbourhood, in dB: bins
+/// within `reach` of `k`, excluding the `skip` bins either side that belong to
+/// its own window main lobe. Tones score high; broadband hiss scores ~10 dB.
+pub fn prominence_db(power: &[f32], k: usize, skip: usize, reach: usize) -> f32 {
+    const MAX_REACH: usize = 32;
+    let reach = reach.min(MAX_REACH);
+    let mut near = [0.0f32; 2 * MAX_REACH];
+    let mut n = 0;
+    for d in skip + 1..=reach {
+        for i in [k.checked_sub(d), k.checked_add(d)].into_iter().flatten() {
+            if let Some(&p) = power.get(i) {
+                near[n] = p;
+                n += 1;
+            }
+        }
+    }
+    if n == 0 || k >= power.len() {
+        return f32::INFINITY;
+    }
+    let (_, median, _) = near[..n].select_nth_unstable_by(n / 2, f32::total_cmp);
+    10.0 * (power[k].max(1e-20) / median.max(1e-20)).log10()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -174,5 +197,33 @@ mod tests {
             // Parabolic fit recovers level within the Hann scalloping bound.
             assert!((db - 20.0 * 0.5f32.log10()).abs() < 1.5, "level {db}");
         }
+    }
+
+    #[test]
+    fn prominence_separates_tones_from_noise() {
+        let n = 4096;
+        let sr = 48000.0;
+        let mut s = Spectrum::new(n, WindowKind::Hann);
+        let mut p = vec![0.0; s.bins()];
+        // Deterministic white noise (LCG), with and without a tone on top.
+        let mut x = 12345u32;
+        let noise: Vec<f32> = (0..n)
+            .map(|_| {
+                x = x.wrapping_mul(1664525).wrapping_add(1013904223);
+                (x >> 8) as f32 / (1u32 << 24) as f32 - 0.5
+            })
+            .collect();
+        s.power(&noise, &mut p);
+        let bin_hz = sr / n as f32;
+        let (f, _) = peak_frequency(&p, bin_hz, 1, s.bins() - 1).unwrap();
+        let k = (f / bin_hz).round() as usize;
+        assert!(prominence_db(&p, k, 4, 24) < 15.0, "noise {}", prominence_db(&p, k, 4, 24));
+        let tone: Vec<f32> = noise.iter().zip(sine(1000.0, 0.1, sr, n)).map(|(a, b)| 0.1 * a + b).collect();
+        s.power(&tone, &mut p);
+        let (f, _) = peak_frequency(&p, bin_hz, 1, s.bins() - 1).unwrap();
+        let k = (f / bin_hz).round() as usize;
+        assert!(prominence_db(&p, k, 4, 24) > 30.0);
+        assert_eq!(prominence_db(&[1.0], 0, 4, 24), f32::INFINITY);
+        assert_eq!(prominence_db(&p, p.len(), 4, 24), f32::INFINITY);
     }
 }

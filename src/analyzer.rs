@@ -4,7 +4,7 @@ use crate::dsp::bands::BandLayout;
 use crate::dsp::level::{amp_to_db, peak_decay, power_to_db, smoothing_coeff, FLOOR_DB};
 use crate::dsp::loudness::LoudnessMeter;
 use crate::dsp::quant::db_to_q;
-use crate::dsp::spectrum::{peak_frequency, Spectrum};
+use crate::dsp::spectrum::{peak_frequency, prominence_db, Spectrum};
 use crate::dsp::weighting::{power_gain_table, Weighting};
 use crate::dsp::window::WindowKind;
 
@@ -12,6 +12,12 @@ use crate::dsp::window::WindowKind;
 pub const MAX_CHANNELS: usize = 8;
 /// Samples at or above this magnitude count as clipped.
 pub const CLIP_LEVEL: f32 = 0.9999;
+/// A dominant frequency must stand this far above the median of nearby bins.
+const PEAK_PROMINENCE_DB: f32 = 15.0;
+/// Bins either side of the peak excluded as its own main lobe, and the
+/// neighbourhood the median is taken over.
+const PEAK_SKIP_BINS: usize = 4;
+const PEAK_REACH_BINS: usize = 24;
 
 #[derive(Clone, Debug)]
 pub struct AnalyzerConfig {
@@ -303,7 +309,12 @@ impl Analyzer {
         let spectrum: Box<[u8]> = self.power.iter().map(|&p| self.quant.quantize(p)).collect();
         self.bands.compute(&self.power, self.spectrum.enbw(), &mut self.band_db);
         let bands: Box<[u8]> = self.band_db.iter().map(|&d| db_to_q(d)).collect();
-        let peak_freq = peak_frequency(&self.power, self.cfg.bin_hz(), self.peak_bins.0, self.peak_bins.1);
+        // Only report a dominant frequency that stands clearly above its
+        // surroundings; in a quiet room the loudest bin is just hiss.
+        let bin_hz = self.cfg.bin_hz();
+        let peak_freq = peak_frequency(&self.power, bin_hz, self.peak_bins.0, self.peak_bins.1).filter(|&(hz, _)| {
+            prominence_db(&self.power, (hz / bin_hz).round() as usize, PEAK_SKIP_BINS, PEAK_REACH_BINS) >= PEAK_PROMINENCE_DB
+        });
 
         let dt = self.cfg.frame_dt() as f32;
         let metered = self.cfg.channels.clamp(1, MAX_CHANNELS);
@@ -444,6 +455,19 @@ pub mod tests {
         // Left carries the tone, right is silent: selecting right gives no peak.
         let (_, frames) = run(cfg, &stereo_sine(1000.0, 0.5, 0.0, 8192));
         assert!(frames.last().unwrap().peak_freq.is_none());
+    }
+
+    #[test]
+    fn no_dominant_frequency_in_noise() {
+        let mut x = 99u32;
+        let data: Vec<f32> = (0..16384)
+            .map(|_| {
+                x = x.wrapping_mul(1664525).wrapping_add(1013904223);
+                0.01 * ((x >> 8) as f32 / (1u32 << 24) as f32 - 0.5)
+            })
+            .collect();
+        let (_, frames) = run(config(1), &data);
+        assert!(frames.iter().all(|f| f.peak_freq.is_none()));
     }
 
     #[test]

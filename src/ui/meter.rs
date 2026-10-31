@@ -12,11 +12,31 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::widgets::{Block, Widget};
 
 const BAR_W: u16 = 3;
+const MAX_BAR_W: u16 = 8;
 const SCALE_W: u16 = 5;
 const TEXT_W: u16 = 34;
 
+/// Smallest width that fits every bar and the readouts.
 pub fn preferred_width(channels: usize) -> u16 {
-    2 + SCALE_W + (channels.min(crate::analyzer::MAX_CHANNELS) as u16 + 1) * (BAR_W + 1) + TEXT_W
+    2 + SCALE_W + bar_count(channels) * (BAR_W + 1) + TEXT_W
+}
+
+/// Panel width when sharing a row of `total` columns with the equalizer: about
+/// two fifths of the row, never less than fits nor more than half.
+pub fn width(channels: usize, total: u16) -> u16 {
+    (total * 2 / 5).max(preferred_width(channels)).min(total / 2)
+}
+
+/// Channel bars plus the loudness bar.
+fn bar_count(channels: usize) -> u16 {
+    channels.clamp(1, crate::analyzer::MAX_CHANNELS) as u16 + 1
+}
+
+/// Bar width for `bars` bars in an inner width of `inner`: the space left after
+/// the scale and readouts, shared out, between `BAR_W` and `MAX_BAR_W`.
+pub fn bar_width(bars: u16, inner: u16) -> u16 {
+    let spare = inner.saturating_sub(SCALE_W + TEXT_W + 1);
+    (spare / bars.max(1)).saturating_sub(1).clamp(BAR_W, MAX_BAR_W)
 }
 
 pub fn channel_label(i: usize, n: usize) -> String {
@@ -36,7 +56,7 @@ struct Bar {
     solid: Option<Color>,
 }
 
-fn draw_bar(buf: &mut Buffer, x: u16, area: Rect, lo: f32, hi: f32, bar: &Bar) {
+fn draw_bar(buf: &mut Buffer, x: u16, bw: u16, area: Rect, lo: f32, hi: f32, bar: &Bar) {
     let rows = area.height;
     let hf = db_to_height(bar.fill, lo, hi, rows);
     let he = db_to_height(bar.envelope, lo, hi, rows);
@@ -48,7 +68,7 @@ fn draw_bar(buf: &mut Buffer, x: u16, area: Rect, lo: f32, hi: f32, bar: &Bar) {
             None => (zone_color(db), zone_color_dim(db)),
         };
         let (ff, fe) = (cell_fill(hf, rb), cell_fill(he, rb));
-        for dx in 0..BAR_W {
+        for dx in 0..bw {
             let cell = &mut buf[(x + dx, y)];
             if ff > 0.0 {
                 cell.set_char(eighth(ff)).set_fg(fg);
@@ -64,12 +84,13 @@ fn draw_bar(buf: &mut Buffer, x: u16, area: Rect, lo: f32, hi: f32, bar: &Bar) {
     }
     if let Some(h) = bar.hold.filter(|h| *h > lo) {
         let y = area.y + db_row(h, lo, hi, rows);
-        for dx in 0..BAR_W {
+        for dx in 0..bw {
             buf[(x + dx, y)].set_char('▔').set_fg(Color::White).set_bg(Color::Reset);
         }
     }
     let label_y = area.y + rows;
-    buf.set_string(x + 1, label_y, &bar.label, Style::default().fg(Color::Gray));
+    let lx = x + bw.saturating_sub(bar.label.len() as u16) / 2;
+    buf.set_string(lx, label_y, &bar.label, Style::default().fg(Color::Gray));
 }
 
 pub fn render(app: &mut App, area: Rect, buf: &mut Buffer) {
@@ -102,14 +123,15 @@ pub fn render(app: &mut App, area: Rect, buf: &mut Buffer) {
         })
         .collect();
     bars.push(Bar { label: "LU".into(), fill: f.lufs_m, envelope: f.lufs_s, hold: None, solid: Some(Color::Cyan) });
+    let bw = bar_width(bars.len() as u16, inner.width);
     let mut x = inner.x + SCALE_W;
     let bars_end = inner.x + inner.width;
     for b in &bars {
-        if x + BAR_W > bars_end {
+        if x + bw > bars_end {
             break;
         }
-        draw_bar(buf, x, bars_area, lo, hi, b);
-        x += BAR_W + 1;
+        draw_bar(buf, x, bw, bars_area, lo, hi, b);
+        x += bw + 1;
     }
 
     // Numeric readouts to the right of the bars.
@@ -178,6 +200,20 @@ mod tests {
         assert_eq!(channel_label(1, 2), "R");
         assert_eq!(channel_label(3, 6), "4");
         assert!(preferred_width(2) > preferred_width(1));
+    }
+
+    #[test]
+    fn widths() {
+        // Narrow screens get the minimum, wide ones two fifths, never over half.
+        assert_eq!(width(1, 100), 49);
+        assert_eq!(width(1, 145), 58);
+        assert_eq!(width(1, 300), 120);
+        assert_eq!(width(8, 145), 72);
+        // Minimum layout keeps 3-column bars; spare room widens them up to 8.
+        assert_eq!(bar_width(2, preferred_width(1) - 2), BAR_W);
+        assert_eq!(bar_width(2, 56), 7);
+        assert_eq!(bar_width(2, 200), MAX_BAR_W);
+        assert_eq!(bar_width(9, 20), BAR_W);
     }
 
     #[test]

@@ -24,12 +24,7 @@ pub fn bucket_levels(h: &History, a: usize, b: usize) -> Option<(f32, f32)> {
 pub fn render(app: &mut App, area: Rect, buf: &mut Buffer) -> Rect {
     let v = &app.view;
     let d = &app.display;
-    let ms_per_col = app.analysis.frame_dt * 1000.0 * v.zoom as f64;
-    let block = Block::bordered().title(title(format!(
-        " Timeline  peak / rms · {:.1} ms/col · {} visible ",
-        ms_per_col,
-        super::fmt_time(ms_per_col / 1000.0 * v.width as f64)
-    )));
+    let block = Block::bordered().title(title(format!(" Timeline  peak / rms · {} ", super::view_range_text(app))));
     let inner = block.inner(area);
     block.render(area, buf);
     let (axis, chart) = split_axis(inner);
@@ -75,6 +70,7 @@ pub fn render(app: &mut App, area: Rect, buf: &mut Buffer) -> Rect {
             }
         }
     }
+    super::draw_time_axis(buf, app, area, chart);
     chart
 }
 
