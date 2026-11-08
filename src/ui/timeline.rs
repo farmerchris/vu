@@ -1,7 +1,8 @@
-//! Level timeline: RMS bars with the peak envelope behind them.
+//! Level timeline: RMS bars with the peak envelope behind them, or in VU
+//! mode the VU needle on the VU scale.
 
-use super::colormap::{zone_color, zone_color_dim};
-use super::{cell_fill, db_to_height, draw_db_axis, eighth, split_axis, title};
+use super::meter::Scale;
+use super::{cell_fill, eighth, split_axis, title};
 use crate::app::App;
 use crate::dsp::level::FLOOR_DB;
 use crate::history::History;
@@ -21,47 +22,56 @@ pub fn bucket_levels(h: &History, a: usize, b: usize) -> Option<(f32, f32)> {
     any.then_some((p, r))
 }
 
+/// Highest VU needle reading (over channels and frames) for frames `[a, b]`.
+pub fn bucket_vu(h: &History, a: usize, b: usize) -> Option<f32> {
+    h.range(a, b).flat_map(|f| f.vu[..f.n()].iter().copied()).reduce(f32::max)
+}
+
 pub fn render(app: &mut App, area: Rect, buf: &mut Buffer) -> Rect {
     let v = &app.view;
     let d = &app.display;
-    let block = Block::bordered().title(title(format!(" Timeline  peak / rms · {} ", super::view_range_text(app))));
+    let what = if d.vu { "vu" } else { "peak / rms" };
+    let block = Block::bordered().title(title(format!(" Timeline  {what} · {} ", super::view_range_text(app))));
     let inner = block.inner(area);
     block.render(area, buf);
     let (axis, chart) = split_axis(inner);
     if chart.width == 0 || chart.height == 0 {
         return chart;
     }
-    let (lo, hi) = (d.db_min, d.db_max);
-    draw_db_axis(buf, axis, lo, hi);
+    let scale = if d.vu { Scale::Vu { reference: d.vu_ref } } else { Scale::Db { lo: d.db_min, hi: d.db_max } };
+    scale.draw_axis(buf, axis);
     let rows = chart.height;
-    let row_db = |r: usize| lo + (hi - lo) * (r as f32 + 0.5) / rows as f32;
+    let height = |db: f32| scale.frac(db) * rows as f32;
+    // Row colours (bar, dim) from the bottom up.
+    let colors: Vec<(Color, Color)> =
+        (0..rows).map(|r| scale.colors(scale.db_at((r as f32 + 0.5) / rows as f32))).collect();
     let first = app.history.first();
     let cursor_col = v.cursor_column();
     for c in 0..chart.width as usize {
         let x = chart.x + c as u16;
         let is_cursor = cursor_col == Some(c);
-        let levels = v
-            .column_frames(c)
-            .filter(|&(_, hi)| hi >= first)
-            .and_then(|(lo, hi)| bucket_levels(&app.history, lo, hi));
-        let (hp, hr) = match levels {
-            Some((p, r)) => (db_to_height(p, lo, hi, rows), db_to_height(r, lo, hi, rows)),
+        let frames = v.column_frames(c).filter(|&(_, hi)| hi >= first);
+        // VU mode draws the needle alone: peaks mostly sit above the top of
+        // the VU scale, so a peak layer would fill it.
+        let (hp, hr) = match frames {
+            Some((a, b)) if d.vu => bucket_vu(&app.history, a, b).map_or((0.0, 0.0), |u| (height(u), height(u))),
+            Some((a, b)) => bucket_levels(&app.history, a, b).map_or((0.0, 0.0), |(p, r)| (height(p), height(r))),
             None => (0.0, 0.0),
         };
         for rb in 0..rows as usize {
             let y = chart.y + rows - 1 - rb as u16;
-            let db = row_db(rb);
+            let (bar, dim) = colors[rb];
             let (fr, fp) = (cell_fill(hr, rb), cell_fill(hp, rb));
             let cell = &mut buf[(x, y)];
             if fr >= 1.0 {
-                cell.set_char('█').set_fg(zone_color(db));
+                cell.set_char('█').set_fg(bar);
             } else if fr > 0.0 {
-                cell.set_char(eighth(fr)).set_fg(zone_color(db));
+                cell.set_char(eighth(fr)).set_fg(bar);
                 if fp >= 1.0 {
-                    cell.set_bg(zone_color_dim(db));
+                    cell.set_bg(dim);
                 }
             } else if fp > 0.0 {
-                cell.set_char(eighth(fp)).set_fg(zone_color_dim(db));
+                cell.set_char(eighth(fp)).set_fg(dim);
             } else if is_cursor {
                 cell.set_char('│');
             }
@@ -89,5 +99,7 @@ mod tests {
         assert_eq!(bucket_levels(&h, 0, 2), Some((-4.0, -4.0)));
         assert_eq!(bucket_levels(&h, 2, 2), Some((-30.0, -30.0)));
         assert_eq!(bucket_levels(&h, 5, 9), None);
+        assert_eq!(bucket_vu(&h, 0, 2), Some(-4.0));
+        assert_eq!(bucket_vu(&h, 5, 9), None);
     }
 }

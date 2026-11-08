@@ -1,7 +1,6 @@
 //! Bounded history of analysis frames addressed by absolute index.
 
-use crate::analyzer::{Frame, MAX_CHANNELS};
-use crate::dsp::level::FLOOR_DB;
+use crate::analyzer::Frame;
 use std::collections::VecDeque;
 
 pub struct History {
@@ -60,31 +59,6 @@ impl History {
         self.frames.range(lo..hi)
     }
 
-    /// Per-channel maximum sample peak over the `n` frames ending at `end`.
-    pub fn peak_hold(&self, end: usize, n: usize) -> [f32; MAX_CHANNELS] {
-        let mut out = [FLOOR_DB; MAX_CHANNELS];
-        for f in self.range(end.saturating_sub(n.saturating_sub(1)), end) {
-            for (o, &p) in out.iter_mut().zip(&f.peak[..f.n()]) {
-                *o = o.max(p);
-            }
-        }
-        out
-    }
-
-    /// Per-band maximum (quantized) over the `n` frames ending at `end`.
-    pub fn band_hold(&self, end: usize, n: usize, out: &mut Vec<u8>) {
-        out.clear();
-        for f in self.range(end.saturating_sub(n.saturating_sub(1)), end) {
-            if out.is_empty() {
-                out.extend_from_slice(&f.bands);
-            } else {
-                for (o, &b) in out.iter_mut().zip(f.bands.iter()) {
-                    *o = (*o).max(b);
-                }
-            }
-        }
-    }
-
     /// Whether any frame in the `n` frames ending at `end` clipped.
     pub fn clipped(&self, end: usize, n: usize) -> bool {
         self.range(end.saturating_sub(n.saturating_sub(1)), end).any(|f| f.clipped)
@@ -94,6 +68,8 @@ impl History {
 #[cfg(test)]
 pub mod tests {
     use super::*;
+    use crate::analyzer::MAX_CHANNELS;
+    use crate::dsp::level::FLOOR_DB;
 
     pub fn frame(peak: f32, bands: &[u8]) -> Frame {
         let mut p = [FLOOR_DB; MAX_CHANNELS];
@@ -106,6 +82,9 @@ pub mod tests {
             peak_decay: p,
             rms: p,
             rms_avg: p,
+            hold: p,
+            vu: p,
+            vu_hold: p,
             lufs_m: f32::NEG_INFINITY,
             lufs_s: f32::NEG_INFINITY,
             lufs_i: f32::NEG_INFINITY,
@@ -113,6 +92,7 @@ pub mod tests {
             clipped: peak >= 0.0,
             spectrum: vec![0u8; 8].into_boxed_slice(),
             bands: bands.to_vec().into_boxed_slice(),
+            band_caps: bands.to_vec().into_boxed_slice(),
         }
     }
 
@@ -147,21 +127,11 @@ pub mod tests {
     }
 
     #[test]
-    fn holds() {
+    fn clip_window() {
         let mut h = History::new(10);
         h.push(frame(-10.0, &[1, 9]));
         h.push(frame(-3.0, &[5, 2]));
         h.push(frame(-20.0, &[3, 3]));
-        let p = h.peak_hold(2, 2);
-        assert_eq!(p[0], -3.0);
-        assert_eq!(p[1], -4.0);
-        assert_eq!(p[2], FLOOR_DB);
-        assert_eq!(h.peak_hold(2, 1)[0], -20.0);
-        let mut b = Vec::new();
-        h.band_hold(2, 3, &mut b);
-        assert_eq!(b, vec![5, 9]);
-        h.band_hold(2, 0, &mut b);
-        assert_eq!(b, vec![3, 3]);
         assert!(!h.clipped(2, 3));
         h.push(frame(0.0, &[0, 0]));
         assert!(h.clipped(3, 1));

@@ -27,6 +27,8 @@ fn make_app(args: &[&str], channels: usize, secs: f64) -> App {
         max_freq: cli.max_freq,
         rms_tau: cli.rms_time / 1000.0,
         peak_decay_db_s: cli.peak_decay,
+        peak_hold_s: cli.peak_hold,
+        band_floor_db: cli.db_min,
         spectrum_channel: cli.channel.map(|c| c - 1),
     });
     let info = SourceInfo {
@@ -252,6 +254,30 @@ fn colormap_cycles() {
     }
     assert_eq!(app.display.colormap, start, "five maps cycle back");
     let _ = ColorMap::Magma;
+}
+
+#[test]
+fn shift_r_resets_max_loudness_only() {
+    let mut app = ready(&[]);
+    app.session.max_lufs_m = -10.0;
+    app.session.max_db = -1.0;
+    assert_eq!(key(&mut app, KeyCode::Char('R')), Action::Redraw);
+    assert_eq!(app.session.max_lufs_m, f32::NEG_INFINITY);
+    assert_eq!(app.session.max_db, -1.0, "R leaves the level maximum");
+    assert!(app.recorder.is_none(), "R is not r (record)");
+    assert!(app.message.as_ref().is_some_and(|(m, _)| m.contains("loudness")));
+}
+
+#[test]
+fn v_toggles_vu_meters() {
+    let mut app = ready(&[]);
+    assert!(!app.display.vu);
+    assert_eq!(key(&mut app, KeyCode::Char('v')), Action::Redraw);
+    assert!(app.display.vu);
+    assert!(app.message.is_some());
+    key(&mut app, KeyCode::Char('v'));
+    assert!(!app.display.vu);
+    assert!(ready(&["--vu"]).display.vu, "--vu starts in VU mode");
 }
 
 #[test]

@@ -157,6 +157,16 @@ pub fn zone_color(db: f32) -> Color {
     }
 }
 
+/// Traditional VU scale colours for a reading `vu` (VU, not dBFS): green
+/// below 0 VU, red from 0 VU up; the second colour is the dim companion.
+pub fn vu_zone_colors(vu: f32) -> (Color, Color) {
+    if vu >= 0.0 {
+        (Color::Red, Color::Indexed(88))
+    } else {
+        (Color::Green, Color::Indexed(22))
+    }
+}
+
 /// Dim companion of [`zone_color`] used for the peak envelope.
 pub fn zone_color_dim(db: f32) -> Color {
     if db >= -6.0 {

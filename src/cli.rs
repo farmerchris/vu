@@ -29,7 +29,7 @@ pub const ALL_PANELS: [Panel; 4] = [Panel::Meter, Panel::Eq, Panel::Spectrogram,
     version,
     about = "Terminal sound meter: levels, loudness, timeline, spectrogram and graphic equalizer",
     after_help = "KEYS: \u{2190}/\u{2192} scroll (shift = x10), PgUp/PgDn page, Home/End oldest/live, \
-space hold, p pause, r record, +/- zoom, 1-4 toggle panels, c colormap, s freq scale, \
+space hold, p pause, r record, +/- zoom, 1-4 toggle panels, c colormap, s freq scale, v VU/RMS, \
 [ ] floor, ? help, q quit\n\n\
 EXAMPLES:\n  vu                              meter the default input\n  \
 vu -f song.wav                  play a file through the meters in real time\n  \
@@ -52,7 +52,7 @@ pub struct Cli {
     pub file: Option<PathBuf>,
 
     /// Use a test signal: sine:FREQ[:DB], square:FREQ[:DB], noise[:DB], pink[:DB],
-    /// sweep:F0:F1:SECS[:DB], silence
+    /// sweep:F0:F1:SECS[:DB[:END_DB]], silence
     #[arg(short = 'g', long, value_name = "SPEC")]
     pub generate: Option<String>,
 
@@ -101,7 +101,7 @@ pub struct Cli {
     pub channel: Option<usize>,
 
     /// FFT size (power of two, 256..=32768)
-    #[arg(long, default_value_t = 2048)]
+    #[arg(long, default_value_t = 4096)]
     pub fft_size: usize,
 
     /// Analysis hop in samples (default: fft-size / 4)
@@ -144,16 +144,24 @@ pub struct Cli {
     #[arg(long, default_value_t = -70.0, allow_hyphen_values = true)]
     pub meter_floor: f32,
 
-    /// RMS meter integration time (ms)
+    /// RMS meter sliding-window length (ms)
     #[arg(long, default_value_t = 300.0)]
     pub rms_time: f32,
 
-    /// Peak meter fall-back rate (dB/s)
-    #[arg(long, default_value_t = 20.0)]
+    /// Peak meter fall-back rate (dB/s; default 20 dB per 1.7 s, IEC 60268-18)
+    #[arg(long, default_value_t = 11.8)]
     pub peak_decay: f32,
 
-    /// Peak hold time (s)
-    #[arg(long, default_value_t = 2.0)]
+    /// Start the level meters as VU needles (v toggles VU and RMS/peak)
+    #[arg(long)]
+    pub vu: bool,
+
+    /// Level (dBFS) of 0 VU on the VU scale (-18: EBU R68; -20: SMPTE)
+    #[arg(long, default_value_t = -18.0, allow_hyphen_values = true, value_name = "DBFS")]
+    pub vu_ref: f32,
+
+    /// Peak hold time (s), after which the marker falls at 20 dB/s
+    #[arg(long, default_value_t = 1.5)]
     pub peak_hold: f32,
 
     /// Spectrogram colour map
@@ -165,7 +173,7 @@ pub struct Cli {
     pub color: ColorChoice,
 
     /// Target UI frame rate
-    #[arg(long, default_value_t = 60)]
+    #[arg(long, default_value_t = 30)]
     pub fps: u32,
 
     /// Seconds shown across the charts (+/- step through 0.5, 1, 2, 5, 10, 20, 30, 60, 120, 300, 600)
@@ -201,6 +209,9 @@ impl Cli {
         }
         if self.meter_floor >= 0.0 {
             bail!("--meter-floor must be negative");
+        }
+        if !(-40.0..=0.0).contains(&self.vu_ref) {
+            bail!("--vu-ref must be between -40 and 0 dBFS");
         }
         if !(1..=480).contains(&self.fps) {
             bail!("--fps must be between 1 and 480");
@@ -247,13 +258,13 @@ mod tests {
         let c = parse(&[]);
         c.validate().unwrap();
         assert_eq!(c.panels, ALL_PANELS.to_vec());
-        assert_eq!(c.hop(), 512);
-        assert_eq!(c.fft_size, 2048);
+        assert_eq!(c.hop(), 1024);
+        assert_eq!(c.fft_size, 4096);
     }
 
     #[test]
     fn panel_list_and_options() {
-        let c = parse(&["-p", "spectrogram,eq", "--db-min", "-120", "--fft-size", "4096", "--hop", "256"]);
+        let c = parse(&["-p", "spectrogram,eq", "--db-min", "-120", "--fft-size", "8192", "--hop", "256"]);
         assert_eq!(c.panels, vec![Panel::Spectrogram, Panel::Eq]);
         assert_eq!(c.db_min, -120.0);
         assert_eq!(c.hop(), 256);

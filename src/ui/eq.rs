@@ -1,4 +1,5 @@
 //! Graphic equalizer: one bar per band at the cursor frame, with peak caps.
+//! The analyzer smooths the bands and their caps, so nothing jitters here.
 
 use super::colormap::{eq_gradient, to_color};
 use super::{cell_fill, db_to_height, draw_db_axis, edge_marker, eighth, fmt_freq, title};
@@ -55,8 +56,7 @@ pub fn render(app: &mut App, area: Rect, buf: &mut Buffer) {
     let axis = Rect { width: 5, height: inner.height - 1, ..inner };
     let chart = Rect { x: inner.x + 5, width: inner.width - 5, height: inner.height - 1, ..inner };
     draw_db_axis(buf, axis, lo, hi);
-    app.history.band_hold(app.view.cursor, app.display.hold_frames, &mut app.band_hold_buf);
-    let caps = &app.band_hold_buf;
+    let caps = &f.band_caps;
     let (bars, gap) = bar_layout(bands, chart.width);
     let rows = chart.height;
     let mode = app.display.color_mode;

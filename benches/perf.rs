@@ -30,6 +30,8 @@ fn config(fft_size: usize, hop: usize) -> AnalyzerConfig {
         max_freq: 20000.0,
         rms_tau: 0.3,
         peak_decay_db_s: 20.0,
+        peak_hold_s: 1.5,
+        band_floor_db: -70.0,
         spectrum_channel: None,
     }
 }

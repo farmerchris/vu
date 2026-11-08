@@ -8,7 +8,10 @@ use vu::cli::Cli;
 use vu::{recorder, report, source, ui};
 use ratatui::crossterm::event::{self, DisableMouseCapture, EnableMouseCapture};
 use ratatui::crossterm::execute;
-use ratatui::crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
+use ratatui::crossterm::terminal::{
+    disable_raw_mode, enable_raw_mode, BeginSynchronizedUpdate, EndSynchronizedUpdate, EnterAlternateScreen,
+    LeaveAlternateScreen,
+};
 use ratatui::prelude::CrosstermBackend;
 use ratatui::Terminal;
 use vu::source::{SilenceWatch, Source, SourceKind};
@@ -51,6 +54,8 @@ fn run() -> Result<()> {
         max_freq: cli.max_freq,
         rms_tau: cli.rms_time / 1000.0,
         peak_decay_db_s: cli.peak_decay,
+        peak_hold_s: cli.peak_hold,
+        band_floor_db: cli.db_min,
         spectrum_channel: cli.channel.map(|c| c - 1),
     };
     if acfg.min_freq >= acfg.top_freq() {
@@ -151,6 +156,7 @@ fn event_loop(term: &mut Term, app: &mut App, analyzer: &mut Analyzer, source: &
     let mut next_frame = Instant::now();
     let mut dirty = true;
     loop {
+        analyzer.set_band_floor(app.display.db_min);
         // Ingest, bounded so a fast file scan never starves the UI.
         let budget = Instant::now() + frame_dt.mul_f32(0.7);
         loop {
@@ -216,7 +222,11 @@ fn event_loop(term: &mut Term, app: &mut App, analyzer: &mut Analyzer, source: &
         if now >= next_frame {
             if dirty || app.message.is_some() {
                 let t = Instant::now();
+                // The terminal shows the frame only once it is complete
+                // (ignored by terminals without synchronized output).
+                execute!(term.backend_mut(), BeginSynchronizedUpdate)?;
                 term.draw(|f| ui::draw(f, app))?;
+                execute!(term.backend_mut(), EndSynchronizedUpdate)?;
                 app.fps.tick(t, t.elapsed());
                 dirty = false;
                 if app.message.as_ref().is_some_and(|(_, t)| t.elapsed() > Duration::from_secs(5)) {

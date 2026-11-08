@@ -1,5 +1,5 @@
 //! Synthetic test signals: `sine:FREQ[:DB]`, `square:FREQ[:DB]`, `noise[:DB]`,
-//! `pink[:DB]`, `sweep:F0:F1:SECS[:DB]`, `silence`.
+//! `pink[:DB]`, `sweep:F0:F1:SECS[:DB[:END_DB]]`, `silence`.
 
 use anyhow::{bail, Context, Result};
 use std::f64::consts::PI;
@@ -10,7 +10,9 @@ pub enum GenKind {
     Square { freq: f64 },
     White,
     Pink,
-    Sweep { f0: f64, f1: f64, secs: f64 },
+    /// Exponential sweep from `f0` to `f1` over `secs`, repeating. With
+    /// `end_db` the level also ramps (linearly in dB) from `level_db` to it.
+    Sweep { f0: f64, f1: f64, secs: f64, end_db: Option<f64> },
     Silence,
 }
 
@@ -42,9 +44,14 @@ pub fn parse_spec(s: &str) -> Result<GenSpec> {
         "noise" | "white" => (GenKind::White, 1, 2),
         "pink" => (GenKind::Pink, 1, 2),
         "sweep" => (
-            GenKind::Sweep { f0: num(1, "start frequency")?, f1: num(2, "end frequency")?, secs: num(3, "duration")? },
+            GenKind::Sweep {
+                f0: num(1, "start frequency")?,
+                f1: num(2, "end frequency")?,
+                secs: num(3, "duration")?,
+                end_db: parts.get(5).map(|_| num(5, "end level")).transpose()?,
+            },
             4,
-            5,
+            6,
         ),
         "silence" => (GenKind::Silence, 1, 1),
         other => bail!("unknown generator '{other}' (sine, square, noise, pink, sweep, silence)"),
@@ -54,7 +61,7 @@ pub fn parse_spec(s: &str) -> Result<GenSpec> {
     }
     match kind {
         GenKind::Sine { freq } | GenKind::Square { freq } if freq <= 0.0 => bail!("frequency must be positive"),
-        GenKind::Sweep { f0, f1, secs } if f0 <= 0.0 || f1 <= 0.0 || secs <= 0.0 => {
+        GenKind::Sweep { f0, f1, secs, .. } if f0 <= 0.0 || f1 <= 0.0 || secs <= 0.0 => {
             bail!("sweep frequencies and duration must be positive")
         }
         _ => {}
@@ -130,12 +137,16 @@ impl Generator {
                 b[6] = w * 0.115926;
                 (out * 0.2).clamp(-1.0, 1.0)
             }
-            GenKind::Sweep { f0, f1, secs } => {
+            GenKind::Sweep { f0, f1, secs, end_db } => {
                 let t = (self.n as f64 / self.sr) % secs;
                 let f = sweep_freq(f0, f1, secs, t);
                 let v = (2.0 * PI * self.phase).sin();
                 self.advance(f);
-                v
+                match end_db {
+                    // `amp` is applied below, so scale by the ramp relative to it.
+                    Some(db1) => v * 10f64.powf((db1 - self.spec.level_db) * (t / secs) / 20.0),
+                    None => v,
+                }
             }
             GenKind::Silence => 0.0,
         };
@@ -171,14 +182,17 @@ mod tests {
         assert_eq!(parse_spec("pink:-3").unwrap().level_db, -3.0);
         assert_eq!(
             parse_spec("sweep:20:20000:5").unwrap().kind,
-            GenKind::Sweep { f0: 20.0, f1: 20000.0, secs: 5.0 }
+            GenKind::Sweep { f0: 20.0, f1: 20000.0, secs: 5.0, end_db: None }
         );
+        let s = parse_spec("sweep:100:800:5:-20:-10").unwrap();
+        assert_eq!(s.kind, GenKind::Sweep { f0: 100.0, f1: 800.0, secs: 5.0, end_db: Some(-10.0) });
+        assert_eq!(s.level_db, -20.0);
         assert_eq!(parse_spec("silence").unwrap().kind, GenKind::Silence);
     }
 
     #[test]
     fn parse_errors() {
-        for bad in ["", "sine", "sine:abc", "sine:-5", "sweep:20:200", "bogus", "noise:x", "sine:1:2:3", "silence:1"] {
+        for bad in ["", "sine", "sine:abc", "sine:-5", "sweep:20:200", "bogus", "noise:x", "sine:1:2:3", "silence:1", "sweep:1:2:3:4:x", "sweep:1:2:3:4:5:6"] {
             assert!(parse_spec(bad).is_err(), "{bad} should fail");
         }
     }
@@ -227,6 +241,18 @@ mod tests {
         assert!((sweep_freq(20.0, 20000.0, 10.0, 10.0) - 20000.0).abs() < 1e-6);
         let x = render("sweep:100:1000:0.5:-6", 48000);
         assert!(peak_abs(&x) <= 10f32.powf(-6.0 / 20.0) + 1e-6);
+    }
+
+    #[test]
+    fn sweep_level_ramp() {
+        // -20 dB at the start of each 1 s sweep, -15 halfway, nearly -10 at
+        // the end, then back to -20 as the sweep repeats.
+        let x = render("sweep:1000:1000:1:-20:-10", 96000);
+        let peak_db = |a: usize| 20.0 * peak_abs(&x[a..a + 480]).log10();
+        assert!((peak_db(0) - -19.95).abs() < 0.1, "{}", peak_db(0));
+        assert!((peak_db(24000 - 240) - -15.0).abs() < 0.1, "{}", peak_db(23760));
+        assert!((peak_db(47520) - -10.05).abs() < 0.1, "{}", peak_db(47520));
+        assert!((peak_db(48000) - -19.95).abs() < 0.1, "{}", peak_db(48000));
     }
 
     #[test]

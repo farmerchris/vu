@@ -227,10 +227,17 @@ pub fn db_row(db: f32, lo: f32, hi: f32, rows: u16) -> u16 {
 /// bottom edge, whichever is nearer the level, so the marker is never more than
 /// half a row off. `None` at or below the floor.
 pub fn edge_marker(db: f32, lo: f32, hi: f32, rows: u16) -> Option<(u16, char)> {
-    if rows == 0 || !db.is_finite() || db <= lo {
+    if !db.is_finite() || db <= lo {
         return None;
     }
-    let h = ((db - lo) / (hi - lo)).clamp(0.0, 1.0) * rows as f32;
+    edge_marker_at(((db - lo) / (hi - lo)).clamp(0.0, 1.0) * rows as f32, rows)
+}
+
+/// [`edge_marker`] for a level already converted to a height of `h` rows.
+pub fn edge_marker_at(h: f32, rows: u16) -> Option<(u16, char)> {
+    if rows == 0 || h.is_nan() || h <= 0.0 {
+        return None;
+    }
     let rb = (h.floor() as u16).min(rows - 1);
     let frac = h - rb as f32;
     let glyph = if frac >= 0.5 { '▔' } else { '▁' };
@@ -435,8 +442,10 @@ const HELP: &[(&str, &str)] = &[
     ("p", "pause / resume the input"),
     ("r", "start / stop recording"),
     ("x", "reset the max level and clip count"),
+    ("R", "reset the max loudness"),
     ("1 2 3 4", "show / hide levels, equalizer, spectrogram, timeline"),
     ("c / s", "cycle colour map / frequency scale"),
+    ("v", "level meters: VU needle / RMS and peak"),
     ("[ / ]  { / }", "lower / raise the chart floor / ceiling"),
     ("? / F1", "toggle this help"),
     ("q / Esc", "quit"),
@@ -444,10 +453,11 @@ const HELP: &[(&str, &str)] = &[
 
 /// What the level readouts mean.
 const LEGEND: &[(&str, &str)] = &[
-    ("peak  hold", "sample peak now; highest over the last few seconds"),
-    ("rms  avg", "RMS of the latest hop; smoothed average (the bar)"),
+    ("peak  hold", "sample peak now; highest, held 1.5 s, then falling"),
+    ("rms  avg", "RMS of the latest hop; over 300 ms (the bar)"),
+    ("vu  hold", "VU mode (v): needle and its held highest; 0 VU = --vu-ref dBFS"),
     ("max  clips", "highest peak and clip events since start (x resets)"),
-    ("LUFS", "loudness over 0.4 s, 3 s and since the start"),
+    ("LUFS", "loudness over 0.4 s, 3 s and since the start; highest 0.4 s (R resets)"),
     ("tone", "strongest tone that stands out, with its note"),
 ];
 

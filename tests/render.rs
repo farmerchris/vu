@@ -31,6 +31,8 @@ fn make_app_with(args: &[&str], channels: usize, secs: f64, spec: &str) -> App {
         max_freq: cli.max_freq,
         rms_tau: cli.rms_time / 1000.0,
         peak_decay_db_s: cli.peak_decay,
+        peak_hold_s: cli.peak_hold,
+        band_floor_db: cli.db_min,
         spectrum_channel: cli.channel.map(|c| c - 1),
     });
     let info = SourceInfo {
@@ -178,6 +180,36 @@ fn meter_shows_stereo_labels() {
 }
 
 #[test]
+fn vu_mode_switches_the_meter_readouts() {
+    let mut app = make_app(&["-p", "meter"], 2, 1.0);
+    let t = text(&render(&mut app, 100, 24));
+    assert!(t.contains(" Levels ") && t.contains("peak") && !t.contains("Levels · VU"), "{t}");
+    let mut app = make_app_with(&["-p", "meter", "--vu"], 2, 1.0, "sine:1000:-16");
+    let lines = render(&mut app, 100, 24);
+    let t = text(&lines);
+    assert!(t.contains("Levels · VU") && t.contains("VU       vu   hold"), "{t}");
+    // A -16 dBFS sine reads +2 VU with 0 VU at the default -18 dBFS.
+    assert!(t.contains("L      +2.0"), "{t}");
+    assert!(lines.iter().any(|l| l.starts_with("│ -20 ")) && lines.iter().any(|l| l.starts_with("│  +3 ")), "{t}");
+}
+
+#[test]
+fn vu_mode_gives_loudness_its_own_axis_and_still_fits() {
+    for (ch, w) in [(2usize, 80u16), (1, 80), (2, 140), (8, 160)] {
+        let mut app = make_app_with(&["--vu"], ch, 1.0, "sine:1000:-16");
+        let lines = render(&mut app, w, 24);
+        let t = text(&lines);
+        // EBU +9 marks beside the LU bar, and the readouts are not cut short.
+        assert!(t.contains(" +9 ") && t.contains(" -18 "), "{ch}ch {w}: {t}");
+        assert!(t.contains("+22c"), "{ch}ch {w}: {t}");
+        assert!(t.contains("integ    max"), "{ch}ch {w}: {t}");
+    }
+    let mut app = make_app_with(&[], 2, 1.0, "sine:1000:-16");
+    let t = text(&render(&mut app, 80, 24));
+    assert!(!t.contains(" +9 "), "no LU axis in dBFS mode: {t}");
+}
+
+#[test]
 fn mono_meter_label() {
     let mut app = make_app(&["-p", "meter"], 1, 1.0);
     let t = text(&render(&mut app, 80, 24));
@@ -232,4 +264,23 @@ fn clip_badge_and_session_line_fit_at_80x24() {
     assert!(screen.contains("CLIP"), "{screen}");
     assert!(screen.contains("max") && screen.contains("1 clip"), "{screen}");
     assert!(screen.contains("tone"), "{screen}");
+}
+
+
+#[test]
+fn timeline_follows_vu_mode() {
+    let args = ["-p", "timeline", "-z", "5"];
+    let mut app = make_app_with(&args, 2, 5.0, "sweep:100:800:5:-20:-10");
+    let t = text(&render(&mut app, 80, 16));
+    assert!(t.contains("Timeline  peak / rms") && !t.contains("  +3 "), "{t}");
+    let mut app = make_app_with(&[&args[..], &["--vu"]].concat(), 2, 5.0, "sweep:100:800:5:-20:-10");
+    let lines = render(&mut app, 80, 16);
+    let t = text(&lines);
+    assert!(t.contains("Timeline  vu"), "{t}");
+    // VU marks down the axis, the sweep near -2 VU once the needle has risen
+    // (0.4 s in) and pinned above +3 VU once past -15 dBFS.
+    let row = |m: &str| lines.iter().find(|l| l.starts_with(&format!("│{m:>5} "))).unwrap_or_else(|| panic!("{m}: {t}"));
+    let first = |l: &str| l.chars().skip(7 + 6).take(3).collect::<String>();
+    assert!(first(row("-3")) == "███" && first(row("+1")).trim().is_empty(), "{t}");
+    assert!(row("+3").trim_end_matches('│').ends_with("███"), "{t}");
 }

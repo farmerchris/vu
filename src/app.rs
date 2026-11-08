@@ -231,17 +231,20 @@ impl View {
 }
 
 /// Highest sample peak and number of clipping events since the start or the
-/// last reset. A run of consecutive clipped frames counts as one event.
+/// last reset (`x`), and the highest momentary loudness since the start or its
+/// own reset (`R`). A run of consecutive clipped frames counts as one event.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Session {
     pub max_db: f32,
     pub clips: u64,
     in_clip: bool,
+    /// Highest momentary loudness (EBU "max M"), LUFS.
+    pub max_lufs_m: f32,
 }
 
 impl Default for Session {
     fn default() -> Self {
-        Session { max_db: crate::dsp::level::FLOOR_DB, clips: 0, in_clip: false }
+        Session { max_db: crate::dsp::level::FLOOR_DB, clips: 0, in_clip: false, max_lufs_m: f32::NEG_INFINITY }
     }
 }
 
@@ -254,16 +257,23 @@ impl Session {
             self.clips += 1;
         }
         self.in_clip = f.clipped;
+        self.max_lufs_m = self.max_lufs_m.max(f.lufs_m);
     }
 
-    /// Start counting again. A clip run in progress at the reset is not
-    /// counted a second time.
+    /// Start counting peaks and clips again. A clip run in progress at the
+    /// reset is not counted a second time. The loudness maximum is kept.
     pub fn reset(&mut self) {
-        let in_clip = self.in_clip;
-        *self = Session::default();
-        self.in_clip = in_clip;
+        *self = Session { in_clip: self.in_clip, max_lufs_m: self.max_lufs_m, ..Session::default() };
+    }
+
+    /// Start tracking the maximum momentary loudness again.
+    pub fn reset_loudness(&mut self) {
+        self.max_lufs_m = f32::NEG_INFINITY;
     }
 }
+
+/// How long CLIP stays lit after a clip, seconds.
+pub const CLIP_SECS: f64 = 2.0;
 
 /// How often the numeric readouts refresh while following live input.
 pub const READOUT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
@@ -342,7 +352,12 @@ pub struct Display {
     pub colormap: ColorMap,
     pub freq_scale: FreqScale,
     pub color_mode: ColorMode,
-    pub hold_frames: usize,
+    /// Frames the CLIP indicator stays lit after a clip.
+    pub clip_frames: usize,
+    /// Level bars show VU needles instead of RMS with a peak envelope.
+    pub vu: bool,
+    /// dBFS that reads 0 VU.
+    pub vu_ref: f32,
 }
 
 impl Display {
@@ -384,7 +399,6 @@ pub struct App {
     /// Chart rectangles (spectrogram, timeline) for mouse hit-testing.
     pub chart_rects: Vec<Rect>,
     pub spec_cache: SpecCache,
-    pub band_hold_buf: Vec<u8>,
 }
 
 impl App {
@@ -432,7 +446,9 @@ impl App {
                 colormap: cli.colormap,
                 freq_scale: cli.freq_scale,
                 color_mode,
-                hold_frames: ((cli.peak_hold as f64 / frame_dt).round() as usize).max(1),
+                clip_frames: ((CLIP_SECS / frame_dt).round() as usize).max(1),
+                vu: cli.vu,
+                vu_ref: cli.vu_ref,
             },
             info,
             control,
@@ -452,7 +468,6 @@ impl App {
             record_count: 0,
             chart_rects: Vec::new(),
             spec_cache: SpecCache::default(),
-            band_hold_buf: Vec::new(),
         }
     }
 
@@ -581,6 +596,10 @@ impl App {
                 self.session.reset();
                 self.flash("max level and clip count reset");
             }
+            KeyCode::Char('R') => {
+                self.session.reset_loudness();
+                self.flash("max loudness reset");
+            }
             KeyCode::Char('1') => self.toggle_panel(Panel::Meter),
             KeyCode::Char('2') => self.toggle_panel(Panel::Eq),
             KeyCode::Char('3') => self.toggle_panel(Panel::Spectrogram),
@@ -592,6 +611,10 @@ impl App {
             KeyCode::Char('s') => {
                 self.display.freq_scale = self.display.freq_scale.next();
                 self.flash(format!("frequency scale: {:?}", self.display.freq_scale).to_lowercase());
+            }
+            KeyCode::Char('v') => {
+                self.display.vu = !self.display.vu;
+                self.flash(if self.display.vu { "meters: VU needle" } else { "meters: RMS / peak" });
             }
             KeyCode::Char('[') => self.display.db_min = (self.display.db_min - 6.0).max(-120.0),
             KeyCode::Char(']') => self.display.db_min = (self.display.db_min + 6.0).min(self.display.db_max - 12.0),
@@ -864,13 +887,17 @@ mod tests {
                 peak_decay: p,
                 rms: p,
                 rms_avg: p,
-                lufs_m: floor,
+                hold: p,
+                vu: p,
+                vu_hold: p,
+                lufs_m: peak - 3.0,
                 lufs_s: floor,
                 lufs_i: floor,
                 peak_freq: None,
                 clipped,
                 spectrum: Box::new([]),
                 bands: Box::new([]),
+                band_caps: Box::new([]),
             }
         };
         let mut s = Session::default();
@@ -884,8 +911,14 @@ mod tests {
         s.add(&frame(-6.0, false));
         s.add(&frame(0.0, true));
         assert_eq!((s.max_db, s.clips), (0.0, 2));
+        assert_eq!(s.max_lufs_m, -3.0);
         s.reset();
         assert_eq!((s.max_db, s.clips), (Session::default().max_db, 0));
+        assert_eq!(s.max_lufs_m, -3.0, "x keeps the loudness maximum");
+        s.reset_loudness();
+        assert_eq!(s.max_lufs_m, f32::NEG_INFINITY);
+        s.add(&frame(-20.0, false));
+        assert_eq!(s.max_lufs_m, -23.0);
         // Resetting mid-clip does not count the same run again.
         s.add(&frame(0.0, true));
         s.reset();
