@@ -339,6 +339,36 @@ fn v_cycles_meter_modes() {
 }
 
 #[test]
+fn brackets_move_the_chart_and_spectrogram_floors_together() {
+    let mut app = ready(&[]);
+    assert_eq!((app.display.db_min, app.display.spec_floor), (-70.0, -90.0));
+    key(&mut app, KeyCode::Char(']'));
+    assert_eq!((app.display.db_min, app.display.spec_floor), (-64.0, -84.0));
+    for _ in 0..20 {
+        key(&mut app, KeyCode::Char('['));
+    }
+    assert_eq!(
+        (app.display.db_min, app.display.spec_floor),
+        (-120.0, -120.0),
+        "both stop at -120"
+    );
+    for _ in 0..30 {
+        key(&mut app, KeyCode::Char(']'));
+    }
+    assert_eq!(
+        (app.display.db_min, app.display.spec_floor),
+        (-12.0, -12.0),
+        "12 dB under the ceiling"
+    );
+    assert_eq!(ready(&["--spec-floor", "-100"]).display.spec_floor, -100.0);
+    assert!(Cli::try_parse_from(["vu", "--spec-floor", "5"])
+        .unwrap()
+        .validate()
+        .is_err());
+    assert_eq!(ready(&["--rms-aes17"]).display.rms_offset, 3.01);
+}
+
+#[test]
 fn cycle_views_steps_modes_on_a_timer() {
     use std::time::{Duration, Instant};
     use vu::app::MeterMode::*;

@@ -26,12 +26,13 @@ pub enum Panel {
 }
 
 /// Named loudness targets for `--lufs-target`, in LUFS.
-pub const LUFS_TARGETS: [(&str, f32); 9] = [
+pub const LUFS_TARGETS: [(&str, f32); 10] = [
     ("streaming", -14.0),
     ("spotify", -14.0),
     ("youtube", -14.0),
     ("apple", -16.0),
     ("podcast", -16.0),
+    ("podcast-mono", -19.0),
     ("broadcast", -23.0), // EBU R128
     ("ebu", -23.0),
     ("atsc", -24.0),    // ATSC A/85
@@ -179,9 +180,14 @@ pub struct Cli {
     #[arg(long, value_enum, default_value = "log")]
     pub freq_scale: FreqScale,
 
-    /// Bottom of the spectrogram/equalizer/timeline dB range
+    /// Bottom of the equalizer/timeline dB range
     #[arg(long, default_value_t = -70.0, allow_hyphen_values = true)]
     pub db_min: f32,
+
+    /// Bottom of the spectrogram's colour range (dB); lower than --db-min, as
+    /// each FFT bin holds only a small share of broadband energy
+    #[arg(long, default_value_t = -90.0, allow_hyphen_values = true)]
+    pub spec_floor: f32,
 
     /// Top of the dB range
     #[arg(long, default_value_t = 0.0, allow_hyphen_values = true)]
@@ -190,6 +196,10 @@ pub struct Cli {
     /// Bottom of the level meter scale (dBFS)
     #[arg(long, default_value_t = -70.0, allow_hyphen_values = true)]
     pub meter_floor: f32,
+
+    /// Show RMS levels 3 dB higher (AES17), so a sine reads the same RMS as peak
+    #[arg(long)]
+    pub rms_aes17: bool,
 
     /// RMS meter sliding-window length (ms)
     #[arg(long, default_value_t = 300.0)]
@@ -205,7 +215,7 @@ pub struct Cli {
 
     /// Loudness that reads 0 LU in LUFS mode: a LUFS value or a preset name.
     ///
-    /// Presets: streaming, spotify, youtube (-14); apple, podcast (-16);
+    /// Presets: streaming, spotify, youtube (-14); apple, podcast (-16); podcast-mono (-19);
     /// broadcast, ebu (-23, EBU R128); atsc (-24, ATSC A/85); netflix (-27).
     #[arg(long, default_value = "streaming", allow_hyphen_values = true, value_name = "LUFS|NAME", value_parser = parse_lufs_target)]
     pub lufs_target: f32,
@@ -269,6 +279,9 @@ impl Cli {
         }
         if !(self.min_freq > 0.0 && self.min_freq < self.max_freq) {
             bail!("need 0 < --min-freq < --max-freq");
+        }
+        if self.spec_floor >= self.db_max {
+            bail!("--spec-floor must be below --db-max");
         }
         if self.db_min >= self.db_max {
             bail!("--db-min must be below --db-max");
@@ -346,6 +359,7 @@ mod tests {
             ("broadcast", -23.0),
             ("atsc", -24.0),
             ("-18.5", -18.5),
+            ("podcast-mono", -19.0),
         ] {
             assert_eq!(parse(&["--lufs-target", args]).lufs_target, want, "{args}");
         }

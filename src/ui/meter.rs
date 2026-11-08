@@ -340,7 +340,7 @@ pub fn render(app: &mut App, area: Rect, buf: &mut Buffer) {
         MeterMode::Rms => (0..n)
             .map(|c| Bar {
                 label: channel_label(c, n),
-                fill: f.rms_avg[c],
+                fill: f.rms_avg[c] + app.display.rms_offset,
                 envelope: f.peak_decay[c],
                 hold: Some(f.hold[c]),
                 hold_color: Color::White,
@@ -388,6 +388,20 @@ pub fn render(app: &mut App, area: Rect, buf: &mut Buffer) {
         draw_bar(buf, x, bw, bars_area, scale, b);
         x += bw + 1;
     }
+    // Integrated loudness, the delivered number, as a pointer beside the S bar.
+    if let (MeterMode::Lufs, Some(px)) = (mode, x.checked_sub(1).filter(|&px| px < bars_end)) {
+        let rows = bars_area.height;
+        let h = scale.frac(f.lufs_i) * rows as f32;
+        if h > 0.0 {
+            let row = rows - 1 - (h.floor() as u16).min(rows - 1);
+            let color = if f.lufs_i >= app.display.lufs_target {
+                LU_OVER_COLOR
+            } else {
+                Color::White
+            };
+            buf[(px, bars_area.y + row)].set_char('◀').set_fg(color);
+        }
+    }
 
     // Numeric readouts to the right of the bars, refreshed at a readable rate
     // while live, in fixed-width columns.
@@ -421,7 +435,8 @@ pub fn render(app: &mut App, area: Rect, buf: &mut Buffer) {
             line(buf, row("dBFS", &["peak", "hold", "rms", "avg"]), head);
             for c in 0..n {
                 let st = Style::default().fg(scale.color(f.peak[c].max(f.hold[c])));
-                let vals = [f.peak[c], f.hold[c], f.rms[c], f.rms_avg[c]].map(fmt_db);
+                let off = app.display.rms_offset;
+                let vals = [f.peak[c], f.hold[c], f.rms[c] + off, f.rms_avg[c] + off].map(fmt_db);
                 line(buf, row(&channel_label(c, n), &vals), st);
             }
         }
@@ -440,7 +455,7 @@ pub fn render(app: &mut App, area: Rect, buf: &mut Buffer) {
             }
         }
         MeterMode::Lufs => {
-            line(buf, row("LUFS", &["mom", "short", "integ", "max"]), head);
+            line(buf, row("LUFS", &["mom", "short", "integ", "max M"]), head);
             // Momentary and short-term in their bars' colours, the rest
             // neutral; anything at or over the target in yellow.
             let target = app.display.lufs_target;
@@ -473,12 +488,16 @@ pub fn render(app: &mut App, area: Rect, buf: &mut Buffer) {
     } else {
         head
     };
-    let (max, unit) = if mode == MeterMode::Lufs {
-        (s.max_tp, "dBTP")
+    let (label, max, unit) = if mode == MeterMode::Lufs {
+        ("TP", s.max_tp, "dBTP")
     } else {
-        (s.max_db, "dBFS")
+        ("max", s.max_db, "dBFS")
     };
-    line(buf, session_text(&fmt_db(max), unit, s.clips), clip_style);
+    line(
+        buf,
+        session_text(label, &fmt_db(max), unit, s.clips),
+        clip_style,
+    );
     if spacious {
         line(buf, String::new(), val);
     }
@@ -513,9 +532,9 @@ pub fn mode_scale(app: &App) -> Scale {
 
 /// Session line: highest peak (sample peak in dBFS, or true peak in dBTP)
 /// and clip events since the start (or `x`).
-pub fn session_text(max: &str, unit: &str, clips: u64) -> String {
+pub fn session_text(label: &str, max: &str, unit: &str, clips: u64) -> String {
     let what = if clips == 1 { "clip" } else { "clips" };
-    format!("{} {unit:<4} {clips:>4} {what}", row("max", &[max]))
+    format!("{} {unit:<4} {clips:>4} {what}", row(label, &[max]))
 }
 
 /// Integrated loudness relative to the target and the loudness range, in LU,
@@ -746,12 +765,12 @@ mod tests {
             row("", &["-60.9", "-59.7", "-55.7"]).len()
         );
         assert_eq!(
-            session_text(&fmt_db(-3.04), "dBFS", 0),
+            session_text("max", &fmt_db(-3.04), "dBFS", 0),
             "max    -3.0 dBFS    0 clips"
         );
         assert_eq!(
-            session_text(&fmt_db(0.0), "dBTP", 1),
-            "max     0.0 dBTP    1 clip"
+            session_text("TP", &fmt_db(0.0), "dBTP", 1),
+            "TP      0.0 dBTP    1 clip"
         );
         assert_eq!(target_text(-2.34, 6.25), "tgt    -2.3 LU   LRA   6.2 LU");
         assert_eq!(
@@ -763,7 +782,7 @@ mod tests {
             target_text(-12.5, 15.0).chars().count()
         );
         assert!(target_text(-12.5, 15.0).chars().count() <= TEXT_W as usize);
-        assert!(session_text(&fmt_db(-3.0), "dBFS", 0).len() <= TEXT_W as usize);
+        assert!(session_text("max", &fmt_db(-3.0), "dBFS", 0).len() <= TEXT_W as usize);
         // The frequency line keeps its layout as the value changes.
         assert_eq!(
             format!("{:>7.1}", 92.6f32).len(),

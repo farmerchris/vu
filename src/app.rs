@@ -420,6 +420,10 @@ pub struct Display {
     pub panels: [bool; crate::cli::PANEL_COUNT],
     pub db_min: f32,
     pub db_max: f32,
+    /// Bottom of the spectrogram's colour range.
+    pub spec_floor: f32,
+    /// Added to RMS levels for display: 3.01 dB with `--rms-aes17`.
+    pub rms_offset: f32,
     pub meter_floor: f32,
     pub colormap: ColorMap,
     pub freq_scale: FreqScale,
@@ -527,6 +531,8 @@ impl App {
                 panels,
                 db_min: cli.db_min,
                 db_max: cli.db_max,
+                spec_floor: cli.spec_floor,
+                rms_offset: if cli.rms_aes17 { 3.01 } else { 0.0 },
                 meter_floor: cli.meter_floor,
                 colormap: cli.colormap,
                 freq_scale: cli.freq_scale,
@@ -691,6 +697,15 @@ impl App {
         self.flash(format!("meter mode: {}", self.display.mode.name()));
     }
 
+    /// Move the chart floor and the spectrogram's floor together, each
+    /// between -120 dB and 12 dB below the ceiling.
+    fn shift_floors(&mut self, by: f32) {
+        let d = &mut self.display;
+        let top = d.db_max - 12.0;
+        d.db_min = (d.db_min + by).clamp(-120.0, top);
+        d.spec_floor = (d.spec_floor + by).clamp(-120.0, top);
+    }
+
     pub fn handle_key(&mut self, k: KeyEvent) -> Action {
         let fast = k
             .modifiers
@@ -758,10 +773,8 @@ impl App {
                     self.cycle = Some((every, Instant::now()));
                 }
             }
-            KeyCode::Char('[') => self.display.db_min = (self.display.db_min - 6.0).max(-120.0),
-            KeyCode::Char(']') => {
-                self.display.db_min = (self.display.db_min + 6.0).min(self.display.db_max - 12.0)
-            }
+            KeyCode::Char('[') => self.shift_floors(-6.0),
+            KeyCode::Char(']') => self.shift_floors(6.0),
             KeyCode::Char('{') => {
                 self.display.db_max = (self.display.db_max - 6.0).max(self.display.db_min + 12.0)
             }

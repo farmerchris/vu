@@ -90,7 +90,7 @@ pub fn render(app: &mut App, area: Rect, buf: &mut Buffer) -> Rect {
         // layer would fill it) and momentary loudness, as on the M bar.
         let (hp, hr) = match (frames, d.mode) {
             (Some((a, b)), MeterMode::Rms) => bucket_levels(&app.history, a, b)
-                .map_or((0.0, 0.0), |(p, r)| (height(p), height(r))),
+                .map_or((0.0, 0.0), |(p, r)| (height(p), height(r + d.rms_offset))),
             (Some((a, b)), MeterMode::Vu) => {
                 bucket_vu(&app.history, a, b).map_or((0.0, 0.0), |u| (height(u), height(u)))
             }

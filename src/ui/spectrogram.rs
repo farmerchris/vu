@@ -170,7 +170,7 @@ pub fn render(app: &mut App, area: Rect, buf: &mut Buffer) -> Rect {
         heading_w,
         d.colormap,
         d.color_mode,
-        d.db_min,
+        d.spec_floor,
         d.db_max,
     );
     let (axis, chart) = split_axis(inner);
@@ -179,7 +179,7 @@ pub fn render(app: &mut App, area: Rect, buf: &mut Buffer) -> Rect {
     }
     let pixels = chart.height as usize * 2;
     let cache = &mut app.spec_cache;
-    cache.ensure_lut(d.colormap, d.color_mode, d.db_min, d.db_max);
+    cache.ensure_lut(d.colormap, d.color_mode, d.spec_floor, d.db_max);
     cache.ranges(
         pixels,
         d.freq_scale,

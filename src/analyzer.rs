@@ -13,6 +13,9 @@ use crate::dsp::window::WindowKind;
 pub const MAX_CHANNELS: usize = 8;
 /// Samples at or above this magnitude count as clipped.
 pub const CLIP_LEVEL: f32 = 0.9999;
+/// Quieter tones are not reported: at that level they are mostly hum and
+/// fans, not what is being played or said.
+const TONE_MIN_DB: f32 = -50.0;
 /// A dominant frequency must stand this far above the median of nearby bins.
 const PEAK_PROMINENCE_DB: f32 = 15.0;
 /// Bins either side of the peak excluded as its own main lobe, and the
@@ -456,7 +459,7 @@ impl Analyzer {
         };
         let (lo, hi) = self.peak_bins;
         let mut peak_freq = peak_frequency(&self.power, bin_hz, lo, hi)
-            .filter(|&(hz, _)| prominent(hz, &self.power));
+            .filter(|&(hz, db)| db >= TONE_MIN_DB && prominent(hz, &self.power));
         // Stay on the previous tone while it is still nearly as strong.
         if let (Some((_, db)), Some(prev)) = (peak_freq, self.tone) {
             let b = (prev / bin_hz).round() as usize;
@@ -800,6 +803,21 @@ pub mod tests {
         // Left carries the tone, right is silent: selecting right gives no peak.
         let (_, frames) = run(cfg, &stereo_sine(1000.0, 0.5, 0.0, 8192));
         assert!(frames.last().unwrap().peak_freq.is_none());
+    }
+
+    #[test]
+    fn quiet_tones_are_not_reported() {
+        // Hum-level tones (below -50 dB) are left out; a clear one is kept.
+        let (_, quiet) = run(
+            config(2),
+            &stereo_sine(120.0, 10f32.powf(-56.0 / 20.0), 0.0, 9600),
+        );
+        assert!(quiet.last().unwrap().peak_freq.is_none());
+        let (_, clear) = run(
+            config(2),
+            &stereo_sine(120.0, 10f32.powf(-40.0 / 20.0), 0.0, 9600),
+        );
+        assert!(clear.last().unwrap().peak_freq.is_some());
     }
 
     #[test]

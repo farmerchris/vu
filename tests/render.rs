@@ -236,7 +236,7 @@ fn each_meter_mode_shows_only_its_own_measure() {
     let lines = render(&mut app, 100, 24);
     let t = text(&lines);
     assert!(
-        t.contains("Levels · LUFS · 0 LU = -14") && t.contains("LUFS    mom  short  integ    max"),
+        t.contains("Levels · LUFS · 0 LU = -14") && t.contains("LUFS    mom  short  integ  max M"),
         "{t}"
     );
     assert!(
@@ -253,18 +253,35 @@ fn each_meter_mode_shows_only_its_own_measure() {
     // loudness range.
     assert!(t.contains("tgt    -2.0 LU   LRA     — LU"), "{t}");
     // Peaks and clips stay in every mode: sample peak, or true peak in LUFS.
-    for (args, unit) in [
-        (&[][..], "dBFS"),
-        (&["--vu"], "dBFS"),
-        (&["--lufs"], "dBTP"),
+    for (args, label, unit) in [
+        (&[][..], "max", "dBFS"),
+        (&["--vu"], "max", "dBFS"),
+        (&["--lufs"], "TP ", "dBTP"),
     ] {
         let mut app = make_app_with(&[&["-p", "meter"][..], args].concat(), 2, 1.0, tone);
         let t = text(&render(&mut app, 100, 24));
         assert!(
-            t.contains(&format!("max   -16.0 {unit}    0 clips")),
+            t.contains(&format!("{label}   -16.0 {unit}    0 clips")),
             "{args:?}: {t}"
         );
     }
+    // Integrated loudness points from beside the S bar, on the same row as
+    // the bars' tops.
+    let mut app = make_app_with(&["-p", "meter", "--lufs"], 2, 2.0, tone);
+    let lines = render(&mut app, 100, 24);
+    let marker = lines
+        .iter()
+        .position(|l| l.contains('◀'))
+        .expect("integrated marker");
+    assert!(
+        lines[marker].contains("▁▁▁▁▁▁▁▁◀") || lines[marker].contains("████████◀"),
+        "{}",
+        lines[marker]
+    );
+    // --rms-aes17 shows RMS 3 dB higher: a sine's RMS reads its peak.
+    let mut app = make_app_with(&["-p", "meter", "--rms-aes17"], 2, 1.0, tone);
+    let t = text(&render(&mut app, 100, 24));
+    assert!(t.contains("L     -16.0  -16.0  -16.0  -16.0"), "{t}");
 }
 
 #[test]

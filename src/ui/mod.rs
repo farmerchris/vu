@@ -601,17 +601,20 @@ const LEGEND: &[(&str, &str)] = &[
     ),
     (
         "LUFS",
-        "LUFS: 0.4 s (M bar), 3 s (S bar), integrated; highest M (the mark)",
+        "LUFS: 0.4 s (M bar), 3 s (S bar), integrated (◀); highest M (the mark)",
     ),
     (
         "tgt  LRA",
         "LUFS: integrated minus --lufs-target; loudness range (r resets all)",
     ),
     (
-        "max  clips",
-        "highest peak (true peak, dBTP, in LUFS) and clip events (x resets)",
+        "max/TP  clips",
+        "highest sample peak (true peak, dBTP, in LUFS) and clip events (x resets)",
     ),
-    ("tone", "strongest tone that stands out, with its note"),
+    (
+        "tone",
+        "strongest tone that stands out (above -50 dB), with its note",
+    ),
 ];
 
 /// Width of the key column in the help.
