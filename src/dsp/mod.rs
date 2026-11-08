@@ -7,5 +7,6 @@ pub mod loudness;
 pub mod quant;
 pub mod scale;
 pub mod spectrum;
+pub mod truepeak;
 pub mod weighting;
 pub mod window;

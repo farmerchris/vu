@@ -83,7 +83,11 @@ impl SilenceWatch {
     /// Fire after `threshold` consecutive zero samples (per channel frame count
     /// times channels, i.e. interleaved samples).
     pub fn new(threshold: u64) -> Self {
-        SilenceWatch { threshold: threshold.max(1), run: 0, fired: false }
+        SilenceWatch {
+            threshold: threshold.max(1),
+            run: 0,
+            fired: false,
+        }
     }
 
     /// Feed a chunk; returns true once each time the zero run reaches the threshold.
@@ -123,17 +127,23 @@ impl Source {
     /// Close and reopen the device stream, looking the device up again by name
     /// in case it reconnected. Data keeps arriving on the same channel.
     pub fn reopen(&mut self) -> Result<()> {
-        let Some(p) = &mut self.device else { bail!("not a live input") };
+        let Some(p) = &mut self.device else {
+            bail!("not a live input")
+        };
         self._stream = None;
         let host = cpal::default_host();
-        if let Some(d) = host
-            .input_devices()
-            .ok()
-            .and_then(|mut it| it.find(|d| d.name().ok().as_deref() == Some(self.info.name.as_str())))
-        {
+        if let Some(d) = host.input_devices().ok().and_then(|mut it| {
+            it.find(|d| d.name().ok().as_deref() == Some(self.info.name.as_str()))
+        }) {
             p.device = d;
         }
-        let stream = build_any(&p.device, &p.config, p.format, p.tx.clone(), self.control.clone())?;
+        let stream = build_any(
+            &p.device,
+            &p.config,
+            p.format,
+            p.tx.clone(),
+            self.control.clone(),
+        )?;
         stream.play().context("restarting input stream")?;
         self._stream = Some(stream);
         Ok(())
@@ -157,7 +167,12 @@ pub fn open(cli: &Cli, fast: bool, looping: bool) -> Result<Source> {
     if let Some(path) = &cli.file {
         open_file(path, fast, looping)
     } else if let Some(spec) = &cli.generate {
-        open_generator(spec, cli.sample_rate.unwrap_or(48000), cli.channels.unwrap_or(2), fast)
+        open_generator(
+            spec,
+            cli.sample_rate.unwrap_or(48000),
+            cli.channels.unwrap_or(2),
+            fast,
+        )
     } else {
         open_device(cli)
     }
@@ -172,7 +187,11 @@ pub struct Pacer {
 
 impl Pacer {
     pub fn new(sample_rate: u32) -> Self {
-        Pacer { start: Instant::now(), sample_rate: sample_rate as f64, sent: 0 }
+        Pacer {
+            start: Instant::now(),
+            sample_rate: sample_rate as f64,
+            sent: 0,
+        }
     }
 
     /// Offset from start at which a chunk ending at sample frame `end` is due.
@@ -208,7 +227,11 @@ fn wait_unpaused(ctl: &Control, pacer: &mut Pacer) -> bool {
 }
 
 /// Read up to `n` interleaved samples as f32 in [-1, 1].
-pub fn read_wav_chunk<R: Read>(reader: &mut hound::WavReader<R>, n: usize, out: &mut Vec<f32>) -> Result<()> {
+pub fn read_wav_chunk<R: Read>(
+    reader: &mut hound::WavReader<R>,
+    n: usize,
+    out: &mut Vec<f32>,
+) -> Result<()> {
     let spec = reader.spec();
     match spec.sample_format {
         hound::SampleFormat::Float => {
@@ -227,13 +250,17 @@ pub fn read_wav_chunk<R: Read>(reader: &mut hound::WavReader<R>, n: usize, out: 
 }
 
 fn open_file(path: &Path, fast: bool, looping: bool) -> Result<Source> {
-    let reader = hound::WavReader::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let reader =
+        hound::WavReader::open(path).with_context(|| format!("opening {}", path.display()))?;
     let spec = reader.spec();
     if spec.channels == 0 {
         bail!("{} has no channels", path.display());
     }
     let info = SourceInfo {
-        name: path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+        name: path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default(),
         sample_rate: spec.sample_rate,
         channels: spec.channels as usize,
         total_frames: Some(reader.duration() as u64),
@@ -243,12 +270,20 @@ fn open_file(path: &Path, fast: bool, looping: bool) -> Result<Source> {
     let control = Arc::new(Control::default());
     let ctl = control.clone();
     let ch = info.channels;
-    thread::Builder::new().name("vu-file".into()).spawn(move || {
-        if let Err(e) = file_thread(reader, tx, &ctl, ch, fast, looping) {
-            ctl.set_error(format!("file read error: {e:#}"));
-        }
-    })?;
-    Ok(Source { info, rx, control, _stream: None, device: None })
+    thread::Builder::new()
+        .name("vu-file".into())
+        .spawn(move || {
+            if let Err(e) = file_thread(reader, tx, &ctl, ch, fast, looping) {
+                ctl.set_error(format!("file read error: {e:#}"));
+            }
+        })?;
+    Ok(Source {
+        info,
+        rx,
+        control,
+        _stream: None,
+        device: None,
+    })
 }
 
 fn file_thread(
@@ -297,22 +332,30 @@ fn open_generator(spec: &str, sample_rate: u32, channels: usize, fast: bool) -> 
     let (tx, rx) = sync_channel(64);
     let control = Arc::new(Control::default());
     let ctl = control.clone();
-    thread::Builder::new().name("vu-gen".into()).spawn(move || {
-        const CHUNK: usize = 512;
-        let mut g = Generator::new(gspec, sample_rate);
-        let mut pacer = Pacer::new(sample_rate);
-        while wait_unpaused(&ctl, &mut pacer) {
-            let mut buf = vec![0.0f32; CHUNK * channels];
-            g.fill(&mut buf, channels);
-            if !fast {
-                pacer.wait(CHUNK);
+    thread::Builder::new()
+        .name("vu-gen".into())
+        .spawn(move || {
+            const CHUNK: usize = 512;
+            let mut g = Generator::new(gspec, sample_rate);
+            let mut pacer = Pacer::new(sample_rate);
+            while wait_unpaused(&ctl, &mut pacer) {
+                let mut buf = vec![0.0f32; CHUNK * channels];
+                g.fill(&mut buf, channels);
+                if !fast {
+                    pacer.wait(CHUNK);
+                }
+                if tx.send(buf).is_err() {
+                    break;
+                }
             }
-            if tx.send(buf).is_err() {
-                break;
-            }
-        }
-    })?;
-    Ok(Source { info, rx, control, _stream: None, device: None })
+        })?;
+    Ok(Source {
+        info,
+        rx,
+        control,
+        _stream: None,
+        device: None,
+    })
 }
 
 fn find_device(host: &cpal::Host, want: &str) -> Result<cpal::Device> {
@@ -325,7 +368,11 @@ fn find_device(host: &cpal::Host, want: &str) -> Result<cpal::Device> {
     let needle = want.to_lowercase();
     devices
         .into_iter()
-        .find(|d| d.name().map(|n| n.to_lowercase().contains(&needle)).unwrap_or(false))
+        .find(|d| {
+            d.name()
+                .map(|n| n.to_lowercase().contains(&needle))
+                .unwrap_or(false)
+        })
         .with_context(|| format!("no input device matching '{want}' (see --list-devices)"))
 }
 
@@ -358,7 +405,9 @@ fn open_device_inner(cli: &Cli) -> Result<Source> {
     let host = cpal::default_host();
     let device = match &cli.device {
         Some(name) => find_device(&host, name)?,
-        None => host.default_input_device().context("no default input device")?,
+        None => host
+            .default_input_device()
+            .context("no default input device")?,
     };
     let name = device.name().unwrap_or_else(|_| "input".into());
     let supported = match cli.sample_rate {
@@ -376,7 +425,8 @@ fn open_device_inner(cli: &Cli) -> Result<Source> {
                     .supported_input_configs()?
                     .filter(|c| c.channels() as usize == ch)
                     .find(|c| {
-                        c.min_sample_rate() <= def.sample_rate() && def.sample_rate() <= c.max_sample_rate()
+                        c.min_sample_rate() <= def.sample_rate()
+                            && def.sample_rate() <= c.max_sample_rate()
                     })
                     .map(|c| c.with_sample_rate(def.sample_rate()))
                     .with_context(|| format!("'{name}' does not support {ch} channels"))?
@@ -400,8 +450,19 @@ fn open_device_inner(cli: &Cli) -> Result<Source> {
     let control = Arc::new(Control::default());
     let stream = build_any(&device, &config, format, tx.clone(), control.clone())?;
     stream.play().context("starting input stream")?;
-    let device = Some(DeviceParams { device, config, format, tx });
-    Ok(Source { info, rx, control, _stream: Some(stream), device })
+    let device = Some(DeviceParams {
+        device,
+        config,
+        format,
+        tx,
+    });
+    Ok(Source {
+        info,
+        rx,
+        control,
+        _stream: Some(stream),
+        device,
+    })
 }
 
 fn build_any(
@@ -459,12 +520,23 @@ pub fn list_devices() -> Result<()> {
     println!("Input devices ({}):", host.id().name());
     for (i, d) in host.input_devices()?.enumerate() {
         let name = d.name().unwrap_or_else(|_| "?".into());
-        let mark = if Some(&name) == default.as_ref() { "*" } else { " " };
+        let mark = if Some(&name) == default.as_ref() {
+            "*"
+        } else {
+            " "
+        };
         print!(" {mark} {i:>2}: {name}  ");
         let _ = std::io::stdout().flush();
         let cfg = d
             .default_input_config()
-            .map(|c| format!("{} Hz, {} ch, {:?}", c.sample_rate().0, c.channels(), c.sample_format()))
+            .map(|c| {
+                format!(
+                    "{} Hz, {} ch, {:?}",
+                    c.sample_rate().0,
+                    c.channels(),
+                    c.sample_format()
+                )
+            })
             .unwrap_or_else(|e| format!("unavailable: {e}"));
         println!("[{cfg}]");
     }
@@ -519,7 +591,12 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("vu-src-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("src.wav");
-        let spec = hound::WavSpec { channels: 2, sample_rate: 8000, bits_per_sample: 16, sample_format: hound::SampleFormat::Int };
+        let spec = hound::WavSpec {
+            channels: 2,
+            sample_rate: 8000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
         let mut w = hound::WavWriter::create(&path, spec).unwrap();
         for i in 0..5000 {
             w.write_sample((i % 100) as i16 * 100).unwrap();

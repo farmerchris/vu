@@ -10,6 +10,10 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
 use ratatui::widgets::{Block, Widget};
 
+/// Caps this close to the floor are left out: they only hold the noise
+/// floor's flicker and scatter as dashes along the bottom.
+const CAP_MIN_ABOVE_FLOOR_DB: f32 = 6.0;
+
 /// Number of bars and the gap between them for `bands` bands in `width` columns.
 pub fn bar_layout(bands: usize, width: u16) -> (usize, u16) {
     let w = width as usize;
@@ -42,26 +46,50 @@ pub fn bar_band(i: usize, bars: usize, bands: usize) -> usize {
 pub fn render(app: &mut App, area: Rect, buf: &mut Buffer) {
     let a = &app.analysis;
     let bands = a.band_centers.len();
-    let kind = if a.third_octave { "1/3 octave".to_string() } else { format!("{bands} bands") };
-    let full = format!(" Equalizer  {kind} · {}-{} Hz ", fmt_freq(a.min_freq), fmt_freq(a.max_freq));
-    let heading = if full.chars().count() + 2 <= area.width as usize { full } else { " Equalizer ".to_string() };
+    let kind = if a.third_octave {
+        "1/3 octave".to_string()
+    } else {
+        format!("{bands} bands")
+    };
+    let full = format!(
+        " Equalizer  {kind} · {}-{} Hz ",
+        fmt_freq(a.min_freq),
+        fmt_freq(a.max_freq)
+    );
+    let heading = if full.chars().count() + 2 <= area.width as usize {
+        full
+    } else {
+        " Equalizer ".to_string()
+    };
     let block = Block::bordered().title(title(heading));
     let inner = block.inner(area);
     block.render(area, buf);
     if inner.height < 3 || inner.width < 8 {
         return;
     }
-    let Some(f) = app.history.get(app.view.cursor) else { return };
+    let Some(f) = app.history.get(app.view.cursor) else {
+        return;
+    };
     let (lo, hi) = (app.display.db_min, app.display.db_max);
-    let axis = Rect { width: 5, height: inner.height - 1, ..inner };
-    let chart = Rect { x: inner.x + 5, width: inner.width - 5, height: inner.height - 1, ..inner };
+    let axis = Rect {
+        width: 5,
+        height: inner.height - 1,
+        ..inner
+    };
+    let chart = Rect {
+        x: inner.x + 5,
+        width: inner.width - 5,
+        height: inner.height - 1,
+        ..inner
+    };
     draw_db_axis(buf, axis, lo, hi);
     let caps = &f.band_caps;
     let (bars, gap) = bar_layout(bands, chart.width);
     let rows = chart.height;
     let mode = app.display.color_mode;
-    let colors: Vec<Color> =
-        (0..rows).map(|rb| to_color(mode, eq_gradient((rb as f32 + 0.5) / rows as f32))).collect();
+    let colors: Vec<Color> = (0..rows)
+        .map(|rb| to_color(mode, eq_gradient((rb as f32 + 0.5) / rows as f32)))
+        .collect();
     for i in 0..bars {
         let b = bar_band(i, bars, bands);
         let (dx0, bw) = bar_span(i, bars, chart.width, gap);
@@ -77,7 +105,11 @@ pub fn render(app: &mut App, area: Rect, buf: &mut Buffer) {
                 buf[(x + dx, y)].set_char(eighth(fill)).set_fg(colors[rb]);
             }
         }
-        if let Some((row, glyph)) = caps.get(b).and_then(|&cap| edge_marker(q_to_db(cap), lo, hi, rows)) {
+        let cap = caps
+            .get(b)
+            .map(|&c| q_to_db(c))
+            .filter(|&c| c >= lo + CAP_MIN_ABOVE_FLOOR_DB);
+        if let Some((row, glyph)) = cap.and_then(|c| edge_marker(c, lo, hi, rows)) {
             for dx in 0..bw {
                 let cell = &mut buf[(x + dx, chart.y + row)];
                 if cell.symbol() == " " {

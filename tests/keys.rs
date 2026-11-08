@@ -38,7 +38,13 @@ fn make_app(args: &[&str], channels: usize, secs: f64) -> App {
         total_frames: None,
         kind: SourceKind::Generator,
     };
-    let mut app = App::new(&cli, info, &analyzer, Arc::new(Control::default()), ColorMode::TrueColor);
+    let mut app = App::new(
+        &cli,
+        info,
+        &analyzer,
+        Arc::new(Control::default()),
+        ColorMode::TrueColor,
+    );
     let mut gen = Generator::new(parse_spec("sweep:50:15000:2:-10").unwrap(), SR);
     let total = (secs * SR as f64) as usize;
     let mut done = 0;
@@ -131,7 +137,10 @@ fn page_up_and_down() {
     let span = app.view.span();
     key(&mut app, KeyCode::PageUp);
     assert!(!app.view.follow);
-    assert_eq!(app.view.cursor, last.saturating_sub(span).max(app.history.first()));
+    assert_eq!(
+        app.view.cursor,
+        last.saturating_sub(span).max(app.history.first())
+    );
     key(&mut app, KeyCode::PageDown);
     assert!(app.view.follow, "paging back to the end resumes following");
     assert_eq!(app.view.cursor, last);
@@ -184,7 +193,11 @@ fn plus_minus_zoom() {
     for _ in 0..20 {
         key(&mut app, KeyCode::Char('+'));
     }
-    assert_eq!(app.view.span_secs, vu::app::ZOOM_SPANS[0], "zoom stops at the shortest span");
+    assert_eq!(
+        app.view.span_secs,
+        vu::app::ZOOM_SPANS[0],
+        "zoom stops at the shortest span"
+    );
     for _ in 0..20 {
         key(&mut app, KeyCode::Char('-'));
     }
@@ -257,15 +270,37 @@ fn colormap_cycles() {
 }
 
 #[test]
-fn shift_r_resets_max_loudness_only() {
+fn r_resets_loudness_and_shift_r_records() {
     let mut app = ready(&[]);
     app.session.max_lufs_m = -10.0;
+    app.session.max_tp = -0.5;
     app.session.max_db = -1.0;
-    assert_eq!(key(&mut app, KeyCode::Char('R')), Action::Redraw);
+    assert_eq!(key(&mut app, KeyCode::Char('r')), Action::Redraw);
     assert_eq!(app.session.max_lufs_m, f32::NEG_INFINITY);
-    assert_eq!(app.session.max_db, -1.0, "R leaves the level maximum");
-    assert!(app.recorder.is_none(), "R is not r (record)");
-    assert!(app.message.as_ref().is_some_and(|(m, _)| m.contains("loudness")));
+    assert!(app.session.max_tp < -100.0);
+    assert!(
+        app.loudness_reset,
+        "asks the analyzer to restart integrated loudness"
+    );
+    assert_eq!(
+        app.session.max_db, -1.0,
+        "r leaves the level maximum (that is x)"
+    );
+    assert!(app.recorder.is_none(), "r no longer records");
+    assert!(app
+        .message
+        .as_ref()
+        .is_some_and(|(m, _)| m.contains("loudness")));
+
+    let dir = std::env::temp_dir().join(format!("vu-keys-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    app.record_base = Some(dir.join("take.wav"));
+    key(&mut app, KeyCode::Char('R'));
+    assert!(app.recorder.is_some(), "R starts recording");
+    key(&mut app, KeyCode::Char('R'));
+    assert!(app.recorder.is_none(), "R stops it");
+    assert_eq!(app.saved_recordings.len(), 1);
+    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 #[test]
@@ -276,11 +311,31 @@ fn v_cycles_meter_modes() {
     for want in [Vu, Lufs, Rms] {
         assert_eq!(key(&mut app, KeyCode::Char('v')), Action::Redraw);
         assert_eq!(app.display.mode, want);
-        assert!(app.message.as_ref().is_some_and(|(m, _)| m.contains(want.name())));
+        assert!(app
+            .message
+            .as_ref()
+            .is_some_and(|(m, _)| m.contains(want.name())));
     }
     assert_eq!(ready(&["--vu"]).display.mode, Vu, "--vu starts in VU mode");
-    assert_eq!(ready(&["--lufs"]).display.mode, Lufs, "--lufs starts in LUFS mode");
+    assert_eq!(
+        ready(&["--lufs"]).display.mode,
+        Lufs,
+        "--lufs starts in LUFS mode"
+    );
     assert!(Cli::try_parse_from(["vu", "--vu", "--lufs"]).is_err());
+    assert_eq!(
+        ready(&[]).display.lufs_target,
+        -14.0,
+        "streaming target by default"
+    );
+    assert_eq!(ready(&["--lufs-target", "-23"]).display.lufs_target, -23.0);
+    for bad in ["-41", "1", "x"] {
+        assert!(
+            Cli::try_parse_from(["vu", "--lufs-target", bad])
+                .map_or(true, |c| c.validate().is_err()),
+            "{bad}"
+        );
+    }
 }
 
 #[test]
@@ -288,7 +343,10 @@ fn cycle_views_steps_modes_on_a_timer() {
     use std::time::{Duration, Instant};
     use vu::app::MeterMode::*;
     let mut app = ready(&[]);
-    assert!(!app.cycle_tick(Instant::now() + Duration::from_secs(60)), "off by default");
+    assert!(
+        !app.cycle_tick(Instant::now() + Duration::from_secs(60)),
+        "off by default"
+    );
     let mut app = ready(&["--cycle-views"]);
     let t0 = app.cycle.unwrap().1;
     assert_eq!(app.cycle.unwrap().0, Duration::from_secs(3));
@@ -301,9 +359,15 @@ fn cycle_views_steps_modes_on_a_timer() {
     assert!(app.cycle_tick(at(9.0)));
     assert_eq!(app.display.mode, Rms, "wraps around");
     let app = ready(&["--cycle-views=0.5", "--lufs"]);
-    assert_eq!((app.cycle.unwrap().0, app.display.mode), (Duration::from_millis(500), Lufs));
+    assert_eq!(
+        (app.cycle.unwrap().0, app.display.mode),
+        (Duration::from_millis(500), Lufs)
+    );
     for bad in ["--cycle-views=0", "--cycle-views=x"] {
-        assert!(Cli::try_parse_from(["vu", bad]).map_or(true, |c| c.validate().is_err()), "{bad}");
+        assert!(
+            Cli::try_parse_from(["vu", bad]).map_or(true, |c| c.validate().is_err()),
+            "{bad}"
+        );
     }
 }
 
@@ -356,7 +420,10 @@ fn help_toggles_and_esc_closes_it() {
 fn quit_keys() {
     let mut app = ready(&[]);
     assert_eq!(key(&mut app, KeyCode::Char('q')), Action::Quit);
-    assert_eq!(mod_key(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL), Action::Quit);
+    assert_eq!(
+        mod_key(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL),
+        Action::Quit
+    );
     // Plain 'c' is the colormap key, not quit.
     assert_eq!(key(&mut app, KeyCode::Char('c')), Action::Redraw);
 }
@@ -387,8 +454,15 @@ fn unknown_key_and_release_do_nothing() {
 fn keys_on_empty_history_do_not_panic() {
     let mut app = make_app(&[], 2, 0.0);
     for code in [
-        KeyCode::Left, KeyCode::Right, KeyCode::PageUp, KeyCode::PageDown, KeyCode::Home,
-        KeyCode::End, KeyCode::Char(' '), KeyCode::Char('+'), KeyCode::Char('-'),
+        KeyCode::Left,
+        KeyCode::Right,
+        KeyCode::PageUp,
+        KeyCode::PageDown,
+        KeyCode::Home,
+        KeyCode::End,
+        KeyCode::Char(' '),
+        KeyCode::Char('+'),
+        KeyCode::Char('-'),
     ] {
         key(&mut app, code);
     }

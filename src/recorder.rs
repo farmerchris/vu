@@ -37,8 +37,14 @@ pub fn record_path(base: Option<&Path>, n: usize, unix_secs: u64) -> PathBuf {
     match base {
         Some(b) if n == 0 => b.to_path_buf(),
         Some(b) => {
-            let stem = b.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "vu".into());
-            let ext = b.extension().map(|e| e.to_string_lossy().into_owned()).unwrap_or_else(|| "wav".into());
+            let stem = b
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "vu".into());
+            let ext = b
+                .extension()
+                .map(|e| e.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "wav".into());
             b.with_file_name(format!("{stem}-{n}.{ext}"))
         }
         None if n == 0 => PathBuf::from(format!("vu-{unix_secs}.wav")),
@@ -47,15 +53,31 @@ pub fn record_path(base: Option<&Path>, n: usize, unix_secs: u64) -> PathBuf {
 }
 
 impl Recorder {
-    pub fn create(path: &Path, channels: usize, sample_rate: u32, format: RecordFormat) -> Result<Self> {
+    pub fn create(
+        path: &Path,
+        channels: usize,
+        sample_rate: u32,
+        format: RecordFormat,
+    ) -> Result<Self> {
         let (bits, sample_format) = match format {
             RecordFormat::Int16 => (16, SampleFormat::Int),
             RecordFormat::Int24 => (24, SampleFormat::Int),
             RecordFormat::Float32 => (32, SampleFormat::Float),
         };
-        let spec = WavSpec { channels: channels as u16, sample_rate, bits_per_sample: bits, sample_format };
-        let writer = WavWriter::create(path, spec).with_context(|| format!("creating {}", path.display()))?;
-        Ok(Recorder { writer: Some(writer), format, path: path.to_path_buf(), samples: 0 })
+        let spec = WavSpec {
+            channels: channels as u16,
+            sample_rate,
+            bits_per_sample: bits,
+            sample_format,
+        };
+        let writer = WavWriter::create(path, spec)
+            .with_context(|| format!("creating {}", path.display()))?;
+        Ok(Recorder {
+            writer: Some(writer),
+            format,
+            path: path.to_path_buf(),
+            samples: 0,
+        })
     }
 
     pub fn write(&mut self, data: &[f32]) -> Result<()> {
@@ -85,7 +107,8 @@ impl Recorder {
 
     pub fn finish(&mut self) -> Result<()> {
         if let Some(w) = self.writer.take() {
-            w.finalize().with_context(|| format!("finalizing {}", self.path.display()))?;
+            w.finalize()
+                .with_context(|| format!("finalizing {}", self.path.display()))?;
         }
         Ok(())
     }
@@ -120,8 +143,14 @@ mod tests {
 
     #[test]
     fn paths() {
-        assert_eq!(record_path(Some(Path::new("out.wav")), 0, 5), PathBuf::from("out.wav"));
-        assert_eq!(record_path(Some(Path::new("dir/out.wav")), 2, 5), PathBuf::from("dir/out-2.wav"));
+        assert_eq!(
+            record_path(Some(Path::new("out.wav")), 0, 5),
+            PathBuf::from("out.wav")
+        );
+        assert_eq!(
+            record_path(Some(Path::new("dir/out.wav")), 2, 5),
+            PathBuf::from("dir/out-2.wav")
+        );
         assert_eq!(record_path(None, 0, 123), PathBuf::from("vu-123.wav"));
         assert_eq!(record_path(None, 1, 123), PathBuf::from("vu-123-1.wav"));
     }
@@ -129,7 +158,11 @@ mod tests {
     #[test]
     fn roundtrip_all_formats() {
         let data: Vec<f32> = (0..2000).map(|i| ((i as f32) * 0.01).sin() * 0.9).collect();
-        for (fmt, tol) in [(RecordFormat::Int16, 1e-4), (RecordFormat::Int24, 1e-6), (RecordFormat::Float32, 0.0)] {
+        for (fmt, tol) in [
+            (RecordFormat::Int16, 1e-4),
+            (RecordFormat::Int24, 1e-6),
+            (RecordFormat::Float32, 0.0),
+        ] {
             let p = tmp(&format!("rt-{fmt:?}.wav"));
             let mut r = Recorder::create(&p, 2, 44100, fmt).unwrap();
             r.write(&data[..1000]).unwrap();

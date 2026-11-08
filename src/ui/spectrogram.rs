@@ -4,8 +4,8 @@
 
 use super::colormap::{build_lut, to_color, ColorMap, ColorMode};
 use super::{fmt_freq, split_axis, title};
-use crate::app::App;
 use crate::analyzer::Frame;
+use crate::app::App;
 use crate::dsp::scale::{pixel_bin_ranges, to_unit, FreqScale};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -58,10 +58,19 @@ impl PixelCache {
 }
 
 impl SpecCache {
-    pub fn ranges(&mut self, pixels: usize, scale: FreqScale, min: f32, max: f32, bin_hz: f32, bins: usize) -> &[(u32, u32)] {
+    pub fn ranges(
+        &mut self,
+        pixels: usize,
+        scale: FreqScale,
+        min: f32,
+        max: f32,
+        bin_hz: f32,
+        bins: usize,
+    ) -> &[(u32, u32)] {
         let key = (pixels, scale, min.to_bits(), max.to_bits(), bins);
         if self.range_key != Some(key) {
-            self.ranges = pixel_bin_ranges(scale, pixels, min as f64, max as f64, bin_hz as f64, bins);
+            self.ranges =
+                pixel_bin_ranges(scale, pixels, min as f64, max as f64, bin_hz as f64, bins);
             self.range_key = Some(key);
             self.pixels.key = None;
         }
@@ -111,7 +120,15 @@ pub fn freq_labels(min: f32, max: f32, scale: FreqScale) -> Vec<f32> {
 }
 
 /// Colour key on the top border, right-aligned: ` -70 ▆▆▆▆▆▆▆▆▆▆▆▆ 0 dB `.
-fn draw_legend(buf: &mut Buffer, area: Rect, heading_w: u16, map: ColorMap, mode: ColorMode, lo: f32, hi: f32) {
+fn draw_legend(
+    buf: &mut Buffer,
+    area: Rect,
+    heading_w: u16,
+    map: ColorMap,
+    mode: ColorMode,
+    lo: f32,
+    hi: f32,
+) {
     const STRIP: u16 = 12;
     let (l, h) = (format!(" {lo:.0} "), format!(" {hi:.0} dB "));
     let w = l.len() as u16 + STRIP + h.len() as u16;
@@ -123,7 +140,9 @@ fn draw_legend(buf: &mut Buffer, area: Rect, heading_w: u16, map: ColorMap, mode
     buf.set_string(x, area.y, &l, style);
     for i in 0..STRIP {
         let c = to_color(mode, map.sample((i as f32 + 0.5) / STRIP as f32));
-        buf[(x + l.len() as u16 + i, area.y)].set_char('█').set_fg(c);
+        buf[(x + l.len() as u16 + i, area.y)]
+            .set_char('█')
+            .set_fg(c);
     }
     buf.set_string(x + l.len() as u16 + STRIP, area.y, &h, style);
 }
@@ -145,7 +164,15 @@ pub fn render(app: &mut App, area: Rect, buf: &mut Buffer) -> Rect {
     let block = Block::bordered().title(title(heading));
     let inner = block.inner(area);
     block.render(area, buf);
-    draw_legend(buf, area, heading_w, d.colormap, d.color_mode, d.db_min, d.db_max);
+    draw_legend(
+        buf,
+        area,
+        heading_w,
+        d.colormap,
+        d.color_mode,
+        d.db_min,
+        d.db_max,
+    );
     let (axis, chart) = split_axis(inner);
     if chart.width == 0 || chart.height == 0 {
         return chart;
@@ -153,8 +180,22 @@ pub fn render(app: &mut App, area: Rect, buf: &mut Buffer) -> Rect {
     let pixels = chart.height as usize * 2;
     let cache = &mut app.spec_cache;
     cache.ensure_lut(d.colormap, d.color_mode, d.db_min, d.db_max);
-    cache.ranges(pixels, d.freq_scale, a.min_freq, a.max_freq, a.bin_hz, a.bins);
-    let SpecCache { ranges, lut, col, pixels: pcache, range_key, .. } = cache;
+    cache.ranges(
+        pixels,
+        d.freq_scale,
+        a.min_freq,
+        a.max_freq,
+        a.bin_hz,
+        a.bins,
+    );
+    let SpecCache {
+        ranges,
+        lut,
+        col,
+        pixels: pcache,
+        range_key,
+        ..
+    } = cache;
     col.resize(pixels, 0);
     if let Some(key) = *range_key {
         pcache.prepare(key, pixels, v.span());
@@ -163,7 +204,9 @@ pub fn render(app: &mut App, area: Rect, buf: &mut Buffer) -> Rect {
     let first = app.history.first();
     let cursor_col = v.cursor_column();
     for c in 0..chart.width as usize {
-        let Some((fs, fe)) = v.column_frames(c).filter(|&(_, hi)| hi >= first) else { continue };
+        let Some((fs, fe)) = v.column_frames(c).filter(|&(_, hi)| hi >= first) else {
+            continue;
+        };
         let fs = fs.max(first);
         col.fill(0);
         let mut any = false;
@@ -198,13 +241,21 @@ pub fn render(app: &mut App, area: Rect, buf: &mut Buffer) -> Rect {
     // Frequency axis.
     let style = Style::default().fg(Color::DarkGray);
     let mut last_row: Option<u16> = None;
-    for f in freq_labels(a.min_freq, a.max_freq, d.freq_scale).into_iter().rev() {
+    for f in freq_labels(a.min_freq, a.max_freq, d.freq_scale)
+        .into_iter()
+        .rev()
+    {
         let u = to_unit(d.freq_scale, f as f64, a.min_freq as f64, a.max_freq as f64) as f32;
-        let row = chart.height - 1 - ((u * chart.height as f32).floor() as u16).min(chart.height - 1);
+        let row =
+            chart.height - 1 - ((u * chart.height as f32).floor() as u16).min(chart.height - 1);
         if last_row.is_some_and(|r| row < r + 2) {
             continue;
         }
-        let label = format!("{:>w$}", fmt_freq(f), w = axis.width.saturating_sub(1) as usize);
+        let label = format!(
+            "{:>w$}",
+            fmt_freq(f),
+            w = axis.width.saturating_sub(1) as usize
+        );
         buf.set_string(axis.x, axis.y + row, label, style);
         last_row = Some(row);
     }
@@ -248,11 +299,17 @@ mod tests {
     #[test]
     fn cache_reuses() {
         let mut c = SpecCache::default();
-        let a = c.ranges(20, FreqScale::Log, 20.0, 20000.0, 23.4375, 1025).to_vec();
+        let a = c
+            .ranges(20, FreqScale::Log, 20.0, 20000.0, 23.4375, 1025)
+            .to_vec();
         assert_eq!(a.len(), 20);
-        let b = c.ranges(20, FreqScale::Log, 20.0, 20000.0, 23.4375, 1025).to_vec();
+        let b = c
+            .ranges(20, FreqScale::Log, 20.0, 20000.0, 23.4375, 1025)
+            .to_vec();
         assert_eq!(a, b);
-        let l = c.ranges(40, FreqScale::Linear, 20.0, 20000.0, 23.4375, 1025).len();
+        let l = c
+            .ranges(40, FreqScale::Linear, 20.0, 20000.0, 23.4375, 1025)
+            .len();
         assert_eq!(l, 40);
         c.ensure_lut(ColorMap::Gray, ColorMode::TrueColor, -96.0, 0.0);
         assert_eq!(c.lut.len(), 256);

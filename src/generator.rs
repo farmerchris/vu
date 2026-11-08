@@ -6,13 +6,22 @@ use std::f64::consts::PI;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum GenKind {
-    Sine { freq: f64 },
-    Square { freq: f64 },
+    Sine {
+        freq: f64,
+    },
+    Square {
+        freq: f64,
+    },
     White,
     Pink,
     /// Exponential sweep from `f0` to `f1` over `secs`, repeating. With
     /// `end_db` the level also ramps (linearly in dB) from `level_db` to it.
-    Sweep { f0: f64, f1: f64, secs: f64, end_db: Option<f64> },
+    Sweep {
+        f0: f64,
+        f1: f64,
+        secs: f64,
+        end_db: Option<f64>,
+    },
     Silence,
 }
 
@@ -35,12 +44,26 @@ pub fn parse_spec(s: &str) -> Result<GenSpec> {
     let opt_db = |i: usize, default: f64| -> Result<f64> {
         match parts.get(i) {
             None => Ok(default),
-            Some(v) => v.parse::<f64>().with_context(|| format!("generator '{s}': invalid level")),
+            Some(v) => v
+                .parse::<f64>()
+                .with_context(|| format!("generator '{s}': invalid level")),
         }
     };
     let (kind, db_idx, max_parts) = match parts[0].to_ascii_lowercase().as_str() {
-        "sine" => (GenKind::Sine { freq: num(1, "frequency")? }, 2, 3),
-        "square" => (GenKind::Square { freq: num(1, "frequency")? }, 2, 3),
+        "sine" => (
+            GenKind::Sine {
+                freq: num(1, "frequency")?,
+            },
+            2,
+            3,
+        ),
+        "square" => (
+            GenKind::Square {
+                freq: num(1, "frequency")?,
+            },
+            2,
+            3,
+        ),
         "noise" | "white" => (GenKind::White, 1, 2),
         "pink" => (GenKind::Pink, 1, 2),
         "sweep" => (
@@ -60,7 +83,9 @@ pub fn parse_spec(s: &str) -> Result<GenSpec> {
         bail!("generator '{s}' has too many fields");
     }
     match kind {
-        GenKind::Sine { freq } | GenKind::Square { freq } if freq <= 0.0 => bail!("frequency must be positive"),
+        GenKind::Sine { freq } | GenKind::Square { freq } if freq <= 0.0 => {
+            bail!("frequency must be positive")
+        }
         GenKind::Sweep { f0, f1, secs, .. } if f0 <= 0.0 || f1 <= 0.0 || secs <= 0.0 => {
             bail!("sweep frequencies and duration must be positive")
         }
@@ -70,7 +95,10 @@ pub fn parse_spec(s: &str) -> Result<GenSpec> {
         GenKind::White | GenKind::Pink => -12.0,
         _ => -6.0,
     };
-    Ok(GenSpec { kind, level_db: opt_db(db_idx, default_db)? })
+    Ok(GenSpec {
+        kind,
+        level_db: opt_db(db_idx, default_db)?,
+    })
 }
 
 pub struct Generator {
@@ -137,7 +165,12 @@ impl Generator {
                 b[6] = w * 0.115926;
                 (out * 0.2).clamp(-1.0, 1.0)
             }
-            GenKind::Sweep { f0, f1, secs, end_db } => {
+            GenKind::Sweep {
+                f0,
+                f1,
+                secs,
+                end_db,
+            } => {
                 let t = (self.n as f64 / self.sr) % secs;
                 let f = sweep_freq(f0, f1, secs, t);
                 let v = (2.0 * PI * self.phase).sin();
@@ -175,24 +208,64 @@ mod tests {
 
     #[test]
     fn parse_variants() {
-        assert_eq!(parse_spec("sine:440").unwrap(), GenSpec { kind: GenKind::Sine { freq: 440.0 }, level_db: -6.0 });
+        assert_eq!(
+            parse_spec("sine:440").unwrap(),
+            GenSpec {
+                kind: GenKind::Sine { freq: 440.0 },
+                level_db: -6.0
+            }
+        );
         assert_eq!(parse_spec("sine:1000:-20").unwrap().level_db, -20.0);
-        assert_eq!(parse_spec("Square:50").unwrap().kind, GenKind::Square { freq: 50.0 });
-        assert_eq!(parse_spec("noise").unwrap(), GenSpec { kind: GenKind::White, level_db: -12.0 });
+        assert_eq!(
+            parse_spec("Square:50").unwrap().kind,
+            GenKind::Square { freq: 50.0 }
+        );
+        assert_eq!(
+            parse_spec("noise").unwrap(),
+            GenSpec {
+                kind: GenKind::White,
+                level_db: -12.0
+            }
+        );
         assert_eq!(parse_spec("pink:-3").unwrap().level_db, -3.0);
         assert_eq!(
             parse_spec("sweep:20:20000:5").unwrap().kind,
-            GenKind::Sweep { f0: 20.0, f1: 20000.0, secs: 5.0, end_db: None }
+            GenKind::Sweep {
+                f0: 20.0,
+                f1: 20000.0,
+                secs: 5.0,
+                end_db: None
+            }
         );
         let s = parse_spec("sweep:100:800:5:-20:-10").unwrap();
-        assert_eq!(s.kind, GenKind::Sweep { f0: 100.0, f1: 800.0, secs: 5.0, end_db: Some(-10.0) });
+        assert_eq!(
+            s.kind,
+            GenKind::Sweep {
+                f0: 100.0,
+                f1: 800.0,
+                secs: 5.0,
+                end_db: Some(-10.0)
+            }
+        );
         assert_eq!(s.level_db, -20.0);
         assert_eq!(parse_spec("silence").unwrap().kind, GenKind::Silence);
     }
 
     #[test]
     fn parse_errors() {
-        for bad in ["", "sine", "sine:abc", "sine:-5", "sweep:20:200", "bogus", "noise:x", "sine:1:2:3", "silence:1", "sweep:1:2:3:4:x", "sweep:1:2:3:4:5:6"] {
+        for bad in [
+            "",
+            "sine",
+            "sine:abc",
+            "sine:-5",
+            "sweep:20:200",
+            "bogus",
+            "noise:x",
+            "sine:1:2:3",
+            "silence:1",
+            "sweep:1:2:3:4:x",
+            "sweep:1:2:3:4:5:6",
+        ] {
             assert!(parse_spec(bad).is_err(), "{bad} should fail");
         }
     }
@@ -250,7 +323,11 @@ mod tests {
         let x = render("sweep:1000:1000:1:-20:-10", 96000);
         let peak_db = |a: usize| 20.0 * peak_abs(&x[a..a + 480]).log10();
         assert!((peak_db(0) - -19.95).abs() < 0.1, "{}", peak_db(0));
-        assert!((peak_db(24000 - 240) - -15.0).abs() < 0.1, "{}", peak_db(23760));
+        assert!(
+            (peak_db(24000 - 240) - -15.0).abs() < 0.1,
+            "{}",
+            peak_db(23760)
+        );
         assert!((peak_db(47520) - -10.05).abs() < 0.1, "{}", peak_db(47520));
         assert!((peak_db(48000) - -19.95).abs() < 0.1, "{}", peak_db(48000));
     }

@@ -17,7 +17,15 @@ pub struct Biquad {
 
 impl Biquad {
     pub fn new(b0: f64, b1: f64, b2: f64, a1: f64, a2: f64) -> Self {
-        Biquad { b0, b1, b2, a1, a2, z1: 0.0, z2: 0.0 }
+        Biquad {
+            b0,
+            b1,
+            b2,
+            a1,
+            a2,
+            z1: 0.0,
+            z2: 0.0,
+        }
     }
 
     /// Transposed direct form II.
@@ -65,7 +73,13 @@ pub fn k_highpass(fs: f64) -> Biquad {
     let q = 0.500_327_037_323_877_3;
     let k = (PI * f0 / fs).tan();
     let a0 = 1.0 + k / q + k * k;
-    Biquad::new(1.0, -2.0, 1.0, 2.0 * (k * k - 1.0) / a0, (1.0 - k / q + k * k) / a0)
+    Biquad::new(
+        1.0,
+        -2.0,
+        1.0,
+        2.0 * (k * k - 1.0) / a0,
+        (1.0 - k / q + k * k) / a0,
+    )
 }
 
 pub fn energy_to_lufs(e: f64) -> f32 {
@@ -112,13 +126,42 @@ pub struct LoudnessMeter {
     integrated: f32,
     max_momentary: f32,
     max_short_term: f32,
+    /// Short-term energies every 100 ms once 3 s are in, for loudness range.
+    short_terms: Vec<f64>,
+    lra: f32,
+}
+
+/// Loudness range (EBU Tech 3342) of short-term energies: the spread between
+/// the 10th and 95th percentiles, after an absolute gate at -70 LUFS and a
+/// relative one 20 LU below their mean. NaN until there are any.
+pub fn loudness_range(short_terms: &[f64]) -> f32 {
+    let abs_gate = 10f64.powf((-70.0 + 0.691) / 10.0);
+    let above: Vec<f64> = short_terms
+        .iter()
+        .copied()
+        .filter(|&e| e > abs_gate)
+        .collect();
+    if above.is_empty() {
+        return f32::NAN;
+    }
+    let rel_gate = above.iter().sum::<f64>() / above.len() as f64 * 0.01;
+    let mut l: Vec<f32> = above
+        .into_iter()
+        .filter(|&e| e > rel_gate)
+        .map(energy_to_lufs)
+        .collect();
+    l.sort_by(f32::total_cmp);
+    let at = |p: f64| l[((p * (l.len() - 1) as f64).round() as usize).min(l.len() - 1)];
+    at(0.95) - at(0.10)
 }
 
 impl LoudnessMeter {
     pub fn new(sample_rate: u32, channels: usize) -> Self {
         let fs = sample_rate as f64;
         LoudnessMeter {
-            filters: (0..channels.max(1)).map(|_| (k_shelf(fs), k_highpass(fs))).collect(),
+            filters: (0..channels.max(1))
+                .map(|_| (k_shelf(fs), k_highpass(fs)))
+                .collect(),
             sub_len: (sample_rate as usize / 10).max(1),
             sub_count: 0,
             sub_acc: 0.0,
@@ -127,7 +170,20 @@ impl LoudnessMeter {
             integrated: f32::NEG_INFINITY,
             max_momentary: f32::NEG_INFINITY,
             max_short_term: f32::NEG_INFINITY,
+            short_terms: Vec::new(),
+            lra: f32::NAN,
         }
+    }
+
+    /// Start a new measurement: integrated loudness, loudness range and the
+    /// maxima start again; the momentary and short-term windows carry on.
+    pub fn reset(&mut self) {
+        self.blocks.clear();
+        self.short_terms.clear();
+        self.integrated = f32::NEG_INFINITY;
+        self.max_momentary = f32::NEG_INFINITY;
+        self.max_short_term = f32::NEG_INFINITY;
+        self.lra = f32::NAN;
     }
 
     /// Feed one interleaved sample frame (extra channels beyond the meter's are ignored).
@@ -158,6 +214,12 @@ impl LoudnessMeter {
             self.max_momentary = self.max_momentary.max(energy_to_lufs(block));
             if self.subs.len() == 30 {
                 self.max_short_term = self.max_short_term.max(self.short_term());
+                self.short_terms.push(self.subs.iter().sum::<f64>() / 30.0);
+                // Loudness range moves slowly; recomputing it once a second
+                // keeps long sessions cheap.
+                if self.short_terms.len() % 10 == 1 {
+                    self.lra = loudness_range(&self.short_terms);
+                }
             }
         }
     }
@@ -190,6 +252,11 @@ impl LoudnessMeter {
 
     pub fn max_short_term(&self) -> f32 {
         self.max_short_term
+    }
+
+    /// Loudness range in LU (EBU Tech 3342), NaN before 3 s of signal.
+    pub fn loudness_range(&self) -> f32 {
+        self.lra
     }
 }
 
@@ -284,5 +351,44 @@ mod tests {
         let mut b = Biquad::new(1.0, 0.0, 0.0, 0.0, 0.0);
         assert_eq!(b.process(0.3), 0.3);
         assert!((b.magnitude(1000.0, 48000.0) - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn loudness_range_and_reset() {
+        let e = |lufs: f64| 10f64.powf((lufs + 0.691) / 10.0);
+        // Steady signal: no range.
+        assert!(loudness_range(&[e(-20.0); 50]).abs() < 1e-4);
+        // Half at -30, half at -20: 10 LU apart; silence is gated out.
+        let mut st: Vec<f64> = (0..50)
+            .map(|i| e(if i % 2 == 0 { -30.0 } else { -20.0 }))
+            .collect();
+        st.extend([e(-90.0); 50]);
+        assert!(
+            (loudness_range(&st) - 10.0).abs() < 0.01,
+            "{}",
+            loudness_range(&st)
+        );
+        // A short burst 25 LU down falls below the relative gate.
+        st.extend([e(-45.0); 5]);
+        assert!((loudness_range(&st) - 10.0).abs() < 0.01);
+        assert!(loudness_range(&[]).is_nan() && loudness_range(&[e(-80.0)]).is_nan());
+
+        let mut m = LoudnessMeter::new(48000, 1);
+        feed_sine(&mut m, 1000.0, 0.1, 48000, 4.0, 1);
+        assert!(
+            m.integrated().is_finite() && m.loudness_range().abs() < 0.1,
+            "{}",
+            m.loudness_range()
+        );
+        m.reset();
+        assert_eq!(
+            (m.integrated(), m.max_momentary()),
+            (f32::NEG_INFINITY, f32::NEG_INFINITY)
+        );
+        assert!(m.loudness_range().is_nan());
+        // Momentary carries on through a reset; integrated starts again.
+        assert!(m.momentary().is_finite());
+        feed_sine(&mut m, 1000.0, 0.1, 48000, 0.5, 1);
+        assert!(m.integrated().is_finite());
     }
 }

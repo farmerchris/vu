@@ -9,7 +9,9 @@ use crate::source::{Control, SourceInfo, SourceKind};
 use crate::ui::colormap::{ColorMap, ColorMode};
 use crate::ui::SpecCache;
 use anyhow::Result;
-use ratatui::crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind};
+use ratatui::crossterm::event::{
+    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
+};
 use ratatui::layout::Rect;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
@@ -48,7 +50,9 @@ pub enum Nav {
 }
 
 /// Zoom levels (seconds across the chart) stepped through by + and -.
-pub const ZOOM_SPANS: [f64; 11] = [0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 30.0, 60.0, 120.0, 300.0, 600.0];
+pub const ZOOM_SPANS: [f64; 11] = [
+    0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 30.0, 60.0, 120.0, 300.0, 600.0,
+];
 pub const DEFAULT_SPAN: f64 = 10.0;
 
 /// Tolerance for float bucket arithmetic.
@@ -56,7 +60,14 @@ const EPS: f64 = 1e-9;
 
 impl Default for View {
     fn default() -> Self {
-        View { follow: true, cursor: 0, view_end: 0, span_secs: DEFAULT_SPAN, dt: 0.01, width: 1 }
+        View {
+            follow: true,
+            cursor: 0,
+            view_end: 0,
+            span_secs: DEFAULT_SPAN,
+            dt: 0.01,
+            width: 1,
+        }
     }
 }
 
@@ -117,7 +128,9 @@ impl View {
         let span = self.span();
         let max_end = self.bucket_end(last);
         // Never scroll back past the oldest frame while there is data to fill the view.
-        self.view_end = self.view_end.clamp((first + span - 1).min(max_end), max_end);
+        self.view_end = self
+            .view_end
+            .clamp((first + span - 1).min(max_end), max_end);
         if self.cursor > self.view_end {
             self.view_end = self.cursor;
         } else if self.cursor + span <= self.view_end {
@@ -205,7 +218,9 @@ impl View {
         if col >= self.width {
             return None;
         }
-        let b = self.bucket(self.view_end).checked_sub(self.width - 1 - col)?;
+        let b = self
+            .bucket(self.view_end)
+            .checked_sub(self.width - 1 - col)?;
         Some(self.bucket_frames(b))
     }
 
@@ -231,8 +246,9 @@ impl View {
 }
 
 /// Highest sample peak and number of clipping events since the start or the
-/// last reset (`x`), and the highest momentary loudness since the start or its
-/// own reset (`R`). A run of consecutive clipped frames counts as one event.
+/// last reset (`x`), and the highest momentary loudness and true peak since
+/// the start or the loudness reset (`r`). A run of consecutive clipped frames
+/// counts as one event.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Session {
     pub max_db: f32,
@@ -240,18 +256,28 @@ pub struct Session {
     in_clip: bool,
     /// Highest momentary loudness (EBU "max M"), LUFS.
     pub max_lufs_m: f32,
+    /// Highest true peak, dBTP.
+    pub max_tp: f32,
 }
 
 impl Default for Session {
     fn default() -> Self {
-        Session { max_db: crate::dsp::level::FLOOR_DB, clips: 0, in_clip: false, max_lufs_m: f32::NEG_INFINITY }
+        let floor = crate::dsp::level::FLOOR_DB;
+        Session {
+            max_db: floor,
+            clips: 0,
+            in_clip: false,
+            max_lufs_m: f32::NEG_INFINITY,
+            max_tp: floor,
+        }
     }
 }
 
 impl Session {
     pub fn add(&mut self, f: &crate::analyzer::Frame) {
-        for &p in &f.peak[..f.n()] {
+        for (&p, &tp) in f.peak[..f.n()].iter().zip(&f.true_peak) {
             self.max_db = self.max_db.max(p);
+            self.max_tp = self.max_tp.max(tp);
         }
         if f.clipped && !self.in_clip {
             self.clips += 1;
@@ -261,14 +287,20 @@ impl Session {
     }
 
     /// Start counting peaks and clips again. A clip run in progress at the
-    /// reset is not counted a second time. The loudness maximum is kept.
+    /// reset is not counted a second time. The loudness measurement is kept.
     pub fn reset(&mut self) {
-        *self = Session { in_clip: self.in_clip, max_lufs_m: self.max_lufs_m, ..Session::default() };
+        *self = Session {
+            in_clip: self.in_clip,
+            max_lufs_m: self.max_lufs_m,
+            max_tp: self.max_tp,
+            ..Session::default()
+        };
     }
 
-    /// Start tracking the maximum momentary loudness again.
+    /// Start the loudness measurement's maxima (momentary, true peak) again.
     pub fn reset_loudness(&mut self) {
-        self.max_lufs_m = f32::NEG_INFINITY;
+        let d = Session::default();
+        (self.max_lufs_m, self.max_tp) = (d.max_lufs_m, d.max_tp);
     }
 }
 
@@ -287,7 +319,13 @@ pub struct Readout {
 }
 
 impl Readout {
-    pub fn pick(&mut self, cursor: usize, follow: bool, now: Instant, exists: impl Fn(usize) -> bool) -> usize {
+    pub fn pick(
+        &mut self,
+        cursor: usize,
+        follow: bool,
+        now: Instant,
+        exists: impl Fn(usize) -> bool,
+    ) -> usize {
         if follow {
             if let Some((f, at)) = self.shown {
                 if now.duration_since(at) < READOUT_INTERVAL && f <= cursor && exists(f) {
@@ -317,7 +355,11 @@ impl FpsMeter {
 
     pub fn tick(&mut self, now: Instant, draw_time: std::time::Duration) {
         self.draws.push_back(now);
-        while self.draws.front().is_some_and(|&t| now.duration_since(t) >= std::time::Duration::from_secs(1)) {
+        while self
+            .draws
+            .front()
+            .is_some_and(|&t| now.duration_since(t) >= std::time::Duration::from_secs(1))
+        {
             self.draws.pop_front();
         }
         self.fps = self.draws.len();
@@ -352,7 +394,7 @@ pub enum MeterMode {
     Rms,
     /// Per-channel VU needles on the VU scale.
     Vu,
-    /// Momentary and short-term loudness on the EBU +9 scale.
+    /// Momentary and short-term loudness, in LU around a target.
     Lufs,
 }
 
@@ -387,6 +429,8 @@ pub struct Display {
     pub mode: MeterMode,
     /// dBFS that reads 0 VU.
     pub vu_ref: f32,
+    /// LUFS that reads 0 LU.
+    pub lufs_target: f32,
 }
 
 impl Display {
@@ -410,6 +454,8 @@ pub struct App {
     pub display: Display,
     pub control: Arc<Control>,
     pub show_help: bool,
+    /// Set by `r`: the analyzer should start a new loudness measurement.
+    pub loudness_reset: bool,
     /// `--cycle-views`: the interval and when the mode last changed.
     pub cycle: Option<(std::time::Duration, Instant)>,
     pub fps: FpsMeter,
@@ -424,7 +470,7 @@ pub struct App {
     pub reopens: u32,
     pub recorder: Option<Recorder>,
     pub saved_recordings: Vec<PathBuf>,
-    record_base: Option<PathBuf>,
+    pub record_base: Option<PathBuf>,
     record_format: RecordFormat,
     record_count: usize,
     /// Chart rectangles (spectrogram, timeline) for mouse hit-testing.
@@ -433,11 +479,18 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(cli: &Cli, info: SourceInfo, analyzer: &Analyzer, control: Arc<Control>, color_mode: ColorMode) -> Self {
+    pub fn new(
+        cli: &Cli,
+        info: SourceInfo,
+        analyzer: &Analyzer,
+        control: Arc<Control>,
+        color_mode: ColorMode,
+    ) -> Self {
         let cfg = analyzer.config();
         let frame_dt = cfg.frame_dt();
         let mut cap = (cli.history / frame_dt).ceil() as usize;
-        if let (SourceKind::File, Some(total), false) = (info.kind, info.total_frames, cli.looping) {
+        if let (SourceKind::File, Some(total), false) = (info.kind, info.total_frames, cli.looping)
+        {
             // Keep whole files for browsing, up to an hour (~1.3 KB per frame).
             let hour = (3600.0 / frame_dt) as usize;
             cap = cap.max((total as usize / cfg.hop + 2).min(hour));
@@ -448,7 +501,11 @@ impl App {
         let panels = crate::cli::panel_set(&cli.panels, cli.piano);
         App {
             history: History::new(cap),
-            view: View { span_secs: cli.span, dt: frame_dt, ..View::default() },
+            view: View {
+                span_secs: cli.span,
+                dt: frame_dt,
+                ..View::default()
+            },
             analysis: AnalysisInfo {
                 sample_rate: cfg.sample_rate,
                 channels: cfg.channels,
@@ -481,11 +538,15 @@ impl App {
                     _ => MeterMode::Rms,
                 },
                 vu_ref: cli.vu_ref,
+                lufs_target: cli.lufs_target,
             },
             info,
             control,
             show_help: false,
-            cycle: cli.cycle_views.map(|s| (std::time::Duration::from_secs_f64(s), Instant::now())),
+            loudness_reset: false,
+            cycle: cli
+                .cycle_views
+                .map(|s| (std::time::Duration::from_secs_f64(s), Instant::now())),
             fps: FpsMeter::new(),
             source_done: false,
             ingest_done: false,
@@ -509,7 +570,8 @@ impl App {
     }
 
     pub fn nav(&mut self, n: Nav) {
-        self.view.apply(n, self.history.first(), self.history.last());
+        self.view
+            .apply(n, self.history.first(), self.history.last());
     }
 
     pub fn paused(&self) -> bool {
@@ -533,7 +595,12 @@ impl App {
             .unwrap_or(0);
         let path = record_path(self.record_base.as_deref(), self.record_count, secs);
         self.record_count += 1;
-        let r = Recorder::create(&path, self.info.channels, self.info.sample_rate, self.record_format)?;
+        let r = Recorder::create(
+            &path,
+            self.info.channels,
+            self.info.sample_rate,
+            self.record_format,
+        )?;
         self.flash(format!("recording to {}", path.display()));
         self.recorder = Some(r);
         Ok(())
@@ -543,14 +610,19 @@ impl App {
         if let Some(mut r) = self.recorder.take() {
             r.finish()?;
             self.saved_recordings.push(r.path.clone());
-            let secs = r.samples as f64 / (self.info.channels.max(1) as f64 * self.info.sample_rate as f64);
+            let secs = r.samples as f64
+                / (self.info.channels.max(1) as f64 * self.info.sample_rate as f64);
             self.flash(format!("saved {} ({secs:.1} s)", r.path.display()));
         }
         Ok(())
     }
 
     fn toggle_recording(&mut self) {
-        let res = if self.recorder.is_some() { self.stop_recording() } else { self.start_recording() };
+        let res = if self.recorder.is_some() {
+            self.stop_recording()
+        } else {
+            self.start_recording()
+        };
         if let Err(e) = res {
             self.flash(format!("record error: {e:#}"));
         }
@@ -569,12 +641,17 @@ impl App {
         match ev {
             Event::Key(k) if k.kind != KeyEventKind::Release => self.handle_key(k),
             Event::Mouse(m) => {
-                let hit = self
-                    .chart_rects
-                    .iter()
-                    .any(|r| m.column >= r.x && m.column < r.x + r.width && m.row >= r.y && m.row < r.y + r.height);
+                let hit = self.chart_rects.iter().any(|r| {
+                    m.column >= r.x
+                        && m.column < r.x + r.width
+                        && m.row >= r.y
+                        && m.row < r.y + r.height
+                });
                 match m.kind {
-                    MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Drag(MouseButton::Left) if hit => {
+                    MouseEventKind::Down(MouseButton::Left)
+                    | MouseEventKind::Drag(MouseButton::Left)
+                        if hit =>
+                    {
                         let x = self.chart_rects[0].x;
                         self.nav(Nav::Column(m.column.saturating_sub(x) as usize));
                         Action::Redraw
@@ -598,7 +675,9 @@ impl App {
     /// Step to the next meter mode once the `--cycle-views` interval has
     /// passed. Returns whether the mode changed.
     pub fn cycle_tick(&mut self, now: Instant) -> bool {
-        let Some((every, since)) = self.cycle else { return false };
+        let Some((every, since)) = self.cycle else {
+            return false;
+        };
         if now.duration_since(since) < every {
             return false;
         }
@@ -613,10 +692,14 @@ impl App {
     }
 
     pub fn handle_key(&mut self, k: KeyEvent) -> Action {
-        let fast = k.modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::CONTROL);
+        let fast = k
+            .modifiers
+            .intersects(KeyModifiers::SHIFT | KeyModifiers::CONTROL);
         let n = if fast { 10 } else { 1 };
         match k.code {
-            KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => return Action::Quit,
+            KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+                return Action::Quit
+            }
             KeyCode::Char('q') => return Action::Quit,
             KeyCode::Esc => {
                 if self.show_help {
@@ -641,14 +724,17 @@ impl App {
                 self.control.paused.store(p, Ordering::Relaxed);
                 self.flash(if p { "input paused" } else { "input resumed" });
             }
-            KeyCode::Char('r') => self.toggle_recording(),
+            KeyCode::Char('R') => self.toggle_recording(),
             KeyCode::Char('x') => {
                 self.session.reset();
                 self.flash("max level and clip count reset");
             }
-            KeyCode::Char('R') => {
+            KeyCode::Char('r') => {
+                // Integrated loudness and range live in the analyzer; the
+                // main loop resets them.
                 self.session.reset_loudness();
-                self.flash("max loudness reset");
+                self.loudness_reset = true;
+                self.flash("loudness measurement reset");
             }
             KeyCode::Char('1') => self.toggle_panel(Panel::Meter),
             KeyCode::Char('2') => self.toggle_panel(Panel::Eq),
@@ -661,7 +747,9 @@ impl App {
             }
             KeyCode::Char('s') => {
                 self.display.freq_scale = self.display.freq_scale.next();
-                self.flash(format!("frequency scale: {:?}", self.display.freq_scale).to_lowercase());
+                self.flash(
+                    format!("frequency scale: {:?}", self.display.freq_scale).to_lowercase(),
+                );
             }
             KeyCode::Char('v') => {
                 self.next_mode();
@@ -671,8 +759,12 @@ impl App {
                 }
             }
             KeyCode::Char('[') => self.display.db_min = (self.display.db_min - 6.0).max(-120.0),
-            KeyCode::Char(']') => self.display.db_min = (self.display.db_min + 6.0).min(self.display.db_max - 12.0),
-            KeyCode::Char('{') => self.display.db_max = (self.display.db_max - 6.0).max(self.display.db_min + 12.0),
+            KeyCode::Char(']') => {
+                self.display.db_min = (self.display.db_min + 6.0).min(self.display.db_max - 12.0)
+            }
+            KeyCode::Char('{') => {
+                self.display.db_max = (self.display.db_max - 6.0).max(self.display.db_min + 12.0)
+            }
             KeyCode::Char('}') => self.display.db_max = (self.display.db_max + 6.0).min(6.0),
             KeyCode::Char('?') | KeyCode::F(1) => self.show_help = !self.show_help,
             _ => return Action::None,
@@ -687,7 +779,12 @@ mod tests {
 
     /// One frame per column: 1 s frames, span equal to the width.
     fn view(width: usize) -> View {
-        View { width, dt: 1.0, span_secs: width as f64, ..View::default() }
+        View {
+            width,
+            dt: 1.0,
+            span_secs: width as f64,
+            ..View::default()
+        }
     }
 
     #[test]
@@ -823,7 +920,11 @@ mod tests {
 
     #[test]
     fn zoom_steps_through_round_spans() {
-        let mut v = View { width: 137, dt: 512.0 / 48000.0, ..View::default() };
+        let mut v = View {
+            width: 137,
+            dt: 512.0 / 48000.0,
+            ..View::default()
+        };
         assert_eq!(v.span_secs, 10.0);
         v.apply(Nav::ZoomOut, 0, Some(9999));
         assert_eq!(v.span_secs, 20.0);
@@ -851,13 +952,20 @@ mod tests {
     fn resizing_stretches_the_same_span() {
         let dt = 512.0 / 48000.0;
         for width in [37, 100, 141, 300] {
-            let mut v = View { width, dt, ..View::default() };
+            let mut v = View {
+                width,
+                dt,
+                ..View::default()
+            };
             v.sync(0, Some(5000));
             // The columns tile exactly 10 s of frames, oldest to newest.
             let (lo, _) = v.column_frames(0).unwrap();
             let (_, hi) = v.column_frames(width - 1).unwrap();
             let shown = (hi - lo + 1) as f64 * dt;
-            assert!((shown - 10.0).abs() <= 2.0 * dt * v.frames_per_col().max(1.0), "{width}: {shown}");
+            assert!(
+                (shown - 10.0).abs() <= 2.0 * dt * v.frames_per_col().max(1.0),
+                "{width}: {shown}"
+            );
             for c in 1..width {
                 let (a, b) = (v.column_frames(c - 1).unwrap(), v.column_frames(c).unwrap());
                 assert_eq!(a.1 + 1, b.0, "{width}: columns {c} contiguous");
@@ -874,7 +982,12 @@ mod tests {
     #[test]
     fn zoomed_in_past_one_frame_per_column() {
         // 0.5 s over 100 columns at 0.01 s frames: half a frame per column.
-        let mut v = View { width: 100, dt: 0.01, span_secs: 0.5, ..View::default() };
+        let mut v = View {
+            width: 100,
+            dt: 0.01,
+            span_secs: 0.5,
+            ..View::default()
+        };
         assert_eq!(v.frames_per_col(), 0.5);
         v.sync(0, Some(999));
         // Each frame fills two columns; the live edge shows the newest frame's first half.
@@ -916,14 +1029,26 @@ mod tests {
         let mut r = Readout::default();
         let all = |_| true;
         assert_eq!(r.pick(10, true, ms(0), all), 10);
-        assert_eq!(r.pick(12, true, ms(50), all), 10, "held within the interval");
+        assert_eq!(
+            r.pick(12, true, ms(50), all),
+            10,
+            "held within the interval"
+        );
         assert_eq!(r.pick(15, true, ms(99), all), 10);
         assert_eq!(r.pick(19, true, ms(100), all), 19, "refreshed after it");
-        assert_eq!(r.pick(20, true, ms(120), |i| i != 19), 20, "evicted frame is replaced");
+        assert_eq!(
+            r.pick(20, true, ms(120), |i| i != 19),
+            20,
+            "evicted frame is replaced"
+        );
         // Scrolling back shows the cursor's frame immediately.
         assert_eq!(r.pick(5, false, ms(130), all), 5);
         assert_eq!(r.pick(6, false, ms(131), all), 6);
-        assert_eq!(r.pick(30, true, ms(140), all), 30, "returning to live refreshes at once");
+        assert_eq!(
+            r.pick(30, true, ms(140), all),
+            30,
+            "returning to live refreshes at once"
+        );
     }
 
     #[test]
@@ -938,6 +1063,7 @@ mod tests {
                 time: 0.0,
                 channels: 2,
                 peak: p,
+                true_peak: p,
                 peak_decay: p,
                 rms: p,
                 rms_avg: p,
@@ -947,6 +1073,7 @@ mod tests {
                 lufs_m: peak - 3.0,
                 lufs_s: floor,
                 lufs_i: floor,
+                lufs_lra: f32::NAN,
                 peak_freq: None,
                 clipped,
                 spectrum: Box::new([]),
@@ -1011,7 +1138,10 @@ mod tests {
         let mut m = FpsMeter::new();
         let t = Instant::now();
         for i in 0..90 {
-            m.tick(t + Duration::from_millis(i * 1000 / 60), Duration::from_micros(800));
+            m.tick(
+                t + Duration::from_millis(i * 1000 / 60),
+                Duration::from_micros(800),
+            );
         }
         // 90 draws at 60 Hz: only the last second's worth count.
         assert_eq!(m.fps, 60);
@@ -1019,5 +1149,4 @@ mod tests {
         m.tick(t + Duration::from_secs(10), Duration::ZERO);
         assert_eq!(m.fps, 1);
     }
-
 }

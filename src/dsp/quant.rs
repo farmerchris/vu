@@ -27,7 +27,10 @@ mod tests {
     fn roundtrip_within_half_step() {
         let mut db = -119.0f32;
         while db < 7.0 {
-            assert!((q_to_db(db_to_q(db)) - db).abs() <= Q_STEP_DB / 2.0 + 1e-4, "{db}");
+            assert!(
+                (q_to_db(db_to_q(db)) - db).abs() <= Q_STEP_DB / 2.0 + 1e-4,
+                "{db}"
+            );
             db += 0.37;
         }
     }

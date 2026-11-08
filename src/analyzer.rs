@@ -5,6 +5,7 @@ use crate::dsp::level::{amp_to_db, peak_decay, power_to_db, FLOOR_DB};
 use crate::dsp::loudness::LoudnessMeter;
 use crate::dsp::quant::db_to_q;
 use crate::dsp::spectrum::{peak_frequency, prominence_db, Spectrum};
+use crate::dsp::truepeak::TruePeak;
 use crate::dsp::weighting::{power_gain_table, Weighting};
 use crate::dsp::window::WindowKind;
 
@@ -87,6 +88,8 @@ pub struct Frame {
     pub channels: u8,
     /// Sample peak over the hop, dBFS.
     pub peak: [f32; MAX_CHANNELS],
+    /// True peak over the hop (BS.1770-4, 4× oversampled), dBTP.
+    pub true_peak: [f32; MAX_CHANNELS],
     /// Peak with meter fall-back applied, dBFS.
     pub peak_decay: [f32; MAX_CHANNELS],
     /// RMS over the hop, dBFS.
@@ -103,6 +106,8 @@ pub struct Frame {
     pub lufs_m: f32,
     pub lufs_s: f32,
     pub lufs_i: f32,
+    /// Loudness range so far (EBU Tech 3342), LU; NaN before 3 s of signal.
+    pub lufs_lra: f32,
     pub peak_freq: Option<(f32, f32)>,
     pub clipped: bool,
     /// Quantized power spectrum (see [`crate::dsp::quant`]).
@@ -119,11 +124,17 @@ impl Frame {
     }
 
     pub fn max_peak(&self) -> f32 {
-        self.peak[..self.n()].iter().copied().fold(FLOOR_DB, f32::max)
+        self.peak[..self.n()]
+            .iter()
+            .copied()
+            .fold(FLOOR_DB, f32::max)
     }
 
     pub fn max_rms(&self) -> f32 {
-        self.rms[..self.n()].iter().copied().fold(FLOOR_DB, f32::max)
+        self.rms[..self.n()]
+            .iter()
+            .copied()
+            .fold(FLOOR_DB, f32::max)
     }
 }
 
@@ -132,6 +143,8 @@ impl Frame {
 pub struct Stats {
     pub frames: u64,
     pub peak: Vec<f32>,
+    /// True peak (linear) of each metered channel.
+    pub true_peak: Vec<f32>,
     pub sumsq: Vec<f64>,
     pub clipped: Vec<u64>,
     pub spectrum_sum: Vec<f64>,
@@ -143,6 +156,7 @@ impl Stats {
         Stats {
             frames: 0,
             peak: vec![0.0; channels],
+            true_peak: vec![0.0; channels],
             sumsq: vec![0.0; channels],
             clipped: vec![0; channels],
             spectrum_sum: vec![0.0; bins],
@@ -175,6 +189,8 @@ pub struct Analyzer {
     band_db: Vec<f32>,
     hop_count: usize,
     hop_peak: [f32; MAX_CHANNELS],
+    hop_tp: [f32; MAX_CHANNELS],
+    true_peak: Vec<TruePeak>,
     hop_sumsq: [f64; MAX_CHANNELS],
     hop_clip: bool,
     /// Per-hop mean squares of the last `rms_win.len()` hops (a ring).
@@ -240,7 +256,9 @@ impl PowerQuant {
             }
             *t = lo;
         }
-        let coarse = (0..=top >> Self::SHIFT).map(|i| Self::reference(i << Self::SHIFT)).collect();
+        let coarse = (0..=top >> Self::SHIFT)
+            .map(|i| Self::reference(i << Self::SHIFT))
+            .collect();
         PowerQuant { thresholds, coarse }
     }
 
@@ -277,9 +295,14 @@ impl Analyzer {
             band_db: vec![0.0; bands.len()],
             hop_count: 0,
             hop_peak: [0.0; MAX_CHANNELS],
+            hop_tp: [0.0; MAX_CHANNELS],
+            true_peak: vec![TruePeak::new(); cfg.channels.clamp(1, MAX_CHANNELS)],
             hop_sumsq: [0.0; MAX_CHANNELS],
             hop_clip: false,
-            rms_win: vec![[0.0; MAX_CHANNELS]; ((cfg.rms_tau as f64 / cfg.frame_dt()).round() as usize).max(1)],
+            rms_win: vec![
+                [0.0; MAX_CHANNELS];
+                ((cfg.rms_tau as f64 / cfg.frame_dt()).round() as usize).max(1)
+            ],
             rms_pos: 0,
             peak_hold: [FLOOR_DB; MAX_CHANNELS],
             hold: [FLOOR_DB; MAX_CHANNELS],
@@ -289,7 +312,10 @@ impl Analyzer {
             band_cap_age: vec![0.0; bands.len()],
             band_coef: {
                 let steps = cfg.frame_dt() as f32 * 30.0;
-                (1.0 - (1.0 - BAND_ATTACK).powf(steps), 1.0 - (1.0 - BAND_RELEASE).powf(steps))
+                (
+                    1.0 - (1.0 - BAND_ATTACK).powf(steps),
+                    1.0 - (1.0 - BAND_RELEASE).powf(steps),
+                )
             },
             tone: None,
             needle: [0.0; MAX_CHANNELS],
@@ -300,7 +326,11 @@ impl Analyzer {
             vu_coef: {
                 let (zeta, omega) = vu_spring();
                 let dt = 1.0 / cfg.sample_rate as f64;
-                ((omega * omega * dt) as f32, (2.0 * zeta * omega * dt) as f32, dt as f32)
+                (
+                    (omega * omega * dt) as f32,
+                    (2.0 * zeta * omega * dt) as f32,
+                    dt as f32,
+                )
             },
             loudness: LoudnessMeter::new(cfg.sample_rate, cfg.channels),
             samples: 0,
@@ -343,6 +373,7 @@ impl Analyzer {
                     if a > self.hop_peak[c] {
                         self.hop_peak[c] = a;
                     }
+                    self.hop_tp[c] = self.hop_tp[c].max(self.true_peak[c].push(s));
                     self.hop_sumsq[c] += (s as f64) * (s as f64);
                     let (k, d, dt) = self.vu_coef;
                     self.needle_v[c] += k * (a * VU_CAL - self.needle[c]) - d * self.needle_v[c];
@@ -391,7 +422,8 @@ impl Analyzer {
         }
         self.stats.spectra += 1;
         let spectrum: Box<[u8]> = self.power.iter().map(|&p| self.quant.quantize(p)).collect();
-        self.bands.compute(&self.power, self.spectrum.enbw(), &mut self.band_db);
+        self.bands
+            .compute(&self.power, self.spectrum.enbw(), &mut self.band_db);
         let dt = self.cfg.frame_dt() as f32;
         // Raw bands are jittery: each band rises fast and falls slowly, from
         // the display floor so silence does not leave it climbing up through
@@ -401,7 +433,11 @@ impl Analyzer {
             let target = raw.max(self.cfg.band_floor_db);
             let s = &mut self.band_smooth[i];
             let gap = target - *s;
-            *s = if gap.abs() < BAND_SNAP_DB { target } else { *s + gap * if gap > 0.0 { attack } else { release } };
+            *s = if gap.abs() < BAND_SNAP_DB {
+                target
+            } else {
+                *s + gap * if gap > 0.0 { attack } else { release }
+            };
             let (cap, age) = (&mut self.band_cap[i], &mut self.band_cap_age[i]);
             hold_then_fall(cap, age, *s, BAND_CAP_HOLD_S, BAND_CAP_FALL_DB_S, dt);
         }
@@ -411,15 +447,28 @@ impl Analyzer {
         // surroundings; in a quiet room the loudest bin is just hiss.
         let bin_hz = self.cfg.bin_hz();
         let prominent = |hz: f32, power: &[f32]| {
-            prominence_db(power, (hz / bin_hz).round() as usize, PEAK_SKIP_BINS, PEAK_REACH_BINS) >= PEAK_PROMINENCE_DB
+            prominence_db(
+                power,
+                (hz / bin_hz).round() as usize,
+                PEAK_SKIP_BINS,
+                PEAK_REACH_BINS,
+            ) >= PEAK_PROMINENCE_DB
         };
         let (lo, hi) = self.peak_bins;
-        let mut peak_freq = peak_frequency(&self.power, bin_hz, lo, hi).filter(|&(hz, _)| prominent(hz, &self.power));
+        let mut peak_freq = peak_frequency(&self.power, bin_hz, lo, hi)
+            .filter(|&(hz, _)| prominent(hz, &self.power));
         // Stay on the previous tone while it is still nearly as strong.
         if let (Some((_, db)), Some(prev)) = (peak_freq, self.tone) {
             let b = (prev / bin_hz).round() as usize;
-            let near = peak_frequency(&self.power, bin_hz, b.saturating_sub(PEAK_SKIP_BINS).max(lo), (b + PEAK_SKIP_BINS).min(hi));
-            if let Some(n) = near.filter(|&(hz, ndb)| ndb >= db - TONE_STICK_DB && prominent(hz, &self.power)) {
+            let near = peak_frequency(
+                &self.power,
+                bin_hz,
+                b.saturating_sub(PEAK_SKIP_BINS).max(lo),
+                (b + PEAK_SKIP_BINS).min(hi),
+            );
+            if let Some(n) =
+                near.filter(|&(hz, ndb)| ndb >= db - TONE_STICK_DB && prominent(hz, &self.power))
+            {
                 peak_freq = Some(n);
             }
         }
@@ -427,6 +476,7 @@ impl Analyzer {
 
         let metered = self.cfg.channels.clamp(1, MAX_CHANNELS);
         let mut peak = [FLOOR_DB; MAX_CHANNELS];
+        let mut true_peak = [FLOOR_DB; MAX_CHANNELS];
         let mut rms = [FLOOR_DB; MAX_CHANNELS];
         let mut rms_avg = [FLOOR_DB; MAX_CHANNELS];
         let mut vu = [FLOOR_DB; MAX_CHANNELS];
@@ -440,16 +490,36 @@ impl Analyzer {
             let sum: f32 = self.rms_win.iter().map(|w| w[c]).sum();
             rms_avg[c] = power_to_db(sum / self.rms_win.len() as f32);
             peak[c] = amp_to_db(self.hop_peak[c]);
-            self.peak_hold[c] = peak_decay(self.peak_hold[c], peak[c], self.cfg.peak_decay_db_s, dt);
-            hold_then_fall(&mut self.hold[c], &mut self.hold_age[c], peak[c], self.cfg.peak_hold_s, HOLD_FALL_DB_S, dt);
+            // Never below the sample peak, whatever the interpolator's ripple.
+            let tp = self.hop_tp[c].max(self.hop_peak[c]);
+            true_peak[c] = amp_to_db(tp);
+            self.stats.true_peak[c] = self.stats.true_peak[c].max(tp);
+            self.peak_hold[c] =
+                peak_decay(self.peak_hold[c], peak[c], self.cfg.peak_decay_db_s, dt);
+            hold_then_fall(
+                &mut self.hold[c],
+                &mut self.hold_age[c],
+                peak[c],
+                self.cfg.peak_hold_s,
+                HOLD_FALL_DB_S,
+                dt,
+            );
             self.hold[c] = self.hold[c].max(self.peak_hold[c]);
             vu[c] = amp_to_db(self.hop_needle[c]);
-            hold_then_fall(&mut self.vu_hold[c], &mut self.vu_hold_age[c], vu[c], self.cfg.peak_hold_s, HOLD_FALL_DB_S, dt);
+            hold_then_fall(
+                &mut self.vu_hold[c],
+                &mut self.vu_hold_age[c],
+                vu[c],
+                self.cfg.peak_hold_s,
+                HOLD_FALL_DB_S,
+                dt,
+            );
         }
         let frame = Frame {
             time: self.samples as f64 / self.cfg.sample_rate as f64,
             channels: metered as u8,
             peak,
+            true_peak,
             peak_decay: self.peak_hold,
             rms,
             rms_avg,
@@ -459,6 +529,7 @@ impl Analyzer {
             lufs_m: self.loudness.momentary(),
             lufs_s: self.loudness.short_term(),
             lufs_i: self.loudness.integrated(),
+            lufs_lra: self.loudness.loudness_range(),
             peak_freq,
             clipped: self.hop_clip,
             spectrum,
@@ -467,6 +538,7 @@ impl Analyzer {
         };
         self.hop_count = 0;
         self.hop_peak = [0.0; MAX_CHANNELS];
+        self.hop_tp = [0.0; MAX_CHANNELS];
         self.hop_sumsq = [0.0; MAX_CHANNELS];
         self.hop_needle = [f32::NEG_INFINITY; MAX_CHANNELS];
         self.hop_clip = false;
@@ -632,7 +704,11 @@ pub mod tests {
         assert!((top - amp_to_db(0.5)).abs() < 0.1);
         // Still held at 1.5 s, then falling at 20 dB/s.
         assert_eq!(at(1.5).hold[0], top);
-        assert!((at(2.0).hold[0] - (top - 8.0)).abs() < 0.5, "{}", at(2.0).hold[0]);
+        assert!(
+            (at(2.0).hold[0] - (top - 8.0)).abs() < 0.5,
+            "{}",
+            at(2.0).hold[0]
+        );
         // The decaying peak envelope falls at its own rate.
         assert!((at(1.1).peak_decay[0] - (top - 20.0)).abs() < 0.5);
     }
@@ -646,22 +722,35 @@ pub mod tests {
         let level = amp_to_db(0.5);
         assert!((at(0.9) - level).abs() < 0.02, "{}", at(0.9));
         // 99% (-0.09 dB) after 300 ms, not before 270 ms.
-        assert!(at(0.27) < level - 0.09 && at(0.31) > level - 0.09, "{} {}", at(0.27), at(0.31));
+        assert!(
+            at(0.27) < level - 0.09 && at(0.31) > level - 0.09,
+            "{} {}",
+            at(0.27),
+            at(0.31)
+        );
         // About 1% overshoot (+0.09 dB), never much more.
-        let top = frames[..90].iter().map(|f| f.vu[0]).fold(FLOOR_DB, f32::max);
+        let top = frames[..90]
+            .iter()
+            .map(|f| f.vu[0])
+            .fold(FLOOR_DB, f32::max);
         assert!(top > level + 0.05 && top < level + 0.15, "{top} vs {level}");
         // The hold keeps the overshoot for 1.5 s; the needle falls the same way.
         assert!((frames[100].vu_hold[0] - top).abs() < 1e-6);
         assert!(at(1.3) < level - 20.0, "{}", at(1.3));
         let (zeta, omega) = vu_spring();
-        assert!((zeta - 0.826).abs() < 0.001 && omega > 10.0 && omega < 30.0, "{zeta} {omega}");
+        assert!(
+            (zeta - 0.826).abs() < 0.001 && omega > 10.0 && omega < 30.0,
+            "{zeta} {omega}"
+        );
     }
 
     #[test]
     fn bands_rise_fast_and_fall_slowly() {
         let (_, frames) = run(config(2), &burst(1000.0, 9600, 48000 * 2));
         let dt = 512.0 / 48000.0;
-        let band = (0..frames[0].bands.len()).max_by_key(|&i| frames[18].bands[i]).unwrap();
+        let band = (0..frames[0].bands.len())
+            .max_by_key(|&i| frames[18].bands[i])
+            .unwrap();
         let level = |s: f64| q_to_db(frames[(s / dt) as usize].bands[band]);
         let cap = |s: f64| q_to_db(frames[(s / dt) as usize].band_caps[band]);
         let full = level(0.19);
@@ -671,7 +760,11 @@ pub mod tests {
         assert!(level(0.2) > full - 3.0, "{}", level(0.2));
         // Falling: 0.1 s after the tone (and its FFT window) has gone the band
         // has dropped only part of the way, and its cap still holds the top.
-        assert!(level(0.34) > -55.0 && level(0.34) < full - 6.0, "{}", level(0.34));
+        assert!(
+            level(0.34) > -55.0 && level(0.34) < full - 6.0,
+            "{}",
+            level(0.34)
+        );
         assert!(cap(0.34) >= full - 0.5);
         // The cap falls once its 1 s hold is over; the band settles exactly
         // at the floor rather than hovering above it.
@@ -683,14 +776,18 @@ pub mod tests {
     fn dominant_frequency_sticks_to_a_near_equal_tone() {
         // Two tones 1 dB apart: the weaker, heard first, keeps the readout.
         let n = 48000;
-        let tone = |f: f32, a: f32, i: usize| a * (2.0 * std::f32::consts::PI * f * i as f32 / 48000.0).sin();
+        let tone = |f: f32, a: f32, i: usize| {
+            a * (2.0 * std::f32::consts::PI * f * i as f32 / 48000.0).sin()
+        };
         let mut data: Vec<f32> = (0..n / 2).map(|i| tone(440.0, 0.3, i)).collect();
         data.extend((n / 2..n).map(|i| tone(440.0, 0.3, i) + tone(660.0, 0.3 * 1.12, i)));
         let (_, frames) = run(config(1), &data);
         let (hz, _) = frames.last().unwrap().peak_freq.unwrap();
         assert!((hz - 440.0).abs() < 3.0, "{hz}");
         // Without the earlier tone the stronger one wins.
-        let fresh: Vec<f32> = (n / 2..n).map(|i| tone(440.0, 0.3, i) + tone(660.0, 0.3 * 1.12, i)).collect();
+        let fresh: Vec<f32> = (n / 2..n)
+            .map(|i| tone(440.0, 0.3, i) + tone(660.0, 0.3 * 1.12, i))
+            .collect();
         let (_, frames) = run(config(1), &fresh);
         let (hz, _) = frames.last().unwrap().peak_freq.unwrap();
         assert!((hz - 660.0).abs() < 3.0, "{hz}");
@@ -726,7 +823,11 @@ pub mod tests {
         let last = frames.last().unwrap();
         assert_eq!(last.peak[0], FLOOR_DB);
         // After ~1 s of silence at 20 dB/s the decaying peak is ~20 dB down.
-        assert!(last.peak_decay[0] < -18.0 && last.peak_decay[0] > -22.0, "{}", last.peak_decay[0]);
+        assert!(
+            last.peak_decay[0] < -18.0 && last.peak_decay[0] > -22.0,
+            "{}",
+            last.peak_decay[0]
+        );
     }
 
     #[test]
@@ -763,12 +864,16 @@ pub mod tests {
     #[test]
     fn many_channels_mix_and_meter_limit() {
         let ch = 10;
-        let data: Vec<f32> = (0..4096 * ch).map(|i| if i % ch == 9 { 0.5 } else { 0.0 }).collect();
+        let data: Vec<f32> = (0..4096 * ch)
+            .map(|i| if i % ch == 9 { 0.5 } else { 0.0 })
+            .collect();
         let (a, frames) = run(config(ch), &data);
         assert_eq!(frames[0].channels as usize, MAX_CHANNELS);
         assert!((a.stats.peak[9] - 0.5).abs() < 1e-6);
         // Clipping is counted on unmetered channels too.
-        let data: Vec<f32> = (0..4096 * ch).map(|i| if i % ch == 9 { 1.0 } else { 0.0 }).collect();
+        let data: Vec<f32> = (0..4096 * ch)
+            .map(|i| if i % ch == 9 { 1.0 } else { 0.0 })
+            .collect();
         let (a, _) = run(config(ch), &data);
         assert_eq!(a.stats.clipped[9], 4096);
     }
@@ -776,10 +881,19 @@ pub mod tests {
     #[test]
     fn power_quant_matches_direct() {
         let pq = PowerQuant::new();
-        let check = |b: u32| assert_eq!(pq.quantize(f32::from_bits(b)), PowerQuant::reference(b), "bits {b:#x}");
+        let check = |b: u32| {
+            assert_eq!(
+                pq.quantize(f32::from_bits(b)),
+                PowerQuant::reference(b),
+                "bits {b:#x}"
+            )
+        };
         for i in 0..pq.coarse.len() as u32 - 1 {
             let (a, b) = (i << PowerQuant::SHIFT, ((i + 1) << PowerQuant::SHIFT) - 1);
-            assert!(PowerQuant::reference(b) - PowerQuant::reference(a) <= 1, "cell {i}");
+            assert!(
+                PowerQuant::reference(b) - PowerQuant::reference(a) <= 1,
+                "cell {i}"
+            );
         }
         for b in (0..=f32::INFINITY.to_bits()).step_by(4099) {
             check(b);
@@ -789,7 +903,17 @@ pub mod tests {
                 check(b);
             }
         }
-        for p in [0.0f32, -0.0, -1.0, f32::NAN, f32::INFINITY, f32::MIN_POSITIVE, 1e-12, 1.0, 1e3] {
+        for p in [
+            0.0f32,
+            -0.0,
+            -1.0,
+            f32::NAN,
+            f32::INFINITY,
+            f32::MIN_POSITIVE,
+            1e-12,
+            1.0,
+            1e3,
+        ] {
             assert_eq!(pq.quantize(p), db_to_q(power_to_db(p)), "{p}");
         }
     }
@@ -800,7 +924,11 @@ pub mod tests {
     fn power_quant_exhaustive() {
         let pq = PowerQuant::new();
         for b in 0..=f32::INFINITY.to_bits() {
-            assert_eq!(pq.quantize(f32::from_bits(b)), PowerQuant::reference(b), "bits {b:#x}");
+            assert_eq!(
+                pq.quantize(f32::from_bits(b)),
+                PowerQuant::reference(b),
+                "bits {b:#x}"
+            );
         }
     }
 

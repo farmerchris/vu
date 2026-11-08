@@ -25,6 +25,33 @@ pub enum Panel {
     All,
 }
 
+/// Named loudness targets for `--lufs-target`, in LUFS.
+pub const LUFS_TARGETS: [(&str, f32); 9] = [
+    ("streaming", -14.0),
+    ("spotify", -14.0),
+    ("youtube", -14.0),
+    ("apple", -16.0),
+    ("podcast", -16.0),
+    ("broadcast", -23.0), // EBU R128
+    ("ebu", -23.0),
+    ("atsc", -24.0),    // ATSC A/85
+    ("netflix", -27.0), // dialogue-gated
+];
+
+/// A `--lufs-target`: a number of LUFS or one of the `LUFS_TARGETS` names.
+fn parse_lufs_target(s: &str) -> std::result::Result<f32, String> {
+    if let Some(&(_, v)) = LUFS_TARGETS
+        .iter()
+        .find(|(n, _)| n.eq_ignore_ascii_case(s.trim()))
+    {
+        return Ok(v);
+    }
+    let names: Vec<&str> = LUFS_TARGETS.iter().map(|t| t.0).collect();
+    s.trim()
+        .parse()
+        .map_err(|_| format!("expected a LUFS value or one of: {}", names.join(", ")))
+}
+
 /// Panels shown by default.
 pub const ALL_PANELS: [Panel; 4] = [Panel::Meter, Panel::Eq, Panel::Spectrogram, Panel::Timeline];
 /// Number of real panels (everything but `All`).
@@ -49,7 +76,7 @@ pub fn panel_set(list: &[Panel], piano: bool) -> [bool; PANEL_COUNT] {
     version,
     about = "Terminal sound meter: levels, loudness, timeline, spectrogram and graphic equalizer",
     after_help = "KEYS: \u{2190}/\u{2192} scroll (shift = x10), PgUp/PgDn page, Home/End oldest/live, \
-space hold, p pause, r record, +/- zoom, 1-5 toggle panels, c colormap, s freq scale, v meter mode, \
+space hold, p pause, R record, r reset loudness, +/- zoom, 1-5 toggle panels, c colormap, s freq scale, v meter mode, \
 [ ] floor, ? help, q quit\n\n\
 EXAMPLES:\n  vu                              meter the default input\n  \
 vu -f song.wav                  play a file through the meters in real time\n  \
@@ -176,6 +203,13 @@ pub struct Cli {
     #[arg(long, conflicts_with = "lufs")]
     pub vu: bool,
 
+    /// Loudness that reads 0 LU in LUFS mode: a LUFS value or a preset name.
+    ///
+    /// Presets: streaming, spotify, youtube (-14); apple, podcast (-16);
+    /// broadcast, ebu (-23, EBU R128); atsc (-24, ATSC A/85); netflix (-27).
+    #[arg(long, default_value = "streaming", allow_hyphen_values = true, value_name = "LUFS|NAME", value_parser = parse_lufs_target)]
+    pub lufs_target: f32,
+
     /// Also show the piano keyboard panel (same as adding `piano` to -p)
     #[arg(long)]
     pub piano: bool,
@@ -242,8 +276,14 @@ impl Cli {
         if self.meter_floor >= 0.0 {
             bail!("--meter-floor must be negative");
         }
-        if self.cycle_views.is_some_and(|s| !(0.5..=3600.0).contains(&s)) {
+        if self
+            .cycle_views
+            .is_some_and(|s| !(0.5..=3600.0).contains(&s))
+        {
             bail!("--cycle-views must be between 0.5 and 3600 seconds");
+        }
+        if !(-40.0..=0.0).contains(&self.lufs_target) {
+            bail!("--lufs-target must be between -40 and 0 LUFS");
         }
         if !(-40.0..=0.0).contains(&self.vu_ref) {
             bail!("--vu-ref must be between -40 and 0 dBFS");
@@ -298,11 +338,51 @@ mod tests {
     }
 
     #[test]
+    fn lufs_target_names_and_numbers() {
+        assert_eq!(parse(&[]).lufs_target, -14.0);
+        for (args, want) in [
+            ("netflix", -27.0),
+            ("EBU", -23.0),
+            ("broadcast", -23.0),
+            ("atsc", -24.0),
+            ("-18.5", -18.5),
+        ] {
+            assert_eq!(parse(&["--lufs-target", args]).lufs_target, want, "{args}");
+        }
+        for (name, v) in LUFS_TARGETS {
+            assert_eq!(parse_lufs_target(name), Ok(v));
+        }
+        let err = Cli::try_parse_from(["vu", "--lufs-target", "loud"])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("streaming") && err.contains("netflix"),
+            "{err}"
+        );
+    }
+
+    #[test]
     fn panel_list_and_options() {
-        let c = parse(&["-p", "spectrogram,eq", "--db-min", "-120", "--fft-size", "8192", "--hop", "256"]);
+        let c = parse(&[
+            "-p",
+            "spectrogram,eq",
+            "--db-min",
+            "-120",
+            "--fft-size",
+            "8192",
+            "--hop",
+            "256",
+        ]);
         assert_eq!(c.panels, vec![Panel::Spectrogram, Panel::Eq]);
-        assert_eq!(panel_set(&c.panels, false), [false, true, true, false, false]);
-        assert_eq!(panel_set(&ALL_PANELS, false), [true, true, true, true, false], "no piano by default");
+        assert_eq!(
+            panel_set(&c.panels, false),
+            [false, true, true, false, false]
+        );
+        assert_eq!(
+            panel_set(&ALL_PANELS, false),
+            [true, true, true, true, false],
+            "no piano by default"
+        );
         assert_eq!(panel_set(&ALL_PANELS, true), [true; PANEL_COUNT]);
         assert_eq!(panel_set(&[Panel::All], false), [true; PANEL_COUNT]);
         assert_eq!(c.db_min, -120.0);

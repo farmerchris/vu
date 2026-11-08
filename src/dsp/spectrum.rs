@@ -103,7 +103,11 @@ pub fn peak_frequency(power: &[f32], bin_hz: f32, lo: usize, hi: usize) -> Optio
     }
     let (a, c) = (db(k - 1), db(k + 1));
     let denom = a - 2.0 * b + c;
-    let p = if denom.abs() > 1e-9 { (0.5 * (a - c) / denom).clamp(-0.5, 0.5) } else { 0.0 };
+    let p = if denom.abs() > 1e-9 {
+        (0.5 * (a - c) / denom).clamp(-0.5, 0.5)
+    } else {
+        0.0
+    };
     Some(((k as f32 + p) * bin_hz, b - 0.25 * (a - c) * p))
 }
 
@@ -180,7 +184,10 @@ mod tests {
         s.power(&vec![0.5; 1024], &mut p);
         // A DC offset reads its own power.
         assert!((p[0] - 0.25).abs() < 1e-6, "{}", p[0]);
-        let (k, _) = p.iter().enumerate().fold((0, 0.0), |m, (i, &v)| if v > m.1 { (i, v) } else { m });
+        let (k, _) = p
+            .iter()
+            .enumerate()
+            .fold((0, 0.0), |m, (i, &v)| if v > m.1 { (i, v) } else { m });
         assert_eq!(k, 0);
     }
 
@@ -217,8 +224,16 @@ mod tests {
         let bin_hz = sr / n as f32;
         let (f, _) = peak_frequency(&p, bin_hz, 1, s.bins() - 1).unwrap();
         let k = (f / bin_hz).round() as usize;
-        assert!(prominence_db(&p, k, 4, 24) < 15.0, "noise {}", prominence_db(&p, k, 4, 24));
-        let tone: Vec<f32> = noise.iter().zip(sine(1000.0, 0.1, sr, n)).map(|(a, b)| 0.1 * a + b).collect();
+        assert!(
+            prominence_db(&p, k, 4, 24) < 15.0,
+            "noise {}",
+            prominence_db(&p, k, 4, 24)
+        );
+        let tone: Vec<f32> = noise
+            .iter()
+            .zip(sine(1000.0, 0.1, sr, n))
+            .map(|(a, b)| 0.1 * a + b)
+            .collect();
         s.power(&tone, &mut p);
         let (f, _) = peak_frequency(&p, bin_hz, 1, s.bins() - 1).unwrap();
         let k = (f / bin_hz).round() as usize;

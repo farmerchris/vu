@@ -16,7 +16,9 @@ const LOWEST: i32 = 21;
 const HIGHEST: i32 = 108;
 /// Shown when there is no tone, so the window sits in the middle.
 const MIDDLE_C: i32 = 60;
-const NAMES: [&str; 12] = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
+const NAMES: [&str; 12] = [
+    "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B",
+];
 const LIT: Color = Color::Cyan;
 
 pub fn is_black(midi: i32) -> bool {
@@ -40,7 +42,11 @@ pub fn key_of(hz: f32) -> Option<i32> {
 
 /// Note name with octave, e.g. "C4", "F#2".
 pub fn key_name(midi: i32) -> String {
-    format!("{}{}", NAMES[midi.rem_euclid(12) as usize], midi.div_euclid(12) - 1)
+    format!(
+        "{}{}",
+        NAMES[midi.rem_euclid(12) as usize],
+        midi.div_euclid(12) - 1
+    )
 }
 
 /// Columns per white key and the first visible white key, for `width`
@@ -56,8 +62,17 @@ pub fn window(width: u16, focus: i32) -> (u16, i32, i32) {
 
 pub fn render(app: &mut App, area: Rect, buf: &mut Buffer) {
     let history = &app.history;
-    let shown = app.readout.pick(app.view.cursor, app.view.follow, std::time::Instant::now(), |i| history.get(i).is_some());
-    let tone = app.history.get(shown).and_then(|f| f.peak_freq).filter(|&(_, db)| db > -100.0);
+    let shown = app.readout.pick(
+        app.view.cursor,
+        app.view.follow,
+        std::time::Instant::now(),
+        |i| history.get(i).is_some(),
+    );
+    let tone = app
+        .history
+        .get(shown)
+        .and_then(|f| f.peak_freq)
+        .filter(|&(_, db)| db > -100.0);
     let lit = tone.and_then(|(hz, _)| key_of(hz));
     let heading = match (tone, lit) {
         (Some((hz, _)), Some(k)) => format!(" Piano  {} · {hz:.1} Hz ", key_name(k)),
@@ -86,7 +101,9 @@ pub fn render(app: &mut App, area: Rect, buf: &mut Buffer) {
         for r in 0..key_rows {
             for dx in 0..kw {
                 let cell = &mut buf[(col(wi) + dx, inner.y + r)];
-                cell.set_char(if dx == kw - 1 { '▕' } else { ' ' }).set_fg(Color::Indexed(245)).set_bg(bg);
+                cell.set_char(if dx == kw - 1 { '▕' } else { ' ' })
+                    .set_fg(Color::Indexed(245))
+                    .set_bg(bg);
             }
         }
     }
@@ -94,7 +111,11 @@ pub fn render(app: &mut App, area: Rect, buf: &mut Buffer) {
     // neighbours (only the left one's last column when keys are narrow).
     for m in (LOWEST..=HIGHEST).filter(|&m| is_black(m)) {
         let left = white_index(m);
-        let bg = if lit == Some(m) { LIT } else { Color::Indexed(16) };
+        let bg = if lit == Some(m) {
+            LIT
+        } else {
+            Color::Indexed(16)
+        };
         let cols: &[u16] = if kw == 3 { &[2, 3] } else { &[1] };
         for &dx in cols {
             let wi = left + (dx / kw) as i32;
@@ -102,7 +123,9 @@ pub fn render(app: &mut App, area: Rect, buf: &mut Buffer) {
                 continue;
             }
             for r in 0..key_rows - 1 {
-                buf[(col(wi) + dx % kw, inner.y + r)].set_char(' ').set_bg(bg);
+                buf[(col(wi) + dx % kw, inner.y + r)]
+                    .set_char(' ')
+                    .set_bg(bg);
             }
         }
     }
@@ -126,7 +149,11 @@ pub fn render(app: &mut App, area: Rect, buf: &mut Buffer) {
         buf.set_string(x, y, name, style);
     };
     if let Some(k) = lit {
-        label(buf, k, Style::default().fg(LIT).add_modifier(Modifier::BOLD));
+        label(
+            buf,
+            k,
+            Style::default().fg(LIT).add_modifier(Modifier::BOLD),
+        );
     }
     for m in (LOWEST..=HIGHEST).filter(|m| m.rem_euclid(12) == 0) {
         label(buf, m, Style::default().fg(Color::DarkGray));
@@ -148,8 +175,14 @@ mod tests {
         assert_eq!(key_of(452.0), Some(69), "within half a semitone");
         assert_eq!(key_of(27.5), Some(21));
         assert_eq!(key_of(4186.0), Some(108));
-        assert_eq!((key_of(20.0), key_of(5000.0), key_of(0.0), key_of(f32::NAN)), (None, None, None, None));
-        assert_eq!((key_name(60), key_name(66), key_name(21)), ("C4".into(), "F#4".into(), "A0".into()));
+        assert_eq!(
+            (key_of(20.0), key_of(5000.0), key_of(0.0), key_of(f32::NAN)),
+            (None, None, None, None)
+        );
+        assert_eq!(
+            (key_name(60), key_name(66), key_name(21)),
+            ("C4".into(), "F#4".into(), "A0".into())
+        );
     }
 
     #[test]

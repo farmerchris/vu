@@ -21,7 +21,12 @@ pub fn truncate_len(chunk_len: usize, channels: usize, done: u64, limit: Option<
     }
 }
 
-pub fn run(source: Source, analyzer: &mut Analyzer, duration: Option<f64>, mut recorder: Option<Recorder>) -> Result<()> {
+pub fn run(
+    source: Source,
+    analyzer: &mut Analyzer,
+    duration: Option<f64>,
+    mut recorder: Option<Recorder>,
+) -> Result<()> {
     if source.info.kind != SourceKind::File && duration.is_none() {
         bail!("--report with a live input or generator needs --duration");
     }
@@ -46,28 +51,87 @@ pub fn run(source: Source, analyzer: &mut Analyzer, duration: Option<f64>, mut r
         r.finish()?;
         eprintln!("recorded {}", r.path.display());
     }
-    print!("{}", format_report(&source.info.name, source.info.sample_rate, ch, analyzer, frames));
+    print!(
+        "{}",
+        format_report(
+            &source.info.name,
+            source.info.sample_rate,
+            ch,
+            analyzer,
+            frames
+        )
+    );
     Ok(())
 }
 
-pub fn format_report(name: &str, sample_rate: u32, ch: usize, a: &Analyzer, frames: usize) -> String {
+pub fn format_report(
+    name: &str,
+    sample_rate: u32,
+    ch: usize,
+    a: &Analyzer,
+    frames: usize,
+) -> String {
     let s = &a.stats;
     let mut out = String::new();
     let secs = s.frames as f64 / sample_rate as f64;
     let _ = writeln!(out, "Source        {name}  ({sample_rate} Hz, {ch} ch)");
-    let _ = writeln!(out, "Duration      {secs:.3} s  ({} samples, {frames} analysis frames)", s.frames);
+    let _ = writeln!(
+        out,
+        "Duration      {secs:.3} s  ({} samples, {frames} analysis frames)",
+        s.frames
+    );
     let per = |f: &dyn Fn(usize) -> String| -> String {
-        (0..ch).map(|c| format!("{:>3} {:>9}", channel_label(c, ch), f(c))).collect::<Vec<_>>().join("  ")
+        (0..ch)
+            .map(|c| format!("{:>3} {:>9}", channel_label(c, ch), f(c)))
+            .collect::<Vec<_>>()
+            .join("  ")
     };
-    let _ = writeln!(out, "Peak          {}  dBFS", per(&|c| format!("{:.2}", amp_to_db(s.peak[c]))));
-    let _ = writeln!(out, "RMS           {}  dBFS", per(&|c| format!("{:.2}", amp_to_db(s.rms(c)))));
-    let _ = writeln!(out, "Crest factor  {}  dB", per(&|c| format!("{:.2}", crest_factor_db(s.peak[c], s.rms(c)))));
-    let _ = writeln!(out, "Clipped       {}  samples", per(&|c| s.clipped[c].to_string()));
+    let _ = writeln!(
+        out,
+        "Peak          {}  dBFS",
+        per(&|c| format!("{:.2}", amp_to_db(s.peak[c])))
+    );
+    let _ = writeln!(
+        out,
+        "True peak     {}  dBTP",
+        per(&|c| format!("{:.2}", amp_to_db(s.true_peak[c])))
+    );
+    let _ = writeln!(
+        out,
+        "RMS           {}  dBFS",
+        per(&|c| format!("{:.2}", amp_to_db(s.rms(c))))
+    );
+    let _ = writeln!(
+        out,
+        "Crest factor  {}  dB",
+        per(&|c| format!("{:.2}", crest_factor_db(s.peak[c], s.rms(c))))
+    );
+    let _ = writeln!(
+        out,
+        "Clipped       {}  samples",
+        per(&|c| s.clipped[c].to_string())
+    );
     let l = &a.loudness;
-    let lu = |v: f32| if v.is_finite() { format!("{v:.1} LUFS") } else { "-inf".into() };
+    let lu = |v: f32| {
+        if v.is_finite() {
+            format!("{v:.1} LUFS")
+        } else {
+            "-inf".into()
+        }
+    };
     let _ = writeln!(out, "Integrated    {}", lu(l.integrated()));
     let _ = writeln!(out, "Max momentary {}", lu(l.max_momentary()));
     let _ = writeln!(out, "Max short-t.  {}", lu(l.max_short_term()));
+    let lra = l.loudness_range();
+    let _ = writeln!(
+        out,
+        "Loud. range   {}",
+        if lra.is_finite() {
+            format!("{lra:.1} LU")
+        } else {
+            "— (needs 3 s)".into()
+        }
+    );
     let cfg = a.config();
     let mean = s.mean_spectrum();
     let bin_hz = cfg.bin_hz();
@@ -75,7 +139,11 @@ pub fn format_report(name: &str, sample_rate: u32, ch: usize, a: &Analyzer, fram
     let hi = (cfg.top_freq() / bin_hz).ceil() as usize;
     match peak_frequency(&mean, bin_hz, lo, hi) {
         Some((f, db)) => {
-            let _ = writeln!(out, "Dominant freq {f:.1} Hz  ({db:.1} dB, {})", note_name(f));
+            let _ = writeln!(
+                out,
+                "Dominant freq {f:.1} Hz  ({db:.1} dB, {})",
+                note_name(f)
+            );
         }
         None => {
             let _ = writeln!(out, "Dominant freq —");

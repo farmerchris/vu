@@ -16,8 +16,9 @@ pub struct BandLayout {
 /// Nominal centre frequencies of the 1/3-octave bands (IEC 61260 / ISO 266),
 /// 20 Hz to 20 kHz. Band `i` is exactly 1000 · 2^((i − 17)/3) Hz.
 pub const THIRD_OCTAVE_NOMINAL: [&str; 31] = [
-    "20", "25", "31.5", "40", "50", "63", "80", "100", "125", "160", "200", "250", "315", "400", "500", "630", "800",
-    "1k", "1.25k", "1.6k", "2k", "2.5k", "3.15k", "4k", "5k", "6.3k", "8k", "10k", "12.5k", "16k", "20k",
+    "20", "25", "31.5", "40", "50", "63", "80", "100", "125", "160", "200", "250", "315", "400",
+    "500", "630", "800", "1k", "1.25k", "1.6k", "2k", "2.5k", "3.15k", "4k", "5k", "6.3k", "8k",
+    "10k", "12.5k", "16k", "20k",
 ];
 
 /// Short frequency label: "22", "850", "1k", "1.5k", "12k".
@@ -67,7 +68,10 @@ impl BandLayout {
         let edges: Vec<f32> = (0..=n)
             .map(|i| (min as f64 * ratio.powf(i as f64 / n as f64)) as f32)
             .collect();
-        let centers = edges.windows(2).map(|e| (e[0] * e[1]).sqrt()).collect::<Vec<_>>();
+        let centers = edges
+            .windows(2)
+            .map(|e| (e[0] * e[1]).sqrt())
+            .collect::<Vec<_>>();
         let labels = centers.iter().map(|&c| short_label(c)).collect();
         let major = vec![true; n];
         Self::build(centers, edges, labels, major, false, bin_hz, nbins)
@@ -97,7 +101,14 @@ impl BandLayout {
                 }
             })
             .collect();
-        BandLayout { centers, edges, labels, major, third_octave, ranges }
+        BandLayout {
+            centers,
+            edges,
+            labels,
+            major,
+            third_octave,
+            ranges,
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -180,7 +191,11 @@ mod tests {
             .find(|&i| b.edges[i] <= 1000.0 && 1000.0 < b.edges[i + 1])
             .unwrap();
         let expected = 20.0 * a.log10();
-        assert!((out[idx] - expected).abs() < 1.0, "{} vs {expected}", out[idx]);
+        assert!(
+            (out[idx] - expected).abs() < 1.0,
+            "{} vs {expected}",
+            out[idx]
+        );
         for (i, &v) in out.iter().enumerate() {
             if (i as isize - idx as isize).abs() > 1 {
                 assert!(v < expected - 40.0, "band {i} leaked: {v}");
@@ -204,8 +219,14 @@ mod tests {
         assert_eq!(b.edges.len(), 32);
         assert!((b.edges[18] / b.centers[17] - 2f32.powf(1.0 / 6.0)).abs() < 1e-4);
         // Octave centres are the majors: 31.5, 63, 125 ... 16k.
-        let majors: Vec<&str> = (0..b.len()).filter(|&i| b.major[i]).map(|i| b.labels[i].as_str()).collect();
-        assert_eq!(majors, ["31.5", "63", "125", "250", "500", "1k", "2k", "4k", "8k", "16k"]);
+        let majors: Vec<&str> = (0..b.len())
+            .filter(|&i| b.major[i])
+            .map(|i| b.labels[i].as_str())
+            .collect();
+        assert_eq!(
+            majors,
+            ["31.5", "63", "125", "250", "500", "1k", "2k", "4k", "8k", "16k"]
+        );
         // A 24 kHz input (12 kHz top) keeps the bands up to 10 kHz.
         let b = BandLayout::third_octave(20.0, 12000.0, 24000.0 / 2048.0, 1025);
         assert_eq!(b.labels.last().unwrap(), "10k");

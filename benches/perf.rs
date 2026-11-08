@@ -78,17 +78,42 @@ fn bench_fft() {
         for _ in 0..n {
             sp.power(std::hint::black_box(&x), &mut out);
         }
-        println!("  Spectrum::power {fft:>5}: {:>6.2} us", t.elapsed().as_secs_f64() * 1e6 / n as f64);
+        println!(
+            "  Spectrum::power {fft:>5}: {:>6.2} us",
+            t.elapsed().as_secs_f64() * 1e6 / n as f64
+        );
     }
 }
 
 fn build_app(minutes: f64, fft: usize, hop: usize) -> App {
     let (fs, hs) = (fft.to_string(), hop.to_string());
-    let args = ["vu", "-g", "sweep:20:20000:7", "--history", "900", "--fft-size", &fs, "--hop", &hs];
+    let args = [
+        "vu",
+        "-g",
+        "sweep:20:20000:7",
+        "--history",
+        "900",
+        "--fft-size",
+        &fs,
+        "--hop",
+        &hs,
+    ];
     let cli = Cli::try_parse_from(args).unwrap();
     let mut analyzer = Analyzer::new(config(cli.fft_size, cli.hop()));
-    let info = SourceInfo { name: "bench".into(), sample_rate: SR, channels: CH, total_frames: None, kind: SourceKind::Generator };
-    let mut app = App::new(&cli, info, &analyzer, Arc::new(Control::default()), ColorMode::TrueColor);
+    let info = SourceInfo {
+        name: "bench".into(),
+        sample_rate: SR,
+        channels: CH,
+        total_frames: None,
+        kind: SourceKind::Generator,
+    };
+    let mut app = App::new(
+        &cli,
+        info,
+        &analyzer,
+        Arc::new(Control::default()),
+        ColorMode::TrueColor,
+    );
     // Analyze 20 s of real signal, then repeat it to fill the history.
     let mut seed: Vec<Frame> = Vec::new();
     analyzer.push(&audio("sweep:20:20000:7:-6", 20.0), |f| seed.push(f));
@@ -105,8 +130,17 @@ fn build_app(minutes: f64, fft: usize, hop: usize) -> App {
 /// Mean draw time in ms; when `feed` is set, the frames of 1/60 s of audio are
 /// appended before every draw, as in a live session. Also returns the first
 /// (cold) draw time.
-fn time_draw(term: &mut Terminal<TestBackend>, app: &mut App, iters: usize, feed: bool) -> (f64, f64) {
-    let per_draw = if feed { (1.0 / 60.0 / app.analysis.frame_dt).ceil() as usize } else { 0 };
+fn time_draw(
+    term: &mut Terminal<TestBackend>,
+    app: &mut App,
+    iters: usize,
+    feed: bool,
+) -> (f64, f64) {
+    let per_draw = if feed {
+        (1.0 / 60.0 / app.analysis.frame_dt).ceil() as usize
+    } else {
+        0
+    };
     let dt = app.analysis.frame_dt;
     let push = |app: &mut App| {
         for _ in 0..per_draw {
@@ -133,7 +167,12 @@ fn time_draw(term: &mut Terminal<TestBackend>, app: &mut App, iters: usize, feed
 
 fn bench_draw(minutes: f64, fft: usize, hop: usize) {
     let mut app = build_app(minutes, fft, hop);
-    println!("draw: {} frames of history (fft {}, hop {})", app.history.len(), app.analysis.fft_size, app.analysis.hop);
+    println!(
+        "draw: {} frames of history (fft {}, hop {})",
+        app.history.len(),
+        app.analysis.fft_size,
+        app.analysis.hop
+    );
     for (w, h) in [(300u16, 100u16), (160, 48)] {
         let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
         for span in [1.0f64, 10.0, 300.0] {
@@ -156,7 +195,10 @@ fn bench_draw(minutes: f64, fft: usize, hop: usize) {
     println!("  300x100 empty draw (terminal overhead): {ms:.3} ms");
     app.view.span_secs = vu::app::DEFAULT_SPAN;
     app.nav(Nav::End);
-    for (i, name) in ["meter", "eq", "spectrogram", "timeline"].iter().enumerate() {
+    for (i, name) in ["meter", "eq", "spectrogram", "timeline"]
+        .iter()
+        .enumerate()
+    {
         let saved = app.display.panels;
         app.display.panels = [false; vu::cli::PANEL_COUNT];
         app.display.panels[i] = true;
@@ -166,7 +208,11 @@ fn bench_draw(minutes: f64, fft: usize, hop: usize) {
     }
 }
 
-fn time_draw_with(term: &mut Terminal<TestBackend>, iters: usize, mut f: impl FnMut(&mut ratatui::Frame)) -> f64 {
+fn time_draw_with(
+    term: &mut Terminal<TestBackend>,
+    iters: usize,
+    mut f: impl FnMut(&mut ratatui::Frame),
+) -> f64 {
     let t = Instant::now();
     for _ in 0..iters {
         term.draw(&mut f).unwrap();

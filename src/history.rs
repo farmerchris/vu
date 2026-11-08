@@ -11,7 +11,11 @@ pub struct History {
 
 impl History {
     pub fn new(cap: usize) -> Self {
-        History { frames: VecDeque::with_capacity(cap.min(1 << 16)), cap: cap.max(1), base: 0 }
+        History {
+            frames: VecDeque::with_capacity(cap.min(1 << 16)),
+            cap: cap.max(1),
+            base: 0,
+        }
     }
 
     pub fn push(&mut self, f: Frame) {
@@ -55,13 +59,17 @@ impl History {
     /// Frames with absolute indices in `[a, b]`, clipped to what is retained.
     pub fn range(&self, a: usize, b: usize) -> impl Iterator<Item = &Frame> {
         let lo = a.saturating_sub(self.base).min(self.frames.len());
-        let hi = (b + 1).saturating_sub(self.base).min(self.frames.len()).max(lo);
+        let hi = (b + 1)
+            .saturating_sub(self.base)
+            .min(self.frames.len())
+            .max(lo);
         self.frames.range(lo..hi)
     }
 
     /// Whether any frame in the `n` frames ending at `end` clipped.
     pub fn clipped(&self, end: usize, n: usize) -> bool {
-        self.range(end.saturating_sub(n.saturating_sub(1)), end).any(|f| f.clipped)
+        self.range(end.saturating_sub(n.saturating_sub(1)), end)
+            .any(|f| f.clipped)
     }
 }
 
@@ -79,6 +87,7 @@ pub mod tests {
             time: 0.0,
             channels: 2,
             peak: p,
+            true_peak: p,
             peak_decay: p,
             rms: p,
             rms_avg: p,
@@ -88,6 +97,7 @@ pub mod tests {
             lufs_m: f32::NEG_INFINITY,
             lufs_s: f32::NEG_INFINITY,
             lufs_i: f32::NEG_INFINITY,
+            lufs_lra: f32::NAN,
             peak_freq: None,
             clipped: peak >= 0.0,
             spectrum: vec![0u8; 8].into_boxed_slice(),

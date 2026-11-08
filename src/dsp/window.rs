@@ -66,7 +66,10 @@ mod tests {
         assert!(w[0].abs() < 1e-7);
         assert!((w[512] - 1.0).abs() < 1e-6);
         for i in 1..512 {
-            assert!((w[i] - w[1024 - i]).abs() < 1e-6, "periodic symmetry at {i}");
+            assert!(
+                (w[i] - w[1024 - i]).abs() < 1e-6,
+                "periodic symmetry at {i}"
+            );
         }
     }
 
@@ -82,8 +85,16 @@ mod tests {
         ];
         for (kind, cg, enbw) in cases {
             let w = make_window(kind, n);
-            assert!(close(coherent_gain(&w), cg, 1e-4), "{kind:?} cg {}", coherent_gain(&w));
-            assert!(close(enbw_bins(&w), enbw, 1e-3), "{kind:?} enbw {}", enbw_bins(&w));
+            assert!(
+                close(coherent_gain(&w), cg, 1e-4),
+                "{kind:?} cg {}",
+                coherent_gain(&w)
+            );
+            assert!(
+                close(enbw_bins(&w), enbw, 1e-3),
+                "{kind:?} enbw {}",
+                enbw_bins(&w)
+            );
         }
     }
 

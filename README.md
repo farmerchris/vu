@@ -5,11 +5,11 @@ A full-screen terminal sound meter written in Rust. It shows:
 - **Levels**, in one of three meter modes (`v` cycles RMS → VU → LUFS; `--vu` or `--lufs` picks the starting one). Each mode shows only its own measure, in both the meters and the timeline:
   - **RMS** (default): per-channel RMS bars (300 ms sliding window) with a peak envelope falling at 20 dB per 1.7 s (IEC 60268-18) and a peak-hold marker (held 1.5 s, then falling at 20 dB/s), on a dBFS scale. Readouts: `peak hold rms avg`.
   - **VU**: per-channel VU needles, simulated on every sample as a damped spring driven by the rectified signal (IEC 60268-17: 99% of a step in 300 ms, about 1% overshoot, falling the same way). Each frame shows the highest point the needle reached, so no moment is skipped, and the marker holds the highest reading (1.5 s, then 20 dB/s). The scale is the standard VU scale, −20 to +3 VU and linear in amplitude like a real meter's needle, in the traditional two zones: green below 0 VU, red from 0 VU up. 0 VU is −18 dBFS (EBU R68; `--vu-ref -20` for SMPTE), so a −18 dBFS alignment tone reads 0 VU. Readouts: `vu hold`, in VU.
-  - **LUFS**: momentary (M) and short-term (S) loudness bars on the EBU +9 scale (EBU Tech 3341): −18 to +9 LU, linear in dB, with 0 LU at the −23 LUFS target; cyan below the target, yellow from it up. The M bar's marker is the highest momentary loudness. Readouts: `mom short integ max` in LUFS (`R` resets the max).
-  - In every mode: the session's highest sample peak in dBFS and the clip count (`x` resets both), a CLIP badge lit for 2 s after a clip, and the strongest tone with its musical note (shown only when a tone stands at least 15 dB above nearby bins, so hiss reads `—`). The VU and loudness scales top out well below full scale, so this is what shows an overload there. The numbers refresh 10 times a second.
-- **Equalizer**: the standard 1/3-octave bands (20 Hz – 20 kHz, octave centres labelled) with fast-rise, slow-fall smoothing per band and peak caps (held 1 s, then falling at 30 dB/s); `-b N` switches to N log-spaced bands.
+  - **LUFS**: momentary (M) and short-term (S) loudness bars on a scale from −36 to +9 LU, linear in dB (the top of EBU Tech 3341's "+9" scale with the floor of its "+18" one, deep enough for speech into a mic), with 0 LU at the target loudness (`--lufs-target`, see below; −14 LUFS by default, the level streaming services normalize to); M is soft blue and S sage green up to the target, and yellow above it; a faint olive line marks the target across the empty part of the bars and the timeline. The readouts match: `mom` in the M bar's blue, `short` in the S bar's green, anything at or over the target in yellow. The M bar's marker is the highest momentary loudness. Readouts: `mom short integ max` in LUFS; `tgt`, integrated loudness relative to the target (the number delivery specs and streaming normalization use; it needs a whole song or programme to settle); `LRA`, loudness range (EBU Tech 3342); and the max **true peak** in dBTP (BS.1770-4, 4× oversampled), since loudness specs limit true peak rather than sample peak. `r` starts a new measurement: integrated, LRA, max momentary and max true peak. Reset at the top of each take or song.
+  - In every mode: the session's highest peak (sample peak in dBFS; true peak in dBTP in LUFS mode) and the clip count (`x` resets the sample peak and clips), a CLIP badge lit for 2 s after a clip, and the strongest tone with its musical note (shown only when a tone stands at least 15 dB above nearby bins, so hiss reads `—`). The VU and loudness scales top out well below full scale, so this is what shows an overload there. The numbers refresh 10 times a second.
+- **Equalizer**: the standard 1/3-octave bands (20 Hz – 20 kHz, octave centres labelled) with fast-rise, slow-fall smoothing per band and peak caps (held 1 s, then falling at 30 dB/s; hidden within 6 dB of the floor, where they would only track noise); `-b N` switches to N log-spaced bands.
 - **Spectrogram**: a scrolling spectrogram on a log, mel or linear frequency axis. Each terminal cell holds two pixels.
-- **Timeline**: levels over time in the meter mode: peak and RMS (RMS), the VU needle with no peak layer, since peaks mostly sit above +3 VU (VU), or short-term loudness with momentary behind it (LUFS). Each column holds the highest reading of the frames it covers.
+- **Timeline**: levels over time in the meter mode: peak and RMS (RMS), the VU needle with no peak layer, since peaks mostly sit above +3 VU (VU), or momentary loudness (LUFS), in the M bar's colours: soft blue below the target, yellow above it, with the faint target line. Each column holds the highest reading of the frames it covers.
 - **Piano** (off by default; `-p …,piano`, `--piano`, `-p all` or `5`): an 88-key keyboard, A0–C8, lighting the key nearest the strongest tone. When the panel is too narrow for all 88 keys, a window of keys follows the tone.
 
 By default it reads the default audio input. It can also read a WAV file or a built-in test signal.
@@ -45,7 +45,22 @@ vu -g sine:997:-20 -t 3 --report     # check the loudness meter
 
 Test signals for `-g`: `sine:FREQ[:DB]`, `square:FREQ[:DB]`, `noise[:DB]`, `pink[:DB]`, `sweep:F0:F1:SECS[:DB[:END_DB]]` (with `END_DB` the level also ramps from `DB` to `END_DB` across each sweep, e.g. `sweep:100:800:5:-20:-10`), `silence`.
 
-Other options (see `vu --help`): `--fft-size`, `--hop`, `--window`, `-w/--weighting a|c|z`, `-b/--bands`, `--min-freq`, `--max-freq`, `--freq-scale`, `--db-min`, `--db-max`, `--meter-floor`, `--rms-time`, `--vu`, `--lufs`, `--vu-ref`, `--cycle-views[=SECS]` (step through the meter modes every SECS seconds, default 3), `--piano`, `--peak-decay`, `--peak-hold`, `--colormap`, `--color auto|truecolor|256`, `--fps`, `-z/--span SECONDS` (time shown across the charts, default 10), `--history`, `--channel`, `--channels`, `--sample-rate`, `--buffer-size`, `--record-format int16|int24|float32`, `--no-mouse`.
+Other options (see `vu --help`): `--fft-size`, `--hop`, `--window`, `-w/--weighting a|c|z`, `-b/--bands`, `--min-freq`, `--max-freq`, `--freq-scale`, `--db-min`, `--db-max`, `--meter-floor`, `--rms-time`, `--vu`, `--lufs`, `--lufs-target`, `--vu-ref`, `--cycle-views[=SECS]` (step through the meter modes every SECS seconds, default 3), `--piano`, `--peak-decay`, `--peak-hold`, `--colormap`, `--color auto|truecolor|256`, `--fps`, `-z/--span SECONDS` (time shown across the charts, default 10), `--history`, `--channel`, `--channels`, `--sample-rate`, `--buffer-size`, `--record-format int16|int24|float32`, `--no-mouse`.
+
+### Loudness targets
+
+`--lufs-target` takes a value in LUFS (`--lufs-target -18`) or one of these names (any case). It sets the loudness that reads 0 LU in LUFS mode; the scale runs from 36 LU below it to 9 LU above (−50 to −5 LUFS with the default).
+
+| Name | LUFS | Target of |
+| --- | --- | --- |
+| `streaming` (default), `spotify`, `youtube` | −14 | streaming services' playback normalization |
+| `apple` | −16 | Apple Music |
+| `podcast` | −16 | podcasts (stereo; mono is usually −19) |
+| `broadcast`, `ebu` | −23 | European broadcast, EBU R128 |
+| `atsc` | −24 | US broadcast, ATSC A/85 |
+| `netflix` | −27 | Netflix (dialogue-gated) |
+
+Broadcast targets are delivery specs, measured as integrated loudness. Streaming targets are where playback is turned down to, so louder masters are allowed but get quieter on playback. Services change these from time to time; check the current spec before delivering.
 
 ## Keys
 
@@ -58,9 +73,9 @@ Other options (see `vu --help`): `--fft-size`, `--hop`, `--window`, `-w/--weight
 | mouse click / wheel | place the cursor / scroll |
 | + / - (↑ / ↓) | zoom the time axis in or out (0.5 s, 1, 2, 5, 10, 20, 30 s, 1, 2, 5, 10 min across the chart) |
 | p | pause or resume the input |
-| r | start or stop recording |
+| R | start or stop recording |
 | x | reset the session max level and clip count |
-| R | reset the max loudness |
+| r | reset the loudness measurement: integrated, LRA, max momentary and max true peak |
 | 1 2 3 4 5 | toggle the meter, equalizer, spectrogram, timeline and piano |
 | c / s | cycle the colour map / frequency scale |
 | v | cycle the meter mode: RMS, VU, LUFS (meters and timeline) |

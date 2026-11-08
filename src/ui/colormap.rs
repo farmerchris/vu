@@ -54,7 +54,12 @@ impl ColorMap {
                 (0.75, [94, 201, 98]),
                 (1.0, [253, 231, 37]),
             ],
-            ColorMap::Fire => &[(0.0, [0, 0, 0]), (0.33, [180, 0, 0]), (0.66, [255, 170, 0]), (1.0, [255, 255, 255])],
+            ColorMap::Fire => &[
+                (0.0, [0, 0, 0]),
+                (0.33, [180, 0, 0]),
+                (0.66, [255, 170, 0]),
+                (1.0, [255, 255, 255]),
+            ],
             ColorMap::Gray => &[(0.0, [0, 0, 0]), (1.0, [255, 255, 255])],
         }
     }
@@ -171,11 +176,20 @@ pub fn vu_zone_colors(vu: f32) -> (Color, Color) {
 /// below the target, yellow at or above it; the second colour is the dim one.
 pub fn lu_zone_colors(lu: f32) -> (Color, Color) {
     if lu >= 0.0 {
-        (Color::Yellow, Color::Indexed(100))
+        (LU_OVER_COLOR, Color::Indexed(100))
     } else {
         (Color::Cyan, Color::Indexed(23))
     }
 }
+
+/// Loudness colours: momentary in soft blue (#5fafd7) and short-term in sage
+/// green (#87af87), of equal weight.
+pub const LU_M_COLOR: Color = Color::Indexed(74);
+pub const LU_S_COLOR: Color = Color::Indexed(108);
+/// The faint line marking the loudness target across empty cells.
+pub const LU_TARGET_LINE: Color = Color::Indexed(100);
+/// Loudness above the target.
+pub const LU_OVER_COLOR: Color = Color::Yellow;
 
 /// Dim companion of [`zone_color`] used for the peak envelope.
 pub fn zone_color_dim(db: f32) -> Color {
@@ -237,13 +251,28 @@ mod tests {
 
     #[test]
     fn color_choice() {
-        assert_eq!(ColorChoice::Auto.resolve(Some("truecolor")), ColorMode::TrueColor);
-        assert_eq!(ColorChoice::Auto.resolve(Some("24BIT")), ColorMode::TrueColor);
+        assert_eq!(
+            ColorChoice::Auto.resolve(Some("truecolor")),
+            ColorMode::TrueColor
+        );
+        assert_eq!(
+            ColorChoice::Auto.resolve(Some("24BIT")),
+            ColorMode::TrueColor
+        );
         assert_eq!(ColorChoice::Auto.resolve(None), ColorMode::Ansi256);
         assert_eq!(ColorChoice::Truecolor.resolve(None), ColorMode::TrueColor);
-        assert_eq!(ColorChoice::Ansi256.resolve(Some("truecolor")), ColorMode::Ansi256);
-        assert_eq!(to_color(ColorMode::TrueColor, [1, 2, 3]), Color::Rgb(1, 2, 3));
-        assert_eq!(to_color(ColorMode::Ansi256, [255, 0, 0]), Color::Indexed(196));
+        assert_eq!(
+            ColorChoice::Ansi256.resolve(Some("truecolor")),
+            ColorMode::Ansi256
+        );
+        assert_eq!(
+            to_color(ColorMode::TrueColor, [1, 2, 3]),
+            Color::Rgb(1, 2, 3)
+        );
+        assert_eq!(
+            to_color(ColorMode::Ansi256, [255, 0, 0]),
+            Color::Indexed(196)
+        );
     }
 
     #[test]

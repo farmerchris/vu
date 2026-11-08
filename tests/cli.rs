@@ -4,7 +4,10 @@ use std::path::PathBuf;
 use std::process::{Command, Output};
 
 fn vu(args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_vu")).args(args).output().expect("run vu")
+    Command::new(env!("CARGO_BIN_EXE_vu"))
+        .args(args)
+        .output()
+        .expect("run vu")
 }
 
 fn out(o: &Output) -> String {
@@ -34,7 +37,10 @@ impl Drop for TempDir {
 
 /// First number following `label` on its line, in the report output.
 fn number_after(report: &str, label: &str) -> f64 {
-    let line = report.lines().find(|l| l.starts_with(label)).unwrap_or_else(|| panic!("no '{label}' line in:\n{report}"));
+    let line = report
+        .lines()
+        .find(|l| l.starts_with(label))
+        .unwrap_or_else(|| panic!("no '{label}' line in:\n{report}"));
     line[label.len()..]
         .split_whitespace()
         .find_map(|t| t.parse::<f64>().ok())
@@ -101,7 +107,9 @@ fn report_file_with_duration_limit() {
     let d = TempDir::new("lim");
     let wav = d.0.join("a.wav");
     let wav_s = wav.to_str().unwrap();
-    assert!(vu(&["--report", "-g", "pink", "-t", "2", "-r", wav_s]).status.success());
+    assert!(vu(&["--report", "-g", "pink", "-t", "2", "-r", wav_s])
+        .status
+        .success());
     let o = vu(&["--report", "-f", wav_s, "-t", "0.5"]);
     assert!(o.status.success(), "{}", err(&o));
     assert_eq!(number_after(&out(&o), "Duration"), 0.5);
@@ -109,14 +117,24 @@ fn report_file_with_duration_limit() {
 
 fn assert_fails(args: &[&str], needle: &str) {
     let o = vu(args);
-    assert!(!o.status.success(), "{args:?} unexpectedly succeeded:\n{}", out(&o));
+    assert!(
+        !o.status.success(),
+        "{args:?} unexpectedly succeeded:\n{}",
+        out(&o)
+    );
     let e = err(&o);
-    assert!(e.contains(needle), "{args:?}: stderr lacks '{needle}':\n{e}");
+    assert!(
+        e.contains(needle),
+        "{args:?}: stderr lacks '{needle}':\n{e}"
+    );
 }
 
 #[test]
 fn invalid_fft_size() {
-    assert_fails(&["--fft-size", "1000", "--report", "-g", "noise", "-t", "1"], "--fft-size");
+    assert_fails(
+        &["--fft-size", "1000", "--report", "-g", "noise", "-t", "1"],
+        "--fft-size",
+    );
 }
 
 #[test]
