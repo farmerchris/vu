@@ -3,6 +3,7 @@
 pub mod colormap;
 pub mod eq;
 pub mod meter;
+pub mod piano;
 pub mod spectrogram;
 pub mod timeline;
 
@@ -297,10 +298,15 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     let d = &app.display;
     let top = d.shown(Panel::Meter) || d.shown(Panel::Eq);
     let (spec, tl) = (d.shown(Panel::Spectrogram), d.shown(Panel::Timeline));
+    let piano = d.shown(Panel::Piano);
     let mut cons = Vec::new();
     if top {
         let min = top_min_height(d.shown(Panel::Meter), app.analysis.channels);
-        cons.push(Constraint::Length(top_height(body.height, min, spec as u16 + tl as u16)));
+        let rest = body.height.saturating_sub(if piano { piano::HEIGHT } else { 0 });
+        cons.push(Constraint::Length(top_height(rest, min, spec as u16 + tl as u16)));
+    }
+    if piano {
+        cons.push(Constraint::Length(piano::HEIGHT));
     }
     if spec {
         cons.push(Constraint::Fill(4));
@@ -311,6 +317,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     let rows = Layout::vertical(cons).split(body);
     let mut it = rows.iter().copied();
     let top_rect = if top { it.next() } else { None };
+    let piano_rect = if piano { it.next() } else { None };
     let spec_rect = if spec { it.next() } else { None };
     let tl_rect = if tl { it.next() } else { None };
 
@@ -338,6 +345,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         if let Some(er) = er {
             eq::render(app, er, buf);
         }
+    }
+    if let Some(r) = piano_rect {
+        piano::render(app, r, buf);
     }
     if let Some(r) = spec_rect {
         let c = spectrogram::render(app, r, buf);
@@ -443,9 +453,9 @@ const HELP: &[(&str, &str)] = &[
     ("r", "start / stop recording"),
     ("x", "reset the max level and clip count"),
     ("R", "reset the max loudness"),
-    ("1 2 3 4", "show / hide levels, equalizer, spectrogram, timeline"),
+    ("1 2 3 4 5", "show / hide levels, equalizer, spectrogram, timeline, piano"),
     ("c / s", "cycle colour map / frequency scale"),
-    ("v", "level meters: VU needle / RMS and peak"),
+    ("v", "meter mode: RMS, VU, LUFS (meters and timeline)"),
     ("[ / ]  { / }", "lower / raise the chart floor / ceiling"),
     ("? / F1", "toggle this help"),
     ("q / Esc", "quit"),
@@ -453,11 +463,11 @@ const HELP: &[(&str, &str)] = &[
 
 /// What the level readouts mean.
 const LEGEND: &[(&str, &str)] = &[
-    ("peak  hold", "sample peak now; highest, held 1.5 s, then falling"),
-    ("rms  avg", "RMS of the latest hop; over 300 ms (the bar)"),
-    ("vu  hold", "VU mode (v): needle and its held highest; 0 VU = --vu-ref dBFS"),
-    ("max  clips", "highest peak and clip events since start (x resets)"),
-    ("LUFS", "loudness over 0.4 s, 3 s and since the start; highest 0.4 s (R resets)"),
+    ("peak  hold", "RMS: sample peak now; highest, held 1.5 s, then falling"),
+    ("rms  avg", "RMS: RMS of the latest hop; over 300 ms (the bar)"),
+    ("vu  hold", "VU: needle and its held highest; 0 VU = --vu-ref dBFS"),
+    ("LUFS", "LUFS: 0.4 s (M bar), 3 s (S bar), since the start; highest M (the mark; R resets)"),
+    ("max  clips", "highest sample peak and clip events since start (x resets)"),
     ("tone", "strongest tone that stands out, with its note"),
 ];
 

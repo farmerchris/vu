@@ -167,6 +167,16 @@ pub fn vu_zone_colors(vu: f32) -> (Color, Color) {
     }
 }
 
+/// Loudness colours for a reading `lu` relative to the target (LU): cyan
+/// below the target, yellow at or above it; the second colour is the dim one.
+pub fn lu_zone_colors(lu: f32) -> (Color, Color) {
+    if lu >= 0.0 {
+        (Color::Yellow, Color::Indexed(100))
+    } else {
+        (Color::Cyan, Color::Indexed(23))
+    }
+}
+
 /// Dim companion of [`zone_color`] used for the peak envelope.
 pub fn zone_color_dim(db: f32) -> Color {
     if db >= -6.0 {

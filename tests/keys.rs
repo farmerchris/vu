@@ -269,15 +269,42 @@ fn shift_r_resets_max_loudness_only() {
 }
 
 #[test]
-fn v_toggles_vu_meters() {
+fn v_cycles_meter_modes() {
+    use vu::app::MeterMode::*;
     let mut app = ready(&[]);
-    assert!(!app.display.vu);
-    assert_eq!(key(&mut app, KeyCode::Char('v')), Action::Redraw);
-    assert!(app.display.vu);
-    assert!(app.message.is_some());
-    key(&mut app, KeyCode::Char('v'));
-    assert!(!app.display.vu);
-    assert!(ready(&["--vu"]).display.vu, "--vu starts in VU mode");
+    assert_eq!(app.display.mode, Rms);
+    for want in [Vu, Lufs, Rms] {
+        assert_eq!(key(&mut app, KeyCode::Char('v')), Action::Redraw);
+        assert_eq!(app.display.mode, want);
+        assert!(app.message.as_ref().is_some_and(|(m, _)| m.contains(want.name())));
+    }
+    assert_eq!(ready(&["--vu"]).display.mode, Vu, "--vu starts in VU mode");
+    assert_eq!(ready(&["--lufs"]).display.mode, Lufs, "--lufs starts in LUFS mode");
+    assert!(Cli::try_parse_from(["vu", "--vu", "--lufs"]).is_err());
+}
+
+#[test]
+fn cycle_views_steps_modes_on_a_timer() {
+    use std::time::{Duration, Instant};
+    use vu::app::MeterMode::*;
+    let mut app = ready(&[]);
+    assert!(!app.cycle_tick(Instant::now() + Duration::from_secs(60)), "off by default");
+    let mut app = ready(&["--cycle-views"]);
+    let t0 = app.cycle.unwrap().1;
+    assert_eq!(app.cycle.unwrap().0, Duration::from_secs(3));
+    let at = |s: f64| t0 + Duration::from_secs_f64(s);
+    assert!(!app.cycle_tick(at(2.9)));
+    assert!(app.cycle_tick(at(3.0)));
+    assert_eq!(app.display.mode, Vu);
+    assert!(!app.cycle_tick(at(5.9)));
+    assert!(app.cycle_tick(at(6.0)));
+    assert!(app.cycle_tick(at(9.0)));
+    assert_eq!(app.display.mode, Rms, "wraps around");
+    let app = ready(&["--cycle-views=0.5", "--lufs"]);
+    assert_eq!((app.cycle.unwrap().0, app.display.mode), (Duration::from_millis(500), Lufs));
+    for bad in ["--cycle-views=0", "--cycle-views=x"] {
+        assert!(Cli::try_parse_from(["vu", bad]).map_or(true, |c| c.validate().is_err()), "{bad}");
+    }
 }
 
 #[test]

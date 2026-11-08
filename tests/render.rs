@@ -180,33 +180,45 @@ fn meter_shows_stereo_labels() {
 }
 
 #[test]
-fn vu_mode_switches_the_meter_readouts() {
-    let mut app = make_app(&["-p", "meter"], 2, 1.0);
+fn each_meter_mode_shows_only_its_own_measure() {
+    let tone = "sine:1000:-16";
+    // RMS: dBFS bars per channel, no VU or loudness readouts.
+    let mut app = make_app_with(&["-p", "meter"], 2, 1.0, tone);
     let t = text(&render(&mut app, 100, 24));
-    assert!(t.contains(" Levels ") && t.contains("peak") && !t.contains("Levels · VU"), "{t}");
-    let mut app = make_app_with(&["-p", "meter", "--vu"], 2, 1.0, "sine:1000:-16");
+    assert!(t.contains("Levels · RMS") && t.contains("dBFS   peak   hold"), "{t}");
+    assert!(!t.contains("LUFS") && !t.contains(" LU ") && !t.contains("  vu "), "{t}");
+    // VU: needles on the VU scale. A -16 dBFS sine reads +2 VU.
+    let mut app = make_app_with(&["-p", "meter", "--vu"], 2, 1.0, tone);
     let lines = render(&mut app, 100, 24);
     let t = text(&lines);
-    assert!(t.contains("Levels · VU") && t.contains("VU       vu   hold"), "{t}");
-    // A -16 dBFS sine reads +2 VU with 0 VU at the default -18 dBFS.
-    assert!(t.contains("L      +2.0"), "{t}");
+    assert!(t.contains("Levels · VU") && t.contains("VU       vu   hold") && t.contains("L      +2.0"), "{t}");
     assert!(lines.iter().any(|l| l.starts_with("│ -20 ")) && lines.iter().any(|l| l.starts_with("│  +3 ")), "{t}");
+    assert!(!t.contains("LUFS") && !t.contains("peak"), "{t}");
+    // LUFS: M and S bars on the EBU +9 axis; the stereo tone reads -16 LUFS.
+    let mut app = make_app_with(&["-p", "meter", "--lufs"], 2, 1.0, tone);
+    let lines = render(&mut app, 100, 24);
+    let t = text(&lines);
+    assert!(t.contains("Levels · LUFS") && t.contains("LUFS    mom  short  integ    max"), "{t}");
+    assert!(lines.iter().any(|l| l.starts_with("│  +9 ")) && lines.iter().any(|l| l.starts_with("│ -18 ")), "{t}");
+    assert!(t.contains(" M ") && t.contains(" S ") && !t.contains(" L ") && !t.contains("  vu "), "{t}");
+    assert!(t.contains("-16.0"), "{t}");
+    // Peaks and clips stay in every mode.
+    for args in [&[][..], &["--vu"], &["--lufs"]] {
+        let mut app = make_app_with(&[&["-p", "meter"][..], args].concat(), 2, 1.0, tone);
+        assert!(text(&render(&mut app, 100, 24)).contains("max   -16.0 dBFS    0 clips"), "{args:?}");
+    }
 }
 
 #[test]
-fn vu_mode_gives_loudness_its_own_axis_and_still_fits() {
-    for (ch, w) in [(2usize, 80u16), (1, 80), (2, 140), (8, 160)] {
-        let mut app = make_app_with(&["--vu"], ch, 1.0, "sine:1000:-16");
-        let lines = render(&mut app, w, 24);
-        let t = text(&lines);
-        // EBU +9 marks beside the LU bar, and the readouts are not cut short.
-        assert!(t.contains(" +9 ") && t.contains(" -18 "), "{ch}ch {w}: {t}");
-        assert!(t.contains("+22c"), "{ch}ch {w}: {t}");
-        assert!(t.contains("integ    max"), "{ch}ch {w}: {t}");
+fn every_mode_fits_at_every_width() {
+    for mode in [&[][..], &["--vu"], &["--lufs"]] {
+        for (ch, w) in [(2usize, 80u16), (1, 80), (2, 140), (8, 160)] {
+            let mut app = make_app_with(mode, ch, 1.0, "sine:1000:-16");
+            let t = text(&render(&mut app, w, 24));
+            // The readouts are not cut short.
+            assert!(t.contains("+22c") && t.contains(" clips"), "{mode:?} {ch}ch {w}: {t}");
+        }
     }
-    let mut app = make_app_with(&[], 2, 1.0, "sine:1000:-16");
-    let t = text(&render(&mut app, 80, 24));
-    assert!(!t.contains(" +9 "), "no LU axis in dBFS mode: {t}");
 }
 
 #[test]
@@ -268,19 +280,63 @@ fn clip_badge_and_session_line_fit_at_80x24() {
 
 
 #[test]
-fn timeline_follows_vu_mode() {
+fn timeline_follows_the_meter_mode() {
+    let sweep = "sweep:100:800:5:-20:-10";
     let args = ["-p", "timeline", "-z", "5"];
-    let mut app = make_app_with(&args, 2, 5.0, "sweep:100:800:5:-20:-10");
+    let mut app = make_app_with(&args, 2, 5.0, sweep);
     let t = text(&render(&mut app, 80, 16));
     assert!(t.contains("Timeline  peak / rms") && !t.contains("  +3 "), "{t}");
-    let mut app = make_app_with(&[&args[..], &["--vu"]].concat(), 2, 5.0, "sweep:100:800:5:-20:-10");
+    let mut app = make_app_with(&[&args[..], &["--vu"]].concat(), 2, 5.0, sweep);
     let lines = render(&mut app, 80, 16);
     let t = text(&lines);
     assert!(t.contains("Timeline  vu"), "{t}");
     // VU marks down the axis, the sweep near -2 VU once the needle has risen
     // (0.4 s in) and pinned above +3 VU once past -15 dBFS.
-    let row = |m: &str| lines.iter().find(|l| l.starts_with(&format!("│{m:>5} "))).unwrap_or_else(|| panic!("{m}: {t}"));
-    let first = |l: &str| l.chars().skip(7 + 6).take(3).collect::<String>();
-    assert!(first(row("-3")) == "███" && first(row("+1")).trim().is_empty(), "{t}");
-    assert!(row("+3").trim_end_matches('│').ends_with("███"), "{t}");
+    let row = |lines: &[String], m: &str| lines.iter().find(|l| l.starts_with(&format!("│{m:>5} "))).cloned().unwrap();
+    let first = |l: String| l.chars().skip(7 + 6).take(3).collect::<String>();
+    assert!(first(row(&lines, "-3")) == "███" && first(row(&lines, "+1")).trim().is_empty(), "{t}");
+    assert!(row(&lines, "+3").trim_end_matches('│').ends_with("███"), "{t}");
+    // LUFS: on the EBU +9 scale. The sweep starts at -20 LUFS (+3 LU) and
+    // ends near -10 LUFS, above the top at -14 LUFS.
+    let mut app = make_app_with(&[&args[..], &["--lufs"]].concat(), 2, 5.0, sweep);
+    let lines = render(&mut app, 80, 16);
+    let t = text(&lines);
+    assert!(t.contains("Timeline  loudness M / S"), "{t}");
+    assert!(row(&lines, "+9").trim_end_matches('│').ends_with("███"), "{t}");
+    assert!(first(row(&lines, "0")) == "███", "{t}");
+}
+
+
+#[test]
+fn piano_panel_lights_the_tone() {
+    use ratatui::style::Color;
+    // Not shown by default; `piano` in -p, --piano or -p all shows it.
+    let mut app = make_app(&[], 2, 1.0);
+    assert!(!text(&render(&mut app, 80, 30)).contains("Piano"));
+    for args in [&["-p", "meter,piano"][..], &["--piano"], &["-p", "all"]] {
+        let mut app = make_app(args, 2, 1.0);
+        assert!(text(&render(&mut app, 80, 40)).contains("Piano"), "{args:?}");
+    }
+    let mut app = make_app(&["-p", "all"], 2, 1.0);
+    let t = text(&render(&mut app, 80, 40));
+    assert!(t.contains("Levels") && t.contains("Equalizer") && t.contains("Spectrogram") && t.contains("Timeline"), "{t}");
+
+    // A 466 Hz tone lights A#4, a black key; 440 Hz lights A4, a white key.
+    for (spec, name, black) in [("sine:466.16:-12", "A#4", true), ("sine:440:-12", "A4", false)] {
+        let mut app = make_app_with(&["-p", "piano"], 2, 1.0, spec);
+        let mut term = Terminal::new(TestBackend::new(80, 1 + vu::ui::piano::HEIGHT)).unwrap();
+        term.draw(|f| vu::ui::draw(f, &mut app)).unwrap();
+        let buf = term.backend().buffer();
+        let row = |y: u16| (0..80).map(|x| buf[(x, y)].symbol().to_string()).collect::<String>();
+        assert!(row(1).contains(&format!("Piano  {name} ·")), "{}", row(1));
+        // The lit key is cyan on the top row, and only on the bottom row for a white key.
+        let lit = |y: u16| (0..80).filter(|&x| buf[(x, y)].bg == Color::Cyan).count();
+        assert!(lit(2) >= 1, "{name}");
+        assert_eq!(lit(4) > 0, !black, "{name}");
+        // Black keys are drawn: some top-row cells are black, the bottom row has none.
+        let blacks = |y: u16| (0..80).filter(|&x| buf[(x, y)].bg == Color::Indexed(16)).count();
+        assert!(blacks(2) > 10 && blacks(4) == 0);
+        // Its name is labelled under the keys.
+        assert!(row(5).contains(name), "{}", row(5));
+    }
 }

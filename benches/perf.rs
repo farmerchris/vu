@@ -158,7 +158,7 @@ fn bench_draw(minutes: f64, fft: usize, hop: usize) {
     app.nav(Nav::End);
     for (i, name) in ["meter", "eq", "spectrogram", "timeline"].iter().enumerate() {
         let saved = app.display.panels;
-        app.display.panels = [false; 4];
+        app.display.panels = [false; vu::cli::PANEL_COUNT];
         app.display.panels[i] = true;
         let (ms, _) = time_draw(&mut term, &mut app, 50, true);
         app.display.panels = saved;

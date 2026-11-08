@@ -1,32 +1,26 @@
-//! Level meters for the frame under the cursor: per-channel averaged RMS bars
-//! with decaying peak envelope and peak-hold marker (or, in VU mode, VU
-//! needles with a hold marker), a momentary-loudness bar, and numeric readouts.
+//! Level meters for the frame under the cursor, in one of three modes: RMS
+//! (per-channel 300 ms RMS bars with a decaying peak envelope and peak-hold
+//! marker), VU (per-channel VU needles with a hold marker) or LUFS (momentary
+//! and short-term loudness), each with its own scale and numeric readouts.
 
-use super::colormap::{vu_zone_colors, zone_color, zone_color_dim};
+use super::colormap::{lu_zone_colors, vu_zone_colors, zone_color, zone_color_dim};
 use super::{cell_fill, draw_db_axis, edge_marker_at as edge_marker, eighth, fmt_db, title};
 use crate::analyzer::Frame;
-use crate::app::App;
+use crate::app::{App, MeterMode};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::widgets::{Block, Widget};
 
 const BAR_W: u16 = 3;
-/// Narrowest bars in VU mode, which also fits the LU axis in the same width.
-const VU_BAR_W: u16 = 2;
-/// Width of the LU bar's own axis in VU mode.
-const LU_AXIS_W: u16 = 3;
 const MAX_BAR_W: u16 = 8;
 const SCALE_W: u16 = 5;
 const TEXT_W: u16 = 35;
 
-/// Smallest width that fits every bar and the readouts, in either mode: VU
-/// mode narrows the bars to make room for the LU axis, and with few bars that
-/// is not quite enough.
+/// Smallest width that fits every bar and the readouts in any mode, so
+/// switching modes does not move the other panels.
 pub fn preferred_width(channels: usize) -> u16 {
-    let bars = bar_count(channels);
-    let short = LU_AXIS_W.saturating_sub(bars * (BAR_W - VU_BAR_W));
-    2 + SCALE_W + bars * (BAR_W + 1) + TEXT_W + short
+    2 + SCALE_W + bar_count(channels) * (BAR_W + 1) + TEXT_W
 }
 
 /// Narrowest equalizer worth showing beside the meter.
@@ -40,18 +34,19 @@ pub fn width(channels: usize, total: u16) -> u16 {
     want.min(total.saturating_sub(MIN_EQ_W)).max(want.min(total / 2))
 }
 
-/// Channel bars plus the loudness bar.
+/// Most bars any mode draws: one per channel, or the two loudness bars.
 fn bar_count(channels: usize) -> u16 {
-    channels.clamp(1, crate::analyzer::MAX_CHANNELS) as u16 + 1
+    (channels.clamp(1, crate::analyzer::MAX_CHANNELS) as u16).max(LUFS_BARS)
 }
 
+/// Momentary and short-term bars in LUFS mode.
+const LUFS_BARS: u16 = 2;
+
 /// Bar width for `bars` bars in an inner width of `inner`: the space left after
-/// the scale and readouts, shared out, between `BAR_W` and `MAX_BAR_W`. VU
-/// mode also leaves room for the LU axis, narrowing the bars to make it fit.
-pub fn bar_width(bars: u16, inner: u16, vu: bool) -> u16 {
-    let (axis, min) = if vu { (LU_AXIS_W, VU_BAR_W) } else { (0, BAR_W) };
-    let spare = inner.saturating_sub(SCALE_W + TEXT_W + 1 + axis);
-    (spare / bars.max(1)).saturating_sub(1).clamp(min, MAX_BAR_W)
+/// the scale and readouts, shared out, between `BAR_W` and `MAX_BAR_W`.
+pub fn bar_width(bars: u16, inner: u16) -> u16 {
+    let spare = inner.saturating_sub(SCALE_W + TEXT_W + 1);
+    (spare / bars.max(1)).saturating_sub(1).clamp(BAR_W, MAX_BAR_W)
 }
 
 pub fn channel_label(i: usize, n: usize) -> String {
@@ -77,7 +72,7 @@ pub enum Scale {
 }
 
 /// EBU R128 target loudness (LUFS), 0 LU on the EBU +9 scale.
-const LU_TARGET: f32 = -23.0;
+pub const LU_TARGET: f32 = -23.0;
 /// Range of the EBU +9 scale, LU.
 const LU_RANGE: (f32, f32) = (-18.0, 9.0);
 
@@ -113,17 +108,16 @@ impl Scale {
         match self {
             Scale::Db { .. } => (zone_color(db), zone_color_dim(db)),
             Scale::Vu { reference } => vu_zone_colors(db - reference),
-            Scale::Lu { .. } => (Color::Cyan, Color::Indexed(23)),
+            Scale::Lu { target } => lu_zone_colors(db - target),
         }
     }
 
-    /// A readout value: dBFS, or VU on the VU scale.
+    /// A readout value: dBFS, VU on the VU scale, LUFS on the loudness scale.
     fn fmt(self, db: f32) -> String {
         match self {
             Scale::Db { .. } => fmt_db(db),
             Scale::Vu { reference } if db.is_finite() && db > -140.0 => format!("{:+5.1}", db - reference),
             Scale::Vu { .. } => fmt_db(db),
-            Scale::Lu { target } if db.is_finite() && db > -140.0 => format!("{:+5.1}", db - target),
             Scale::Lu { .. } => fmt_db(db),
         }
     }
@@ -161,12 +155,11 @@ impl Scale {
     }
 }
 
-/// LU labels, left-aligned to sit right of the LU bar: every 3 or 9 LU as
-/// space allows, so +9 and 0 are always marked, with 0 LU (the target) in the
-/// bar's colour.
+/// LU labels: every 3 or 9 LU as space allows, so +9 and 0 are always
+/// marked, with 0 LU (the target) highlighted.
 fn draw_lu_axis(buf: &mut Buffer, axis: Rect, target: f32) {
     let rows = axis.height;
-    if axis.width < 2 || rows == 0 {
+    if axis.width < 3 || rows == 0 {
         return;
     }
     let span = LU_RANGE.1 - LU_RANGE.0;
@@ -177,8 +170,9 @@ fn draw_lu_axis(buf: &mut Buffer, axis: Rect, target: f32) {
         let h = scale.frac(target + lu) * rows as f32;
         let row = rows - 1 - (h.floor() as u16).min(rows - 1);
         let label = if lu > 0.0 { format!("+{lu}") } else { format!("{lu}") };
-        let color = if lu == 0.0 { Color::Cyan } else { Color::DarkGray };
-        buf.set_string(axis.x, axis.y + row, format!("{label:<w$}", w = axis.width as usize), Style::default().fg(color));
+        let color = if lu == 0.0 { Color::Yellow } else { Color::DarkGray };
+        let w = (axis.width - 1) as usize;
+        buf.set_string(axis.x, axis.y + row, format!("{label:>w$}"), Style::default().fg(color));
         lu -= step;
     }
 }
@@ -188,22 +182,16 @@ struct Bar {
     fill: f32,
     envelope: f32,
     hold: Option<f32>,
-    solid: Option<Color>,
-    scale: Scale,
 }
 
-fn draw_bar(buf: &mut Buffer, x: u16, bw: u16, area: Rect, bar: &Bar) {
+fn draw_bar(buf: &mut Buffer, x: u16, bw: u16, area: Rect, scale: Scale, bar: &Bar) {
     let rows = area.height;
-    let scale = bar.scale;
     let hf = scale.frac(bar.fill) * rows as f32;
     let he = scale.frac(bar.envelope) * rows as f32;
     for rb in 0..rows as usize {
         let y = area.y + rows - 1 - rb as u16;
         let db = scale.db_at((rb as f32 + 0.5) / rows as f32);
-        let (fg, dim) = match bar.solid {
-            Some(c) => (c, Color::Indexed(23)),
-            None => scale.colors(db),
-        };
+        let (fg, dim) = scale.colors(db);
         let (ff, fe) = (cell_fill(hf, rb), cell_fill(he, rb));
         for dx in 0..bw {
             let cell = &mut buf[(x + dx, y)];
@@ -230,8 +218,8 @@ fn draw_bar(buf: &mut Buffer, x: u16, bw: u16, area: Rect, bar: &Bar) {
 }
 
 pub fn render(app: &mut App, area: Rect, buf: &mut Buffer) {
-    let vu = app.display.vu;
-    let block = Block::bordered().title(title(if vu { " Levels · VU " } else { " Levels " }));
+    let mode = app.display.mode;
+    let block = Block::bordered().title(title(format!(" Levels · {} ", mode.name())));
     let inner = block.inner(area);
     block.render(area, buf);
     if inner.height < 3 || inner.width < SCALE_W + BAR_W {
@@ -243,41 +231,34 @@ pub fn render(app: &mut App, area: Rect, buf: &mut Buffer) {
         buf.set_string(inner.x + 1, inner.y, "waiting for audio…", Style::default().fg(Color::DarkGray));
         return;
     };
-    let scale = match vu {
-        true => Scale::Vu { reference: app.display.vu_ref },
-        false => Scale::Db { lo: app.display.meter_floor, hi: 0.0 },
-    };
+    let scale = mode_scale(app);
     let n = f.n();
+    let s = &app.session;
 
     let bars_area = Rect { height: inner.height - 1, ..inner };
     scale.draw_axis(buf, Rect { width: SCALE_W, ..bars_area });
-    let mut bars: Vec<Bar> = (0..n)
-        .map(|c| {
-            let label = channel_label(c, n);
-            match vu {
-                true => Bar { label, fill: f.vu[c], envelope: f.vu[c], hold: Some(f.vu_hold[c]), solid: None, scale },
-                false => Bar { label, fill: f.rms_avg[c], envelope: f.peak_decay[c], hold: Some(f.hold[c]), solid: None, scale },
-            }
-        })
-        .collect();
-    // Loudness shares the dBFS axis, but the VU scale is no loudness scale, so
-    // in VU mode the LU bar gets its own EBU +9 axis.
-    let lu_scale = if vu { Scale::Lu { target: LU_TARGET } } else { scale };
-    let lu = Bar { label: "LU".into(), fill: f.lufs_m, envelope: f.lufs_s, hold: None, solid: Some(Color::Cyan), scale: lu_scale };
-    bars.push(lu);
-    let bw = bar_width(bars.len() as u16, inner.width, vu);
+    let bars: Vec<Bar> = match mode {
+        MeterMode::Rms => (0..n)
+            .map(|c| Bar { label: channel_label(c, n), fill: f.rms_avg[c], envelope: f.peak_decay[c], hold: Some(f.hold[c]) })
+            .collect(),
+        MeterMode::Vu => (0..n)
+            .map(|c| Bar { label: channel_label(c, n), fill: f.vu[c], envelope: f.vu[c], hold: Some(f.vu_hold[c]) })
+            .collect(),
+        // Momentary, marked with its highest reading (R resets), and short-term.
+        MeterMode::Lufs => vec![
+            Bar { label: "M".into(), fill: f.lufs_m, envelope: f.lufs_m, hold: Some(s.max_lufs_m) },
+            Bar { label: "S".into(), fill: f.lufs_s, envelope: f.lufs_s, hold: None },
+        ],
+    };
+    let bw = bar_width(bars.len() as u16, inner.width);
     let mut x = inner.x + SCALE_W;
     let bars_end = inner.x + inner.width;
     for b in &bars {
         if x + bw > bars_end {
             break;
         }
-        draw_bar(buf, x, bw, bars_area, b);
+        draw_bar(buf, x, bw, bars_area, scale, b);
         x += bw + 1;
-        if b.scale != scale && x + LU_AXIS_W <= bars_end {
-            b.scale.draw_axis(buf, Rect { x, width: LU_AXIS_W, ..bars_area });
-            x += LU_AXIS_W;
-        }
     }
 
     // Numeric readouts to the right of the bars, refreshed at a readable rate
@@ -289,8 +270,9 @@ pub fn render(app: &mut App, area: Rect, buf: &mut Buffer) {
         return;
     }
     let tw = (bars_end - tx) as usize;
+    let rows = if mode == MeterMode::Lufs { 1 } else { n };
     // Blank separator rows only when there is room for them.
-    let needed = 1 + n + 1 + 2 + 1 + clipped as usize;
+    let needed = 1 + rows + 1 + 1 + clipped as usize;
     let spacious = inner.height as usize >= needed + 2;
     let mut y = inner.y;
     let mut line = |buf: &mut Buffer, s: String, st: Style| {
@@ -302,24 +284,32 @@ pub fn render(app: &mut App, area: Rect, buf: &mut Buffer) {
     };
     let head = Style::default().fg(Color::DarkGray);
     let val = Style::default().fg(Color::White);
-    let heads = if vu { ["vu", "hold", "peak", "avg"] } else { ["peak", "hold", "rms", "avg"] };
-    line(buf, row(if vu { "VU" } else { "dBFS" }, &heads), head);
-    for c in 0..n {
-        let (vals, loudest) = match vu {
-            true => ([f.vu[c], f.vu_hold[c], f.peak[c], f.rms_avg[c]], f.vu_hold[c]),
-            false => ([f.peak[c], f.hold[c], f.rms[c], f.rms_avg[c]], f.peak[c].max(f.hold[c])),
-        };
-        let st = Style::default().fg(scale.color(loudest));
-        line(buf, row(&channel_label(c, n), &vals.map(|v| scale.fmt(v))), st);
+    match mode {
+        MeterMode::Rms => {
+            line(buf, row("dBFS", &["peak", "hold", "rms", "avg"]), head);
+            for c in 0..n {
+                let st = Style::default().fg(scale.color(f.peak[c].max(f.hold[c])));
+                let vals = [f.peak[c], f.hold[c], f.rms[c], f.rms_avg[c]].map(fmt_db);
+                line(buf, row(&channel_label(c, n), &vals), st);
+            }
+        }
+        MeterMode::Vu => {
+            line(buf, row("VU", &["vu", "hold"]), head);
+            for c in 0..n {
+                let st = Style::default().fg(scale.color(f.vu_hold[c]));
+                line(buf, row(&channel_label(c, n), &[f.vu[c], f.vu_hold[c]].map(|v| scale.fmt(v))), st);
+            }
+        }
+        MeterMode::Lufs => {
+            line(buf, row("LUFS", &["mom", "short", "integ", "max"]), head);
+            let st = Style::default().fg(scale.color(f.lufs_m));
+            line(buf, row("", &[f.lufs_m, f.lufs_s, f.lufs_i, s.max_lufs_m].map(fmt_db)), st);
+        }
     }
-    let s = &app.session;
+    // Peaks and clips in every mode: the VU and loudness scales top out well
+    // below full scale, so they would not show an overload on their own.
     let clip_style = if s.clips > 0 { Style::default().fg(Color::LightRed) } else { head };
-    line(buf, session_text(&scale.fmt(s.max_db), s.clips), clip_style);
-    if spacious {
-        line(buf, String::new(), val);
-    }
-    line(buf, row("LUFS", &["mom", "short", "integ", "max"]), head);
-    line(buf, row("", &[f.lufs_m, f.lufs_s, f.lufs_i, s.max_lufs_m].map(fmt_db)), Style::default().fg(Color::Cyan));
+    line(buf, session_text(&fmt_db(s.max_db), s.clips), clip_style);
     if spacious {
         line(buf, String::new(), val);
     }
@@ -329,10 +319,20 @@ pub fn render(app: &mut App, area: Rect, buf: &mut Buffer) {
     }
 }
 
-/// Session line: highest peak and clip events since the start (or `x`).
+/// Scale of the meter bars and the timeline in the current mode.
+pub fn mode_scale(app: &App) -> Scale {
+    match app.display.mode {
+        MeterMode::Rms => Scale::Db { lo: app.display.meter_floor, hi: 0.0 },
+        MeterMode::Vu => Scale::Vu { reference: app.display.vu_ref },
+        MeterMode::Lufs => Scale::Lu { target: LU_TARGET },
+    }
+}
+
+/// Session line: highest sample peak (dBFS) and clip events since the start
+/// (or `x`).
 pub fn session_text(max: &str, clips: u64) -> String {
     let unit = if clips == 1 { "clip" } else { "clips" };
-    format!("{} {:>COL_W$} {unit}", row("max", &[max]), clips)
+    format!("{} dBFS {:>4} {unit}", row("max", &[max]), clips)
 }
 
 /// Width of each readout column; values are right-aligned under their headers.
@@ -390,6 +390,10 @@ mod tests {
         assert_eq!(s.color(-18.5), Color::Green);
         assert_eq!(s.color(-18.0), Color::Red);
         assert_eq!(s.color(-15.0), Color::Red);
+        // Loudness: cyan below the -23 LUFS target, yellow from it up.
+        let l = Scale::Lu { target: LU_TARGET };
+        assert_eq!((l.frac(-41.0), l.frac(-23.0), l.frac(-14.0)), (0.0, 18.0 / 27.0, 1.0));
+        assert_eq!((l.color(-23.5), l.color(-23.0)), (Color::Cyan, Color::Yellow));
         let d = Scale::Db { lo: -60.0, hi: 0.0 };
         assert_eq!(d.frac(-30.0), 0.5);
         assert_eq!(d.fmt(-3.0), " -3.0");
@@ -420,27 +424,29 @@ mod tests {
         assert_eq!(channel_label(0, 2), "L");
         assert_eq!(channel_label(1, 2), "R");
         assert_eq!(channel_label(3, 6), "4");
-        assert!(preferred_width(2) > preferred_width(1));
+        // LUFS mode always draws two bars, so mono needs as much room as stereo.
+        assert_eq!(preferred_width(2), preferred_width(1));
+        assert!(preferred_width(3) > preferred_width(2));
     }
 
     #[test]
     fn widths() {
         // Wide screens get two fifths; narrow ones what the readouts need.
-        assert_eq!(width(1, 100), 51, "one column for the LU axis in VU mode");
+        assert_eq!(width(1, 100), 50);
         assert_eq!(width(1, 145), 58);
         assert_eq!(width(1, 300), 120);
-        assert_eq!(width(8, 145), 78);
-        // 80 columns: the stereo readouts fit, the equalizer keeps 26.
+        assert_eq!(width(8, 145), 74);
+        // 80 columns: the stereo readouts fit, the equalizer keeps 30.
         assert_eq!(width(2, 80), preferred_width(2));
-        assert_eq!(80 - width(2, 80), 26);
+        assert_eq!(80 - width(2, 80), 30);
         // Too narrow for both: the equalizer keeps its minimum, or half.
         assert_eq!(width(2, 60), 36);
         assert_eq!(width(2, 40), 20);
         // Minimum layout keeps 3-column bars; spare room widens them up to 8.
-        assert_eq!(bar_width(2, preferred_width(1) - 2, false), BAR_W);
-        assert_eq!(bar_width(2, 56, false), 6);
-        assert_eq!(bar_width(2, 200, false), MAX_BAR_W);
-        assert_eq!(bar_width(9, 20, false), BAR_W);
+        assert_eq!(bar_width(2, preferred_width(1) - 2), BAR_W);
+        assert_eq!(bar_width(2, 56), 6);
+        assert_eq!(bar_width(2, 200), MAX_BAR_W);
+        assert_eq!(bar_width(9, 20), BAR_W);
     }
 
     #[test]
@@ -457,9 +463,8 @@ mod tests {
             }
         }
         assert_eq!(row("LUFS", &["mom", "short", "integ"]).len(), row("", &["-60.9", "-59.7", "-55.7"]).len());
-        assert_eq!(session_text(&fmt_db(-3.04), 0), "max    -3.0      0 clips");
-        assert_eq!(session_text(&fmt_db(0.0), 1), "max     0.0      1 clip");
-        assert_eq!(session_text(&Scale::Vu { reference: -18.0 }.fmt(-16.0), 0), "max    +2.0      0 clips");
+        assert_eq!(session_text(&fmt_db(-3.04), 0), "max    -3.0 dBFS    0 clips");
+        assert_eq!(session_text(&fmt_db(0.0), 1), "max     0.0 dBFS    1 clip");
         assert!(session_text(&fmt_db(-3.0), 0).len() <= TEXT_W as usize);
         // The frequency line keeps its layout as the value changes.
         assert_eq!(format!("{:>7.1}", 92.6f32).len(), format!("{:>7.1}", 10298.8f32).len());

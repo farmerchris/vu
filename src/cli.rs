@@ -11,7 +11,7 @@ use std::path::PathBuf;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
 pub enum Panel {
-    /// Level meters (peak, RMS, loudness)
+    /// Level meters (RMS, VU or LUFS mode; v cycles)
     Meter,
     /// Graphic equalizer bands
     Eq,
@@ -19,9 +19,29 @@ pub enum Panel {
     Spectrogram,
     /// Level timeline
     Timeline,
+    /// Piano keyboard lighting the strongest tone (not shown by default)
+    Piano,
+    /// Every panel, the piano included
+    All,
 }
 
+/// Panels shown by default.
 pub const ALL_PANELS: [Panel; 4] = [Panel::Meter, Panel::Eq, Panel::Spectrogram, Panel::Timeline];
+/// Number of real panels (everything but `All`).
+pub const PANEL_COUNT: usize = 5;
+
+/// Which panels `list` turns on, indexed by `Panel as usize`.
+pub fn panel_set(list: &[Panel], piano: bool) -> [bool; PANEL_COUNT] {
+    let mut on = [false; PANEL_COUNT];
+    for &p in list {
+        match p {
+            Panel::All => on = [true; PANEL_COUNT],
+            p => on[p as usize] = true,
+        }
+    }
+    on[Panel::Piano as usize] |= piano;
+    on
+}
 
 #[derive(Parser, Debug, Clone)]
 #[command(
@@ -29,7 +49,7 @@ pub const ALL_PANELS: [Panel; 4] = [Panel::Meter, Panel::Eq, Panel::Spectrogram,
     version,
     about = "Terminal sound meter: levels, loudness, timeline, spectrogram and graphic equalizer",
     after_help = "KEYS: \u{2190}/\u{2192} scroll (shift = x10), PgUp/PgDn page, Home/End oldest/live, \
-space hold, p pause, r record, +/- zoom, 1-4 toggle panels, c colormap, s freq scale, v VU/RMS, \
+space hold, p pause, r record, +/- zoom, 1-5 toggle panels, c colormap, s freq scale, v meter mode, \
 [ ] floor, ? help, q quit\n\n\
 EXAMPLES:\n  vu                              meter the default input\n  \
 vu -f song.wav                  play a file through the meters in real time\n  \
@@ -152,9 +172,21 @@ pub struct Cli {
     #[arg(long, default_value_t = 11.8)]
     pub peak_decay: f32,
 
-    /// Start the level meters as VU needles (v toggles VU and RMS/peak)
-    #[arg(long)]
+    /// Start in VU meter mode (v cycles RMS, VU, LUFS)
+    #[arg(long, conflicts_with = "lufs")]
     pub vu: bool,
+
+    /// Also show the piano keyboard panel (same as adding `piano` to -p)
+    #[arg(long)]
+    pub piano: bool,
+
+    /// Start in loudness (LUFS) meter mode
+    #[arg(long)]
+    pub lufs: bool,
+
+    /// Step through the meter modes every SECS seconds (default 3), for demos
+    #[arg(long, value_name = "SECS", num_args = 0..=1, default_missing_value = "3", require_equals = true)]
+    pub cycle_views: Option<f64>,
 
     /// Level (dBFS) of 0 VU on the VU scale (-18: EBU R68; -20: SMPTE)
     #[arg(long, default_value_t = -18.0, allow_hyphen_values = true, value_name = "DBFS")]
@@ -209,6 +241,9 @@ impl Cli {
         }
         if self.meter_floor >= 0.0 {
             bail!("--meter-floor must be negative");
+        }
+        if self.cycle_views.is_some_and(|s| !(0.5..=3600.0).contains(&s)) {
+            bail!("--cycle-views must be between 0.5 and 3600 seconds");
         }
         if !(-40.0..=0.0).contains(&self.vu_ref) {
             bail!("--vu-ref must be between -40 and 0 dBFS");
@@ -266,6 +301,10 @@ mod tests {
     fn panel_list_and_options() {
         let c = parse(&["-p", "spectrogram,eq", "--db-min", "-120", "--fft-size", "8192", "--hop", "256"]);
         assert_eq!(c.panels, vec![Panel::Spectrogram, Panel::Eq]);
+        assert_eq!(panel_set(&c.panels, false), [false, true, true, false, false]);
+        assert_eq!(panel_set(&ALL_PANELS, false), [true, true, true, true, false], "no piano by default");
+        assert_eq!(panel_set(&ALL_PANELS, true), [true; PANEL_COUNT]);
+        assert_eq!(panel_set(&[Panel::All], false), [true; PANEL_COUNT]);
         assert_eq!(c.db_min, -120.0);
         assert_eq!(c.hop(), 256);
         c.validate().unwrap();

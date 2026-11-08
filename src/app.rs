@@ -344,8 +344,38 @@ pub struct AnalysisInfo {
     pub window: String,
 }
 
+/// What the level meters and the timeline measure; `v` cycles in this order.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MeterMode {
+    /// Per-channel RMS with a peak envelope, dBFS.
+    #[default]
+    Rms,
+    /// Per-channel VU needles on the VU scale.
+    Vu,
+    /// Momentary and short-term loudness on the EBU +9 scale.
+    Lufs,
+}
+
+impl MeterMode {
+    pub fn next(self) -> Self {
+        match self {
+            MeterMode::Rms => MeterMode::Vu,
+            MeterMode::Vu => MeterMode::Lufs,
+            MeterMode::Lufs => MeterMode::Rms,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            MeterMode::Rms => "RMS",
+            MeterMode::Vu => "VU",
+            MeterMode::Lufs => "LUFS",
+        }
+    }
+}
+
 pub struct Display {
-    pub panels: [bool; 4],
+    pub panels: [bool; crate::cli::PANEL_COUNT],
     pub db_min: f32,
     pub db_max: f32,
     pub meter_floor: f32,
@@ -354,15 +384,14 @@ pub struct Display {
     pub color_mode: ColorMode,
     /// Frames the CLIP indicator stays lit after a clip.
     pub clip_frames: usize,
-    /// Level bars show VU needles instead of RMS with a peak envelope.
-    pub vu: bool,
+    pub mode: MeterMode,
     /// dBFS that reads 0 VU.
     pub vu_ref: f32,
 }
 
 impl Display {
     pub fn shown(&self, p: Panel) -> bool {
-        self.panels[p as usize]
+        self.panels.get(p as usize).copied().unwrap_or(false)
     }
 }
 
@@ -381,6 +410,8 @@ pub struct App {
     pub display: Display,
     pub control: Arc<Control>,
     pub show_help: bool,
+    /// `--cycle-views`: the interval and when the mode last changed.
+    pub cycle: Option<(std::time::Duration, Instant)>,
     pub fps: FpsMeter,
     pub source_done: bool,
     pub ingest_done: bool,
@@ -414,10 +445,7 @@ impl App {
         if let Some(d) = cli.duration {
             cap = cap.max((d / frame_dt).ceil() as usize + 2);
         }
-        let mut panels = [false; 4];
-        for &p in &cli.panels {
-            panels[p as usize] = true;
-        }
+        let panels = crate::cli::panel_set(&cli.panels, cli.piano);
         App {
             history: History::new(cap),
             view: View { span_secs: cli.span, dt: frame_dt, ..View::default() },
@@ -447,12 +475,17 @@ impl App {
                 freq_scale: cli.freq_scale,
                 color_mode,
                 clip_frames: ((CLIP_SECS / frame_dt).round() as usize).max(1),
-                vu: cli.vu,
+                mode: match (cli.vu, cli.lufs) {
+                    (true, _) => MeterMode::Vu,
+                    (_, true) => MeterMode::Lufs,
+                    _ => MeterMode::Rms,
+                },
                 vu_ref: cli.vu_ref,
             },
             info,
             control,
             show_help: false,
+            cycle: cli.cycle_views.map(|s| (std::time::Duration::from_secs_f64(s), Instant::now())),
             fps: FpsMeter::new(),
             source_done: false,
             ingest_done: false,
@@ -562,6 +595,23 @@ impl App {
         }
     }
 
+    /// Step to the next meter mode once the `--cycle-views` interval has
+    /// passed. Returns whether the mode changed.
+    pub fn cycle_tick(&mut self, now: Instant) -> bool {
+        let Some((every, since)) = self.cycle else { return false };
+        if now.duration_since(since) < every {
+            return false;
+        }
+        self.cycle = Some((every, now));
+        self.next_mode();
+        true
+    }
+
+    fn next_mode(&mut self) {
+        self.display.mode = self.display.mode.next();
+        self.flash(format!("meter mode: {}", self.display.mode.name()));
+    }
+
     pub fn handle_key(&mut self, k: KeyEvent) -> Action {
         let fast = k.modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::CONTROL);
         let n = if fast { 10 } else { 1 };
@@ -604,6 +654,7 @@ impl App {
             KeyCode::Char('2') => self.toggle_panel(Panel::Eq),
             KeyCode::Char('3') => self.toggle_panel(Panel::Spectrogram),
             KeyCode::Char('4') => self.toggle_panel(Panel::Timeline),
+            KeyCode::Char('5') => self.toggle_panel(Panel::Piano),
             KeyCode::Char('c') => {
                 self.display.colormap = self.display.colormap.next();
                 self.flash(format!("colormap: {:?}", self.display.colormap).to_lowercase());
@@ -613,8 +664,11 @@ impl App {
                 self.flash(format!("frequency scale: {:?}", self.display.freq_scale).to_lowercase());
             }
             KeyCode::Char('v') => {
-                self.display.vu = !self.display.vu;
-                self.flash(if self.display.vu { "meters: VU needle" } else { "meters: RMS / peak" });
+                self.next_mode();
+                // A manual change restarts the demo interval.
+                if let Some((every, _)) = self.cycle {
+                    self.cycle = Some((every, Instant::now()));
+                }
             }
             KeyCode::Char('[') => self.display.db_min = (self.display.db_min - 6.0).max(-120.0),
             KeyCode::Char(']') => self.display.db_min = (self.display.db_min + 6.0).min(self.display.db_max - 12.0),

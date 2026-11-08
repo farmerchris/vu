@@ -219,6 +219,9 @@ fn event_loop(term: &mut Term, app: &mut App, analyzer: &mut Analyzer, source: &
         }
 
         let now = Instant::now();
+        if app.cycle_tick(now) {
+            dirty = true;
+        }
         if now >= next_frame {
             if dirty || app.message.is_some() {
                 let t = Instant::now();
