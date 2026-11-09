@@ -1,5 +1,6 @@
-//! Window settings kept between sessions: what is shown and how, and the
-//! input. They are applied to the command line before the session opens,
+//! Window settings kept between sessions: what is shown and how. The input
+//! is not kept: each run starts on the default input unless the command line
+//! names one. The settings are applied to the command line before the session opens,
 //! for every option not given explicitly on it, so explicit options win for
 //! that run. (eframe keeps the window's position and size itself.)
 //!
@@ -7,7 +8,7 @@
 //! `~/Library/Application Support/vu/settings.txt`); unknown or invalid
 //! lines are ignored.
 
-use super::input::{Choice, MenuState};
+use super::input::MenuState;
 use crate::app::{App, MeterMode};
 use crate::cli::{Cli, Panel};
 use crate::dsp::scale::FreqScale;
@@ -82,13 +83,6 @@ pub fn capture(app: &App, menu: &MenuState) -> Map {
     put("rms_aes17", (d.rms_offset != 0.0).to_string());
     put("span", app.view.span_secs.to_string());
     put("dock_meter", menu.dock_live.to_string());
-    match &menu.current {
-        Some(Choice::Default) => put("source", "default".into()),
-        Some(Choice::Device(n)) => put("source", format!("device:{n}")),
-        Some(Choice::Signal(s)) => put("source", format!("signal:{s}")),
-        // A file is not reopened next time.
-        None => {}
-    }
     m
 }
 
@@ -156,13 +150,6 @@ pub fn apply(cli: &mut Cli, saved: &Map, explicit: &HashSet<String>) {
     if let (false, Some(v)) = (given(&["no_dock_meter"]), flag("dock_meter")) {
         cli.no_dock_meter = !v;
     }
-    if let (false, Some(src)) = (given(&["device", "file", "generate"]), saved.get("source")) {
-        if let Some(n) = src.strip_prefix("device:") {
-            cli.device = Some(n.to_string());
-        } else if let Some(spec) = src.strip_prefix("signal:") {
-            cli.generate = Some(spec.to_string());
-        }
-    }
     if cli.validate().is_err() {
         *cli = original;
     }
@@ -200,23 +187,15 @@ mod tests {
         );
         assert_eq!((c.db_min, c.lufs_target, c.span), (-80.0, -16.0, 30.0));
         assert!(c.rms_aes17 && c.no_dock_meter);
-        assert_eq!(c.generate.as_deref(), Some("pink"));
+        // An input saved by an older version is not reopened.
+        assert_eq!((c.generate, c.device, c.file), (None, None, None));
     }
 
     #[test]
     fn explicit_options_win() {
-        let (mut c, ex) = cli(&[
-            "--vu",
-            "-g",
-            "sine",
-            "--colormap",
-            "fire",
-            "--db-min",
-            "-60",
-        ]);
+        let (mut c, ex) = cli(&["--vu", "--colormap", "fire", "--db-min", "-60"]);
         apply(&mut c, &saved(), &ex);
         assert!(c.vu && !c.lufs);
-        assert_eq!(c.generate.as_deref(), Some("sine"));
         assert_eq!((c.colormap, c.db_min), (ColorMap::Fire, -60.0));
         // Others still come from the saved settings.
         assert_eq!(c.freq_scale, FreqScale::Mel);

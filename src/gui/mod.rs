@@ -77,24 +77,12 @@ pub fn explicit_args(m: &clap::ArgMatches) -> HashSet<String> {
         .collect()
 }
 
-/// Open the source given on the command line (or saved from last time) and
-/// show it in a window until it is closed. `explicit` names the arguments
-/// given on the command line; saved settings fill in the rest.
+/// Open the source given on the command line (the default input if none)
+/// and show it in a window until it is closed. `explicit` names the
+/// arguments given on the command line; saved settings fill in the rest.
 pub fn run(mut cli: Cli, explicit: HashSet<String>) -> Result<()> {
-    let given = cli.clone();
     settings::apply(&mut cli, &settings::load(), &explicit);
-    // A saved input that is gone (an unplugged device) falls back to the
-    // command line's.
-    let session = match Session::open(&cli) {
-        Ok(s) => s,
-        Err(e) if (&cli.device, &cli.generate) == (&given.device, &given.generate) => {
-            return Err(e)
-        }
-        Err(_) => {
-            (cli.device, cli.generate) = (given.device.clone(), given.generate.clone());
-            Session::open(&cli)?
-        }
-    };
+    let session = Session::open(&cli)?;
     let title = format!("vu — {}", session.source.info.name);
     let gui = Gui {
         frame_dt: Duration::from_secs_f64(1.0 / cli.fps as f64),

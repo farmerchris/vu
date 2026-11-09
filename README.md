@@ -100,7 +100,7 @@ On macOS the Dock icon is a live level meter, as Activity Monitor's is, mirrorin
 
 View → Live Dock Icon (or `--no-dock-meter`) keeps the icon still instead.
 
-The window remembers its settings between sessions: the panels, meter mode, colour map, frequency scale, chart floors and ceiling, loudness target, VU reference, RMS as AES17, zoom, the Dock icon setting and the input (a device or test signal, not a file), as well as its position and size. Options given on the command line override the saved values for that run. They are kept in the app's data directory (`~/Library/Application Support/vu/` on macOS).
+The window remembers its settings between sessions: the panels, meter mode, colour map, frequency scale, chart floors and ceiling, loudness target, VU reference, RMS as AES17, zoom, and the Dock icon setting, as well as its position and size. The input is not remembered: it starts on the default input unless the command line names one (`-d`, `-g` or `-f`). Options given on the command line override the saved values for that run. They are kept in the app's data directory (`~/Library/Application Support/vu/` on macOS).
 
 Click or drag on the spectrogram or timeline to place the cursor; scroll to move it.
 
