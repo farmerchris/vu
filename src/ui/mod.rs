@@ -557,7 +557,7 @@ fn render_status(app: &mut App, area: Rect, buf: &mut Buffer) {
     }
 }
 
-const HELP: &[(&str, &str)] = &[
+pub const HELP: &[(&str, &str)] = &[
     (
         "← / →  h / l",
         "move the cursor (Shift, Ctrl or H / L: 10 columns)",
@@ -586,7 +586,7 @@ const HELP: &[(&str, &str)] = &[
 ];
 
 /// What the level readouts mean.
-const LEGEND: &[(&str, &str)] = &[
+pub const LEGEND: &[(&str, &str)] = &[
     (
         "peak  hold",
         "RMS: sample peak now; highest, held 1.5 s, then falling",

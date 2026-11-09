@@ -366,6 +366,11 @@ fn find_device(host: &cpal::Host, want: &str) -> Result<cpal::Device> {
         }
     }
     let needle = want.to_lowercase();
+    // An exact name wins over a substring, so "Mic" never opens "Mic 2".
+    let name = |d: &cpal::Device| d.name().map(|n| n.to_lowercase()).unwrap_or_default();
+    if let Some(d) = devices.iter().find(|d| name(d) == needle) {
+        return Ok(d.clone());
+    }
     devices
         .into_iter()
         .find(|d| {
@@ -510,6 +515,17 @@ where
         None,
     )?;
     Ok(stream)
+}
+
+/// Names of the input devices and of the default one.
+pub fn input_device_names() -> (Vec<String>, Option<String>) {
+    let host = cpal::default_host();
+    let default = host.default_input_device().and_then(|d| d.name().ok());
+    let names = host
+        .input_devices()
+        .map(|it| it.filter_map(|d| d.name().ok()).collect())
+        .unwrap_or_default();
+    (names, default)
 }
 
 pub fn list_devices() -> Result<()> {

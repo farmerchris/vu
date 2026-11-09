@@ -123,7 +123,7 @@ impl Scale {
     }
 
     /// A readout value: dBFS, VU on the VU scale, LUFS on the loudness scale.
-    fn fmt(self, db: f32) -> String {
+    pub fn fmt(self, db: f32) -> String {
         match self {
             Scale::Db { .. } => fmt_db(db),
             Scale::Vu { reference } if db.is_finite() && db > -140.0 => {

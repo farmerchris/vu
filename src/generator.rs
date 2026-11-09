@@ -1,5 +1,7 @@
-//! Synthetic test signals: `sine:FREQ[:DB]`, `square:FREQ[:DB]`, `noise[:DB]`,
-//! `pink[:DB]`, `sweep:F0:F1:SECS[:DB[:END_DB]]`, `silence`.
+//! Synthetic test signals: `sine[:FREQ[:DB]]`, `square[:FREQ[:DB]]`,
+//! `noise[:DB]`, `pink[:DB]`, `sweep[:F0[:F1[:SECS[:DB[:END_DB]]]]]`,
+//! `silence`. Every field is optional: a missing or empty one takes its
+//! default (`DEFAULTS`), so `sweep`, `sine::-20` and `sweep:100::5` all work.
 
 use anyhow::{bail, Context, Result};
 use std::f64::consts::PI;
@@ -32,50 +34,62 @@ pub struct GenSpec {
     pub level_db: f64,
 }
 
+/// Default tone frequency (Hz), sweep range (Hz) and sweep duration (s).
+pub const DEFAULT_FREQ: f64 = 1000.0;
+pub const DEFAULT_SWEEP: (f64, f64, f64) = (20.0, 20000.0, 10.0);
+/// Default peak levels (dBFS): tones and sweeps, and noise (whose peaks sit
+/// well above its RMS).
+pub const DEFAULT_DB: f64 = -6.0;
+pub const DEFAULT_NOISE_DB: f64 = -12.0;
+
+/// The `-g` value used when none is given.
+pub const DEFAULT_SPEC: &str = "sine";
+
 pub fn parse_spec(s: &str) -> Result<GenSpec> {
     let parts: Vec<&str> = s.split(':').map(str::trim).collect();
-    let num = |i: usize, what: &str| -> Result<f64> {
-        parts
-            .get(i)
-            .with_context(|| format!("generator '{s}' is missing {what}"))?
-            .parse::<f64>()
-            .with_context(|| format!("generator '{s}': invalid {what}"))
-    };
-    let opt_db = |i: usize, default: f64| -> Result<f64> {
-        match parts.get(i) {
+    // Field `i` as a number, or `default` when missing or empty.
+    let field = |i: usize, what: &str, default: f64| -> Result<f64> {
+        match parts.get(i).filter(|v| !v.is_empty()) {
             None => Ok(default),
             Some(v) => v
                 .parse::<f64>()
-                .with_context(|| format!("generator '{s}': invalid level")),
+                .with_context(|| format!("generator '{s}': invalid {what} '{v}'")),
         }
     };
     let (kind, db_idx, max_parts) = match parts[0].to_ascii_lowercase().as_str() {
         "sine" => (
             GenKind::Sine {
-                freq: num(1, "frequency")?,
+                freq: field(1, "frequency", DEFAULT_FREQ)?,
             },
             2,
             3,
         ),
         "square" => (
             GenKind::Square {
-                freq: num(1, "frequency")?,
+                freq: field(1, "frequency", DEFAULT_FREQ)?,
             },
             2,
             3,
         ),
         "noise" | "white" => (GenKind::White, 1, 2),
         "pink" => (GenKind::Pink, 1, 2),
-        "sweep" => (
-            GenKind::Sweep {
-                f0: num(1, "start frequency")?,
-                f1: num(2, "end frequency")?,
-                secs: num(3, "duration")?,
-                end_db: parts.get(5).map(|_| num(5, "end level")).transpose()?,
-            },
-            4,
-            6,
-        ),
+        "sweep" => {
+            let (f0, f1, secs) = DEFAULT_SWEEP;
+            let end_db = match parts.get(5).filter(|v| !v.is_empty()) {
+                Some(_) => Some(field(5, "end level", 0.0)?),
+                None => None,
+            };
+            (
+                GenKind::Sweep {
+                    f0: field(1, "start frequency", f0)?,
+                    f1: field(2, "end frequency", f1)?,
+                    secs: field(3, "duration", secs)?,
+                    end_db,
+                },
+                4,
+                6,
+            )
+        }
         "silence" => (GenKind::Silence, 1, 1),
         other => bail!("unknown generator '{other}' (sine, square, noise, pink, sweep, silence)"),
     };
@@ -92,12 +106,12 @@ pub fn parse_spec(s: &str) -> Result<GenSpec> {
         _ => {}
     }
     let default_db = match kind {
-        GenKind::White | GenKind::Pink => -12.0,
-        _ => -6.0,
+        GenKind::White | GenKind::Pink => DEFAULT_NOISE_DB,
+        _ => DEFAULT_DB,
     };
     Ok(GenSpec {
         kind,
-        level_db: opt_db(db_idx, default_db)?,
+        level_db: field(db_idx, "level", default_db)?,
     })
 }
 
@@ -252,13 +266,61 @@ mod tests {
     }
 
     #[test]
+    fn defaults_fill_missing_and_empty_fields() {
+        assert_eq!(
+            parse_spec("sine").unwrap(),
+            GenSpec {
+                kind: GenKind::Sine { freq: 1000.0 },
+                level_db: -6.0
+            }
+        );
+        assert_eq!(
+            parse_spec(DEFAULT_SPEC).unwrap(),
+            parse_spec("sine").unwrap()
+        );
+        assert_eq!(parse_spec("sine::-20").unwrap().level_db, -20.0);
+        assert_eq!(
+            parse_spec("square").unwrap().kind,
+            GenKind::Square { freq: 1000.0 }
+        );
+        let full = GenKind::Sweep {
+            f0: 20.0,
+            f1: 20000.0,
+            secs: 10.0,
+            end_db: None,
+        };
+        assert_eq!(parse_spec("sweep").unwrap().kind, full);
+        assert_eq!(parse_spec("sweep:").unwrap().kind, full);
+        assert_eq!(
+            parse_spec("sweep:100::5").unwrap().kind,
+            GenKind::Sweep {
+                f0: 100.0,
+                f1: 20000.0,
+                secs: 5.0,
+                end_db: None
+            }
+        );
+        let s = parse_spec("sweep::::-30:-6").unwrap();
+        assert_eq!(s.level_db, -30.0);
+        assert_eq!(
+            s.kind,
+            GenKind::Sweep {
+                f0: 20.0,
+                f1: 20000.0,
+                secs: 10.0,
+                end_db: Some(-6.0)
+            }
+        );
+    }
+
+    #[test]
     fn parse_errors() {
         for bad in [
             "",
-            "sine",
             "sine:abc",
             "sine:-5",
-            "sweep:20:200",
+            "sweep:20:x",
+            "sweep:0",
             "bogus",
             "noise:x",
             "sine:1:2:3",

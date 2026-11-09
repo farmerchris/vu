@@ -1,21 +1,41 @@
 [package]
 name = "vu"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-description = "Terminal sound level meter with timeline, spectrogram and graphic equalizer"
+description = "Sound level meter with timeline, spectrogram and graphic equalizer, in the terminal or a window"
 license = "MIT"
+default-run = "vu"
 
 [[bin]]
 name = "vu"
 path = "src/main.rs"
 
+[[bin]]
+name = "vu-gui"
+path = "src/bin/vu-gui.rs"
+required-features = ["gui"]
+
+[features]
+default = ["gui"]
+# The window front end (vu --gui, vu-gui). Without it vu is terminal-only.
+gui = ["dep:eframe", "dep:muda", "dep:objc2", "dep:objc2-app-kit", "dep:objc2-foundation"]
+
 [dependencies]
 anyhow = "1"
 clap = { version = "4.5", features = ["derive"] }
 cpal = "0.15"
+eframe = { version = "0.31", optional = true, features = ["persistence"] }
 hound = "3.5"
 ratatui = "0.29"
 realfft = "3.4"
+
+# The native menu bar and live Dock icon on macOS; other systems use a menu
+# bar in the window.
+[target.'cfg(target_os = "macos")'.dependencies]
+muda = { version = "0.15", optional = true }
+objc2 = { version = "0.6", optional = true }
+objc2-app-kit = { version = "0.3", optional = true, default-features = false, features = ["std", "NSApplication", "NSImage", "NSResponder"] }
+objc2-foundation = { version = "0.3", optional = true, default-features = false, features = ["std", "NSData"] }
 
 [profile.release]
 opt-level = 3

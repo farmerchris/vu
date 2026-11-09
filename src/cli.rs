@@ -99,9 +99,11 @@ pub struct Cli {
     #[arg(short = 'f', long, conflicts_with = "generate")]
     pub file: Option<PathBuf>,
 
-    /// Use a test signal: sine:FREQ[:DB], square:FREQ[:DB], noise[:DB], pink[:DB],
-    /// sweep:F0:F1:SECS[:DB[:END_DB]], silence
-    #[arg(short = 'g', long, value_name = "SPEC")]
+    /// Use a test signal: sine[:FREQ[:DB]], square[:FREQ[:DB]], noise[:DB], pink[:DB],
+    /// sweep[:F0[:F1[:SECS[:DB[:END_DB]]]]], silence. Fields are optional (empty ones
+    /// too, e.g. sine::-20): 1000 Hz, sweep 20-20000 Hz over 10 s, -6 dBFS (noise -12).
+    /// -g alone plays a 1 kHz sine
+    #[arg(short = 'g', long, value_name = "SPEC", num_args = 0..=1, default_missing_value = crate::generator::DEFAULT_SPEC)]
     pub generate: Option<String>,
 
     /// Process file/generator input as fast as possible instead of in real time
@@ -127,6 +129,14 @@ pub struct Cli {
     /// Print a statistics report (peak, RMS, LUFS, dominant frequency) and exit; no UI
     #[arg(long)]
     pub report: bool,
+
+    /// Open the meters in a window instead of the terminal (also: vu-gui)
+    #[arg(long, conflicts_with = "report")]
+    pub gui: bool,
+
+    /// Window mode on macOS: keep the Dock icon still instead of showing live levels
+    #[arg(long)]
+    pub no_dock_meter: bool,
 
     /// Panels to show, comma separated
     #[arg(short = 'p', long, value_enum, value_delimiter = ',', default_values_t = ALL_PANELS.to_vec())]

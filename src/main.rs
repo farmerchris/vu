@@ -1,7 +1,7 @@
 //! vu — terminal sound meter.
 
-use anyhow::{bail, Result};
-use clap::Parser;
+use anyhow::Result;
+use clap::{CommandFactory, FromArgMatches};
 use ratatui::crossterm::event::{self, DisableMouseCapture, EnableMouseCapture};
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{
@@ -11,14 +11,23 @@ use ratatui::crossterm::terminal::{
 use ratatui::prelude::CrosstermBackend;
 use ratatui::Terminal;
 use std::io::{stdout, Stdout};
-use std::sync::atomic::Ordering;
-use std::sync::mpsc::TryRecvError;
 use std::time::{Duration, Instant};
-use vu::analyzer::{Analyzer, AnalyzerConfig};
+use vu::analyzer::Analyzer;
 use vu::app::{Action, App};
 use vu::cli::Cli;
-use vu::source::{SilenceWatch, Source, SourceKind};
+use vu::pump::{self, Pump};
+use vu::source::Source;
 use vu::{recorder, report, source, ui};
+
+#[cfg(feature = "gui")]
+fn gui(cli: Cli, matches: &clap::ArgMatches) -> Result<()> {
+    vu::gui::run(cli, vu::gui::explicit_args(matches))
+}
+
+#[cfg(not(feature = "gui"))]
+fn gui(_cli: Cli, _matches: &clap::ArgMatches) -> Result<()> {
+    anyhow::bail!("this vu was built without the window (cargo feature \"gui\")")
+}
 
 fn main() {
     if let Err(e) = run() {
@@ -28,42 +37,20 @@ fn main() {
 }
 
 fn run() -> Result<()> {
-    let cli = Cli::parse();
+    let matches = Cli::command().get_matches();
+    let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
     if cli.list_devices {
         return source::list_devices();
     }
     cli.validate()?;
     let fast = cli.fast || cli.report;
     let looping = cli.looping && !cli.report;
+    if cli.gui {
+        return gui(cli, &matches);
+    }
     let source = source::open(&cli, fast, looping)?;
+    let acfg = pump::analyzer_config(&cli, &source.info)?;
     let info = &source.info;
-    if let Some(c) = cli.channel {
-        if c > info.channels {
-            bail!("--channel {c} but the input has {} channels", info.channels);
-        }
-    }
-    let acfg = AnalyzerConfig {
-        sample_rate: info.sample_rate,
-        channels: info.channels,
-        fft_size: cli.fft_size,
-        hop: cli.hop(),
-        window: cli.window,
-        weighting: cli.weighting,
-        bands: cli.bands,
-        min_freq: cli.min_freq,
-        max_freq: cli.max_freq,
-        rms_tau: cli.rms_time / 1000.0,
-        peak_decay_db_s: cli.peak_decay,
-        peak_hold_s: cli.peak_hold,
-        band_floor_db: cli.db_min,
-        spectrum_channel: cli.channel.map(|c| c - 1),
-    };
-    if acfg.min_freq >= acfg.top_freq() {
-        bail!(
-            "--min-freq must be below Nyquist ({} Hz)",
-            info.sample_rate / 2
-        );
-    }
     let mut analyzer = Analyzer::new(acfg);
     if cli.report {
         let rec = match &cli.record {
@@ -141,29 +128,9 @@ fn run_tui(cli: &Cli, mut source: Source, mut analyzer: Analyzer) -> Result<()> 
         restore_terminal(mouse);
         r
     });
-    let finished = app.stop_recording();
-    for p in &app.saved_recordings {
-        eprintln!("vu: recorded {}", p.display());
-    }
-    if let Some(e) = source.control.take_error() {
-        eprintln!("vu: {e}");
-    }
-    if app.reopens > 0 {
-        eprintln!(
-            "vu: the input went digitally silent; reopened it {} time(s)",
-            app.reopens
-        );
-    }
-    if let Some(n) = source.dropped_chunks() {
-        eprintln!("vu: {n} audio buffers were dropped because the UI fell behind");
-    }
+    let finished = pump::finish(&mut app, &source);
     res.and(finished)
 }
-
-/// Seconds of exact-zero input before a live device is considered stalled.
-const SILENCE_SECS: f64 = 1.5;
-/// Reopen attempts per stall before reporting the input as silent.
-const MAX_REOPENS: u32 = 3;
 
 fn event_loop(
     term: &mut Term,
@@ -173,86 +140,12 @@ fn event_loop(
     cli: &Cli,
 ) -> Result<()> {
     let frame_dt = Duration::from_secs_f64(1.0 / cli.fps as f64);
-    let ch = source.info.channels;
-    let mut watch =
-        SilenceWatch::new((SILENCE_SECS * (source.info.sample_rate as usize * ch) as f64) as u64);
-    let mut attempts = 0u32;
-    let limit = cli
-        .duration
-        .map(|d| (d * source.info.sample_rate as f64).round() as u64);
-    let live = source.info.kind == SourceKind::Device;
+    let mut pump = Pump::new(cli, &source.info);
     let mut next_frame = Instant::now();
     let mut dirty = true;
     loop {
-        analyzer.set_band_floor(app.display.db_min);
-        if std::mem::take(&mut app.loudness_reset) {
-            analyzer.loudness.reset();
-        }
-        // Ingest, bounded so a fast file scan never starves the UI.
         let budget = Instant::now() + frame_dt.mul_f32(0.7);
-        loop {
-            match source.rx.try_recv() {
-                Ok(mut chunk) => {
-                    if app.ingest_done || (live && app.paused()) {
-                        continue;
-                    }
-                    chunk.truncate(report::truncate_len(
-                        chunk.len(),
-                        ch,
-                        analyzer.samples(),
-                        limit,
-                    ));
-                    if let Some(r) = app.recorder.as_mut() {
-                        if let Err(e) = r.write(&chunk) {
-                            app.recorder = None;
-                            app.flash(format!("record error: {e:#}"));
-                        }
-                    }
-                    analyzer.push(&chunk, |f| app.push_frame(f));
-                    dirty = true;
-                    if source.can_reopen() {
-                        let stalled = watch.feed(&chunk);
-                        if app.input_warning.is_some() && chunk.iter().any(|&x| x != 0.0) {
-                            app.input_warning = None;
-                            app.flash("input restored");
-                            attempts = 0;
-                        }
-                        if stalled {
-                            if attempts < MAX_REOPENS {
-                                attempts += 1;
-                                app.reopens += 1;
-                                app.input_warning = Some(format!("input silent (all zeros), reopening ({attempts}/{MAX_REOPENS})"));
-                                if let Err(e) = source.reopen() {
-                                    app.input_warning = Some(format!("input lost: {e:#}"));
-                                }
-                                watch.reset();
-                            } else {
-                                app.input_warning =
-                                    Some("input is sending pure silence: mic muted, or taken by another app/device?".into());
-                            }
-                        }
-                    }
-                    if limit.is_some_and(|l| analyzer.samples() >= l) {
-                        app.ingest_done = true;
-                        source.control.stop.store(true, Ordering::Relaxed);
-                        if let Err(e) = app.stop_recording() {
-                            app.flash(format!("record error: {e:#}"));
-                        }
-                    }
-                    if Instant::now() >= budget {
-                        break;
-                    }
-                }
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => {
-                    if !app.source_done {
-                        app.source_done = true;
-                        dirty = true;
-                    }
-                    break;
-                }
-            }
-        }
+        dirty |= pump.run(app, analyzer, source, budget);
 
         let now = Instant::now();
         if app.cycle_tick(now) {

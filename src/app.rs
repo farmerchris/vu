@@ -416,6 +416,7 @@ impl MeterMode {
     }
 }
 
+#[derive(Clone)]
 pub struct Display {
     pub panels: [bool; crate::cli::PANEL_COUNT],
     pub db_min: f32,

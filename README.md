@@ -1,6 +1,6 @@
 # vu
 
-A full-screen terminal sound meter written in Rust. It shows:
+A sound meter written in Rust, full-screen in the terminal or in a window (`vu --gui`). It shows:
 
 - **Levels**, in one of three meter modes (`v` cycles RMS → VU → LUFS; `--vu` or `--lufs` picks the starting one). Each mode shows only its own measure, in both the meters and the timeline:
   - **RMS** (default): per-channel RMS bars (300 ms sliding window) with a peak envelope falling at 20 dB per 1.7 s (IEC 60268-18) and a peak-hold marker (held 1.5 s, then falling at 20 dB/s), on a dBFS scale. Readouts: `peak hold rms avg`.
@@ -17,8 +17,9 @@ By default it reads the default audio input. It can also read a WAV file or a bu
 ## Build
 
 ```sh
-cargo build --release      # binary: target/release/vu
+cargo build --release      # binaries: target/release/vu and target/release/vu-gui (cargo run starts vu)
 cargo test                 # unit + integration tests
+cargo build --release --no-default-features   # terminal only, without the window's dependencies
 ```
 
 On macOS, the terminal needs microphone permission (System Settings → Privacy & Security → Microphone). Without it the input is silent.
@@ -41,11 +42,27 @@ vu -p spectrogram,eq                 # only some panels
 vu -p all --cycle-views              # demo: every panel, meter modes stepping every 3 s
 vu -f song.wav --report              # print statistics, no UI
 vu -g sine:997:-20 -t 3 --report     # check the loudness meter
+vu --gui                             # the same meters in a window (or: vu-gui)
 ```
 
-Test signals for `-g`: `sine:FREQ[:DB]`, `square:FREQ[:DB]`, `noise[:DB]`, `pink[:DB]`, `sweep:F0:F1:SECS[:DB[:END_DB]]` (with `END_DB` the level also ramps from `DB` to `END_DB` across each sweep, e.g. `sweep:100:800:5:-20:-10`), `silence`.
+Test signals for `-g`: `sine[:FREQ[:DB]]`, `square[:FREQ[:DB]]`, `noise[:DB]`, `pink[:DB]`, `sweep[:F0[:F1[:SECS[:DB[:END_DB]]]]]` (with `END_DB` the level also ramps from `DB` to `END_DB` across each sweep, e.g. `sweep:100:800:5:-20:-10`), `silence`. Every field is optional, and an empty one also takes its default, so you can set a later field alone:
 
-Other options (see `vu --help`): `--fft-size`, `--hop`, `--window`, `-w/--weighting a|c|z`, `-b/--bands`, `--min-freq`, `--max-freq`, `--freq-scale`, `--db-min`, `--db-max`, `--spec-floor` (spectrogram colour floor, default −90 dB: each FFT bin holds only a small share of broadband energy, so a −70 floor would hide quiet high-frequency content), `--meter-floor`, `--rms-time`, `--rms-aes17` (show RMS 3 dB higher, so a sine's RMS reads its peak, the AES17 convention VU mode already uses), `--vu`, `--lufs`, `--lufs-target`, `--vu-ref`, `--cycle-views[=SECS]` (step through the meter modes every SECS seconds, default 3), `--piano`, `--peak-decay`, `--peak-hold`, `--colormap`, `--color auto|truecolor|256`, `--fps`, `-z/--span SECONDS` (time shown across the charts, default 10), `--history`, `--channel`, `--channels`, `--sample-rate`, `--buffer-size`, `--record-format int16|int24|float32`, `--no-mouse`.
+| Field | Default |
+|---|---|
+| `FREQ` (sine, square) | 1000 Hz |
+| `F0`, `F1`, `SECS` (sweep) | 20 Hz, 20000 Hz, 10 s, repeating |
+| `DB` (peak level) | −6 dBFS; −12 dBFS for noise and pink |
+| `END_DB` (sweep) | none: constant level |
+
+```sh
+vu -g                    # 1 kHz sine at -6 dBFS
+vu -g sweep              # 20 Hz - 20 kHz over 10 s
+vu -g sine::-20          # 1 kHz at -20 dBFS
+vu -g sweep:100::5       # 100 Hz - 20 kHz over 5 s
+vu -g sweep::::-30:-6    # full sweep, level rising from -30 to -6 dBFS
+```
+
+Other options (see `vu --help`): `--fft-size`, `--hop`, `--window`, `-w/--weighting a|c|z`, `-b/--bands`, `--min-freq`, `--max-freq`, `--freq-scale`, `--db-min`, `--db-max`, `--spec-floor` (spectrogram colour floor, default −90 dB: each FFT bin holds only a small share of broadband energy, so a −70 floor would hide quiet high-frequency content), `--meter-floor`, `--rms-time`, `--rms-aes17` (show RMS 3 dB higher, so a sine's RMS reads its peak, the AES17 convention VU mode already uses), `--vu`, `--lufs`, `--lufs-target`, `--vu-ref`, `--cycle-views[=SECS]` (step through the meter modes every SECS seconds, default 3), `--piano`, `--gui`, `--no-dock-meter`, `--peak-decay`, `--peak-hold`, `--colormap`, `--color auto|truecolor|256`, `--fps`, `-z/--span SECONDS` (time shown across the charts, default 10), `--history`, `--channel`, `--channels`, `--sample-rate`, `--buffer-size`, `--record-format int16|int24|float32`, `--no-mouse`.
 
 ### Loudness targets
 
@@ -62,6 +79,30 @@ Other options (see `vu --help`): `--fft-size`, `--hop`, `--window`, `-w/--weight
 | `netflix` | −27 | Netflix (dialogue-gated) |
 
 Broadcast targets are delivery specs, measured as integrated loudness. Streaming targets are where playback is turned down to, so louder masters are allowed but get quieter on playback. Services change these from time to time; check the current spec before delivering.
+
+## Window
+
+`vu --gui` (or `vu-gui`, which takes the same options) shows the same panels in a resizable window, drawn on the GPU with [egui](https://github.com/emilk/egui). Both front ends share the analysis, the app state and the key bindings below, so every key works in both.
+
+On macOS the menus are in the system menu bar; elsewhere they are a menu bar in the window. Both are built from one description and set the same state as the keys:
+
+- **File**: start / stop recording; close (⌘W) and quit (⌘Q) finish a recording properly.
+- **View**: show / hide each panel, colour map, frequency scale, zoom, chart floor and ceiling, full screen.
+- **Input**: **Source** (the default input, every input device, and test signals; the list follows devices as they are plugged in and out, and choosing one starts a fresh measurement with the same display settings), pause the input, hold the display, back to live, oldest data.
+- **Meter**: meter mode, demo cycling, loudness target presets, VU reference, RMS as AES17, reset loudness, reset max and clips.
+- **Help**: the keys and readout legend.
+
+On macOS the Dock icon is a live level meter, as Activity Monitor's is, mirroring the meter bars of the current mode in their colours and behaviour, a few times a second:
+
+- **RMS**: a column per channel in the green / yellow / red zones, with the dim peak envelope above the RMS level and the white hold cap.
+- **VU**: a column per channel, green below 0 VU and red above, with the hold cap.
+- **LUFS**: M in soft blue with its max-M cap, and S in sage green with the integrated-loudness pointer, both yellow above the target.
+
+View → Live Dock Icon (or `--no-dock-meter`) keeps the icon still instead.
+
+The window remembers its settings between sessions: the panels, meter mode, colour map, frequency scale, chart floors and ceiling, loudness target, VU reference, RMS as AES17, zoom, the Dock icon setting and the input (a device or test signal, not a file), as well as its position and size. Options given on the command line override the saved values for that run. They are kept in the app's data directory (`~/Library/Application Support/vu/` on macOS).
+
+Click or drag on the spectrogram or timeline to place the cursor; scroll to move it.
 
 ## Keys
 
