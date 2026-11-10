@@ -308,7 +308,7 @@ impl eframe::App for Gui {
         if std::mem::take(&mut self.app.restart_input) {
             if let Some(choice) = self.sources.current.clone() {
                 let why = self.app.input_warning.take().unwrap_or_default();
-                self.switch(ctx, choice);
+                self.switch(choice);
                 self.app.flash(format!("{why}; input restarted"));
             }
         }
@@ -345,7 +345,7 @@ impl eframe::App for Gui {
 
         match req {
             Some(Request::Quit) => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
-            Some(Request::Open(choice)) => self.switch(ctx, choice),
+            Some(Request::Open(choice)) => self.switch(choice),
             Some(Request::ToggleDockMeter) => self.sources.dock_live = !self.sources.dock_live,
             Some(Request::Reset) => self.reset(ctx),
             Some(Request::SetDockStyle(s)) => self.sources.dock_style = s,
@@ -406,7 +406,7 @@ impl Gui {
         self.app.flash("settings reset to defaults");
     }
 
-    fn switch(&mut self, ctx: &egui::Context, choice: Choice) {
+    fn switch(&mut self, choice: Choice) {
         let mut cli = self.cli.clone();
         (cli.file, cli.generate, cli.device, cli.record) = (None, None, None, None);
         match &choice {

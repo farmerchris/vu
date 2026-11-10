@@ -116,6 +116,9 @@ impl Pump {
             self.mic_mode_checked = Instant::now();
             if source.mic_mode_changed() {
                 self.follow_mic_mode(app, source);
+            } else if source.name_mic_mode() {
+                app.info.name = source.info.name.clone();
+                app.flash(format!("input: {}", source.info.name));
             }
         }
         if source.waiting.is_some() && !self.wait_for_input(app, source) {

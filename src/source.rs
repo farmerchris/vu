@@ -186,6 +186,26 @@ impl Source {
         self.voice.is_some_and(|v| v != mic_mode_wants_voice())
     }
 
+    /// Name a voice-processing input after the Mic Mode now in effect, which
+    /// the user can change between Voice Isolation and Wide Spectrum while it
+    /// runs. Returns whether the name changed.
+    pub fn name_mic_mode(&mut self) -> bool {
+        #[cfg(target_os = "macos")]
+        if self.voice == Some(true) && self._input.is_some() {
+            if let (Some((device, _)), Some(mode)) = (
+                self.info.name.rsplit_once(" ("),
+                crate::mic_mode_mac::active(),
+            ) {
+                let name = format!("{device} ({mode})");
+                if name != self.info.name {
+                    self.info.name = name;
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     /// Whether this source can be reopened (live devices only).
     pub fn can_reopen(&self) -> bool {
         self.device.is_some()
