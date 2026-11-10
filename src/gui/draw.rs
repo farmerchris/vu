@@ -994,25 +994,84 @@ fn draw_time_axis(p: &Painter, plot: Rect, app: &App) {
 }
 
 /// The status line: source, state, time, recording and messages.
+/// A status mark, drawn as a shape: the terminal's glyphs for these
+/// (● ❚❚ ◆ ■) are not in egui's fonts.
+#[derive(Clone, Copy)]
+enum Mark {
+    Dot,
+    Play,
+    Pause,
+    Hold,
+    Stop,
+}
+
+/// A mark and a bold label in one colour.
+fn badge(ui: &mut Ui, mark: Mark, text: &str, color: Color32) {
+    let h = ui.text_style_height(&egui::TextStyle::Body);
+    let (rect, _) = ui.allocate_exact_size(Vec2::splat(h), egui::Sense::hover());
+    let c = rect.center();
+    let r = h * 0.3;
+    let p = ui.painter();
+    match mark {
+        Mark::Dot => {
+            p.circle_filled(c, r, color);
+        }
+        Mark::Play => {
+            p.add(Shape::convex_polygon(
+                vec![
+                    c + Vec2::new(-r * 0.8, -r),
+                    c + Vec2::new(r, 0.0),
+                    c + Vec2::new(-r * 0.8, r),
+                ],
+                color,
+                Stroke::NONE,
+            ));
+        }
+        Mark::Pause => {
+            for dx in [-r * 0.55, r * 0.55] {
+                let bar =
+                    Rect::from_center_size(c + Vec2::new(dx, 0.0), Vec2::new(r * 0.6, r * 2.0));
+                p.rect_filled(bar, 1.0, color);
+            }
+        }
+        Mark::Hold => {
+            p.add(Shape::convex_polygon(
+                vec![
+                    c + Vec2::new(0.0, -r),
+                    c + Vec2::new(r, 0.0),
+                    c + Vec2::new(0.0, r),
+                    c + Vec2::new(-r, 0.0),
+                ],
+                color,
+                Stroke::NONE,
+            ));
+        }
+        Mark::Stop => {
+            p.rect_filled(Rect::from_center_size(c, Vec2::splat(r * 1.7)), 1.0, color);
+        }
+    }
+    ui.label(RichText::new(text).strong().color(color));
+}
+
 pub fn status(ui: &mut Ui, app: &App) {
     let a = &app.analysis;
     ui.horizontal(|ui| {
         ui.label(RichText::new(&app.info.name).strong().color(TEXT));
         ui.label(RichText::new(format!("{} Hz {} ch", a.sample_rate, a.channels)).color(LABEL));
-        let (mode, color) = if app.ingest_done {
-            ("■ DONE", Color::Blue)
+        let (mark, mode, color) = if app.ingest_done {
+            (Mark::Stop, "DONE", Color::Blue)
         } else if app.source_done {
-            ("■ END", Color::Blue)
+            (Mark::Stop, "END", Color::Blue)
         } else if app.paused() {
-            ("❚❚ PAUSED", Color::Magenta)
+            (Mark::Pause, "PAUSED", Color::Magenta)
         } else if !app.view.follow {
-            ("◆ HOLD", Color::Yellow)
+            (Mark::Hold, "HOLD", Color::Yellow)
         } else if app.info.kind == SourceKind::Device {
-            ("● LIVE", Color::Green)
+            (Mark::Dot, "LIVE", Color::Green)
         } else {
-            ("▶ PLAY", Color::Green)
+            (Mark::Play, "PLAY", Color::Green)
         };
-        ui.label(RichText::new(mode).strong().color(c32(color)));
+        badge(ui, mark, mode, c32(color));
         if let Some(fr) = app.history.get(app.view.cursor) {
             ui.label(
                 RichText::new(format!("t {}", fmt_time(fr.time)))
@@ -1032,11 +1091,7 @@ pub fn status(ui: &mut Ui, app: &App) {
         }
         if let Some(r) = &app.recorder {
             let secs = r.samples as f64 / (a.channels.max(1) as f64 * a.sample_rate as f64);
-            ui.label(
-                RichText::new(format!("● REC {secs:.1}s"))
-                    .strong()
-                    .color(c32(Color::Red)),
-            );
+            badge(ui, Mark::Dot, &format!("REC {secs:.1}s"), c32(Color::Red));
         }
         if let Some((msg, at)) = &app.message {
             if at.elapsed().as_secs_f32() < 4.0 {
@@ -1095,4 +1150,34 @@ pub fn help(ctx: &egui::Context, app: &mut App) {
                 });
         });
     app.show_help = open;
+}
+
+#[cfg(test)]
+mod tests {
+    use eframe::egui::{Context, FontId};
+
+    /// Text the window shows draws with egui's fonts, not as empty boxes.
+    #[test]
+    fn window_text_has_glyphs() {
+        let ctx = Context::default();
+        let _ = ctx.run(Default::default(), |_| {});
+        let missing = |font: &FontId, text: &str| -> Vec<char> {
+            ctx.fonts(|f| text.chars().filter(|&c| !f.has_glyph(font, c)).collect())
+        };
+        let keys: String = crate::ui::HELP
+            .iter()
+            .chain(crate::ui::LEGEND)
+            .map(|(k, _)| *k)
+            .collect();
+        assert_eq!(missing(&FontId::monospace(14.0), &keys), Vec::<char>::new());
+        let text: String = crate::ui::HELP
+            .iter()
+            .chain(crate::ui::LEGEND)
+            .map(|(_, v)| *v)
+            .collect();
+        assert_eq!(
+            missing(&FontId::proportional(14.0), &(text + "⚠✔")),
+            Vec::<char>::new()
+        );
+    }
 }

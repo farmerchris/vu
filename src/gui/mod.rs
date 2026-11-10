@@ -1,4 +1,4 @@
-//! Window front end (`vu --gui`, `vu-gui`), drawn with egui. It shares the
+//! Window front end (`vu-meter --gui`, `vu-meter-gui`), drawn with egui. It shares the
 //! terminal UI's state, keys and analysis ([`App`], [`Pump`]); only drawing
 //! and input translation are its own.
 
@@ -68,6 +68,49 @@ impl Session {
     }
 }
 
+/// How long [`detach`] waits for the window to fail before returning.
+const DETACH_GRACE: Duration = Duration::from_millis(1500);
+
+/// Start this command again with `--foreground`, in the background and its
+/// own process group (so the terminal's Ctrl-C and closing it leave the
+/// window alone), and return. Its output goes to a log in the temporary
+/// directory; if it fails within a moment (a device that will not open, say)
+/// the error is shown here and returned.
+pub fn detach() -> Result<()> {
+    #[cfg(unix)]
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
+    let log_path = std::env::temp_dir().join(format!("vu-meter-{}.log", std::process::id()));
+    let log = std::fs::File::create(&log_path)?;
+    let mut cmd = Command::new(std::env::current_exe()?);
+    cmd.args(std::env::args_os().skip(1))
+        .arg("--foreground")
+        .stdin(Stdio::null())
+        .stdout(log.try_clone()?)
+        .stderr(log);
+    #[cfg(unix)]
+    cmd.process_group(0);
+    let mut child = cmd.spawn()?;
+    let start = Instant::now();
+    while start.elapsed() < DETACH_GRACE {
+        if let Some(status) = child.try_wait()? {
+            let out = std::fs::read_to_string(&log_path).unwrap_or_default();
+            let _ = std::fs::remove_file(&log_path);
+            if status.success() {
+                print!("{out}");
+                return Ok(());
+            }
+            eprint!("{out}");
+            std::process::exit(status.code().unwrap_or(1));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    Ok(())
+}
+
+/// The window's size on first run and after Reset to Defaults.
+const WINDOW_SIZE: [f32; 2] = [1280.0, 800.0];
+
 /// Ids of the arguments given on the command line (not defaults), which
 /// take precedence over saved settings.
 pub fn explicit_args(m: &clap::ArgMatches) -> HashSet<String> {
@@ -83,10 +126,13 @@ pub fn explicit_args(m: &clap::ArgMatches) -> HashSet<String> {
 pub fn run(mut cli: Cli, explicit: HashSet<String>) -> Result<()> {
     settings::apply(&mut cli, &settings::load(), &explicit);
     let session = Session::open(&cli)?;
-    let title = format!("vu — {}", session.source.info.name);
+    let title = format!("VU Meter — {}", session.source.info.name);
+    let mut sources = input::MenuState::new(input::MenuState::from_cli(&cli), !cli.no_dock_meter);
+    sources.dock_style = cli.dock_style;
     let gui = Gui {
         frame_dt: Duration::from_secs_f64(1.0 / cli.fps as f64),
-        sources: input::MenuState::new(input::MenuState::from_cli(&cli), !cli.no_dock_meter),
+        title: title.clone(),
+        sources,
         devices: watch_devices(),
         cli,
         app: session.app,
@@ -105,7 +151,7 @@ pub fn run(mut cli: Cli, explicit: HashSet<String>) -> Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_title(title)
             .with_icon(std::sync::Arc::new(icon::icon()))
-            .with_inner_size([1280.0, 800.0])
+            .with_inner_size(WINDOW_SIZE)
             .with_min_inner_size([640.0, 420.0]),
         ..Default::default()
     };
@@ -149,6 +195,8 @@ struct Gui {
     sources: input::MenuState,
     devices: Receiver<(Vec<String>, Option<String>)>,
     frame_dt: Duration,
+    /// The window title shown, which names the input.
+    title: String,
     spec: draw::SpecView,
     /// Unused scroll distance, toward the next cursor step.
     scroll: f32,
@@ -163,7 +211,7 @@ struct Gui {
 impl Drop for Gui {
     fn drop(&mut self) {
         if let Err(e) = pump::finish(&mut self.app, &self.source) {
-            eprintln!("vu: {e:#}");
+            eprintln!("vu-meter: {e:#}");
         }
     }
 }
@@ -251,6 +299,19 @@ impl eframe::App for Gui {
         self.pump
             .run(&mut self.app, &mut self.analyzer, &mut self.source, budget);
         self.app.cycle_tick(t0);
+        // The input's name changes on switching inputs, and with the Mic Mode.
+        let title = format!("VU Meter — {}", self.source.info.name);
+        if title != self.title {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
+            self.title = title;
+        }
+        if std::mem::take(&mut self.app.restart_input) {
+            if let Some(choice) = self.sources.current.clone() {
+                let why = self.app.input_warning.take().unwrap_or_default();
+                self.switch(ctx, choice);
+                self.app.flash(format!("{why}; input restarted"));
+            }
+        }
         let mut req = None;
         for k in input::key_events(ctx) {
             if self.app.handle_key(k) == Action::Quit {
@@ -286,10 +347,13 @@ impl eframe::App for Gui {
             Some(Request::Quit) => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
             Some(Request::Open(choice)) => self.switch(ctx, choice),
             Some(Request::ToggleDockMeter) => self.sources.dock_live = !self.sources.dock_live,
+            Some(Request::Reset) => self.reset(ctx),
+            Some(Request::SetDockStyle(s)) => self.sources.dock_style = s,
             None => {}
         }
         #[cfg(target_os = "macos")]
-        self.dock.update(&self.app, self.sources.dock_live);
+        self.dock
+            .update(&self.app, self.sources.dock_live, self.sources.dock_style);
         self.app.fps.tick(t0, t0.elapsed());
         ctx.request_repaint_after(self.frame_dt);
     }
@@ -321,6 +385,27 @@ impl Gui {
 
     /// Switch to another input, starting a fresh session with the same
     /// display settings. On failure the current input carries on.
+    /// Put the display, zoom, Dock icon and window size back to the built-in
+    /// defaults (not the command line's), and save them. The input and any
+    /// recording carry on.
+    fn reset(&mut self, ctx: &egui::Context) {
+        use clap::Parser;
+        let defaults = Cli::parse_from(["vu"]);
+        let d = &self.app.display;
+        self.app.display = crate::app::Display {
+            clip_frames: d.clip_frames,
+            ..crate::app::Display::new(&defaults, d.color_mode, self.app.view.dt)
+        };
+        self.app.view.span_secs = defaults.span;
+        self.app.cycle = None;
+        self.sources.dock_live = !defaults.no_dock_meter;
+        self.sources.dock_style = defaults.dock_style;
+        self.spec = draw::SpecView::default();
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(WINDOW_SIZE.into()));
+        settings::save(&settings::capture(&self.app, &self.sources));
+        self.app.flash("settings reset to defaults");
+    }
+
     fn switch(&mut self, ctx: &egui::Context, choice: Choice) {
         let mut cli = self.cli.clone();
         (cli.file, cli.generate, cli.device, cli.record) = (None, None, None, None);
@@ -337,15 +422,7 @@ impl Gui {
                 return;
             }
         };
-        // Display settings carry over; their timing follows the new input.
-        let display = self.app.display.clone();
-        s.app.display = crate::app::Display {
-            clip_frames: s.app.display.clip_frames,
-            ..display
-        };
-        s.app.view.span_secs = self.app.view.span_secs;
-        s.app.show_help = self.app.show_help;
-        s.app.cycle = self.app.cycle;
+        s.app.keep_view(&self.app);
         s.app.flash(format!("input: {label}"));
         if let Err(e) = pump::finish(&mut self.app, &self.source) {
             s.app.flash(format!("record error: {e:#}"));
@@ -357,10 +434,6 @@ impl Gui {
         self.pump = s.pump;
         self.spec = draw::SpecView::default();
         self.sources.current = Some(choice);
-        ctx.send_viewport_cmd(egui::ViewportCommand::Title(format!(
-            "vu — {}",
-            self.source.info.name
-        )));
     }
 
     fn body(&mut self, ui: &mut egui::Ui) {

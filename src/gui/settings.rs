@@ -5,7 +5,7 @@
 //! that run. (eframe keeps the window's position and size itself.)
 //!
 //! Stored as `key=value` lines in the app's data directory (on macOS
-//! `~/Library/Application Support/vu/settings.txt`); unknown or invalid
+//! `~/Library/Application Support/vu-meter/settings.txt`); unknown or invalid
 //! lines are ignored.
 
 use super::input::MenuState;
@@ -18,7 +18,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 
 /// The app id eframe stores the window geometry under, and our directory.
-pub const APP_ID: &str = "vu";
+pub const APP_ID: &str = "vu-meter";
 
 pub type Map = BTreeMap<String, String>;
 
@@ -83,6 +83,7 @@ pub fn capture(app: &App, menu: &MenuState) -> Map {
     put("rms_aes17", (d.rms_offset != 0.0).to_string());
     put("span", app.view.span_secs.to_string());
     put("dock_meter", menu.dock_live.to_string());
+    put("dock_style", name(&menu.dock_style));
     m
 }
 
@@ -149,6 +150,14 @@ pub fn apply(cli: &mut Cli, saved: &Map, explicit: &HashSet<String>) {
     }
     if let (false, Some(v)) = (given(&["no_dock_meter"]), flag("dock_meter")) {
         cli.no_dock_meter = !v;
+    }
+    if !given(&["dock_style"]) {
+        if let Some(s) = saved
+            .get("dock_style")
+            .and_then(|v| crate::cli::DockStyle::from_str(v, true).ok())
+        {
+            cli.dock_style = s;
+        }
     }
     if cli.validate().is_err() {
         *cli = original;

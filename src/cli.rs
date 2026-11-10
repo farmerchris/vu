@@ -9,6 +9,16 @@ use anyhow::{bail, Result};
 use clap::{Parser, ValueEnum};
 use std::path::PathBuf;
 
+/// How the live Dock icon shows the levels (window mode, macOS).
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, ValueEnum)]
+pub enum DockStyle {
+    /// LED columns, like the meter bars
+    #[default]
+    Bars,
+    /// An analogue meter with a needle
+    Needle,
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
 pub enum Panel {
     /// Level meters (RMS, VU or LUFS mode; v cycles)
@@ -73,18 +83,18 @@ pub fn panel_set(list: &[Panel], piano: bool) -> [bool; PANEL_COUNT] {
 
 #[derive(Parser, Debug, Clone)]
 #[command(
-    name = "vu",
+    name = "vu-meter",
     version,
     about = "Terminal sound meter: levels, loudness, timeline, spectrogram and graphic equalizer",
     after_help = "KEYS: \u{2190}/\u{2192} scroll (shift = x10), PgUp/PgDn page, Home/End oldest/live, \
 space hold, p pause, R record, r reset loudness, +/- zoom, 1-5 toggle panels, c colormap, s freq scale, v meter mode, \
 [ ] floor, ? help, q quit\n\n\
-EXAMPLES:\n  vu                              meter the default input\n  \
-vu -f song.wav                  play a file through the meters in real time\n  \
-vu -f song.wav --fast           analyze the whole file instantly, then browse it\n  \
-vu -r take.wav                  meter and record the default input\n  \
-vu -g sweep:20:20000:10 -p spectrogram,eq\n  \
-vu -f song.wav --report         print peak/RMS/LUFS statistics without the UI"
+EXAMPLES:\n  vu-meter                        meter the default input\n  \
+vu-meter -f song.wav            play a file through the meters in real time\n  \
+vu-meter -f song.wav --fast     analyze the whole file instantly, then browse it\n  \
+vu-meter -r take.wav            meter and record the default input\n  \
+vu-meter -g sweep:20:20000:10 -p spectrogram,eq\n  \
+vu-meter -f song.wav --report   print peak/RMS/LUFS statistics without the UI"
 )]
 pub struct Cli {
     /// Input device: index or case-insensitive name substring (see --list-devices)
@@ -130,13 +140,21 @@ pub struct Cli {
     #[arg(long)]
     pub report: bool,
 
-    /// Open the meters in a window instead of the terminal (also: vu-gui)
+    /// Open the meters in a window instead of the terminal (also: vu-meter-gui)
     #[arg(long, conflicts_with = "report")]
     pub gui: bool,
+
+    /// Window mode: stay attached to the terminal instead of returning to the prompt
+    #[arg(long)]
+    pub foreground: bool,
 
     /// Window mode on macOS: keep the Dock icon still instead of showing live levels
     #[arg(long)]
     pub no_dock_meter: bool,
+
+    /// Window mode on macOS: how the live Dock icon shows the levels
+    #[arg(long, value_enum, default_value = "bars")]
+    pub dock_style: DockStyle,
 
     /// Panels to show, comma separated
     #[arg(short = 'p', long, value_enum, value_delimiter = ',', default_values_t = ALL_PANELS.to_vec())]

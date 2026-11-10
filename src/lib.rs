@@ -6,13 +6,19 @@
 pub mod analyzer;
 pub mod app;
 pub mod cli;
+#[cfg(target_os = "macos")]
+mod device_mac;
 pub mod dsp;
 pub mod generator;
 #[cfg(feature = "gui")]
 pub mod gui;
 pub mod history;
+#[cfg(target_os = "macos")]
+mod mic_mode_mac;
 pub mod pump;
 pub mod recorder;
 pub mod report;
 pub mod source;
 pub mod ui;
+#[cfg(target_os = "macos")]
+mod voice_mac;

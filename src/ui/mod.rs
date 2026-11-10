@@ -427,7 +427,7 @@ fn render_status(app: &mut App, area: Rect, buf: &mut Buffer) {
     let a = &app.analysis;
     let mut spans = vec![
         Span::styled(
-            " vu ",
+            " vu-meter ",
             Style::default()
                 .fg(Color::Black)
                 .bg(Color::Cyan)

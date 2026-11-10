@@ -6,7 +6,7 @@ use crate::analyzer::{Analyzer, AnalyzerConfig};
 use crate::app::App;
 use crate::cli::Cli;
 use crate::report;
-use crate::source::{SilenceWatch, Source, SourceInfo, SourceKind};
+use crate::source::{RateChanged, SilenceWatch, Source, SourceInfo, SourceKind};
 use anyhow::{bail, Result};
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::TryRecvError;
@@ -16,6 +16,15 @@ use std::time::Instant;
 const SILENCE_SECS: f64 = 1.5;
 /// Reopen attempts per stall before reporting the input as silent.
 const MAX_REOPENS: u32 = 3;
+/// How often a waiting input is checked to see if it can be shared now.
+const CLAIM_EVERY: std::time::Duration = std::time::Duration::from_secs(1);
+/// How often a live input checks the user's Mic Mode (macOS).
+const MIC_MODE_EVERY: std::time::Duration = std::time::Duration::from_secs(1);
+/// A live input may run this much faster than real time (bursts, clock
+/// drift) before the excess is dropped...
+const FAST_RATIO: f64 = 1.25;
+/// ...plus this many seconds of slack.
+const FAST_SLACK_SECS: f64 = 1.0;
 
 /// Analyzer settings from the command line for a source.
 pub fn analyzer_config(cli: &Cli, info: &SourceInfo) -> Result<AnalyzerConfig> {
@@ -56,6 +65,17 @@ pub struct Pump {
     attempts: u32,
     limit: Option<u64>,
     live: bool,
+    /// Live input: when the stream (re)started and frames received since.
+    clock: Option<(Instant, u64)>,
+    /// The input is shown as running fast.
+    fast: bool,
+    /// When a waiting input was last checked.
+    last_claim: Option<Instant>,
+    /// When the Mic Mode was last checked.
+    mic_mode_checked: Instant,
+    sample_rate: f64,
+    /// The options the input was opened with, to open it again.
+    cli: Cli,
 }
 
 impl Pump {
@@ -70,6 +90,12 @@ impl Pump {
                 .duration
                 .map(|d| (d * info.sample_rate as f64).round() as u64),
             live: info.kind == SourceKind::Device,
+            clock: None,
+            fast: false,
+            last_claim: None,
+            mic_mode_checked: Instant::now(),
+            sample_rate: info.sample_rate as f64,
+            cli: cli.clone(),
         }
     }
 
@@ -86,11 +112,23 @@ impl Pump {
         if std::mem::take(&mut app.loudness_reset) {
             analyzer.loudness.reset();
         }
+        if self.live && self.mic_mode_checked.elapsed() >= MIC_MODE_EVERY {
+            self.mic_mode_checked = Instant::now();
+            if source.mic_mode_changed() {
+                self.follow_mic_mode(app, source);
+            }
+        }
+        if source.waiting.is_some() && !self.wait_for_input(app, source) {
+            return false;
+        }
         let ch = source.info.channels;
         let mut dirty = false;
         loop {
-            match source.rx.try_recv() {
+            match source.try_recv() {
                 Ok(mut chunk) => {
+                    if self.live && self.too_fast(app, source, chunk.len() / ch.max(1)) {
+                        continue;
+                    }
                     if app.ingest_done || (self.live && app.paused()) {
                         continue;
                     }
@@ -135,6 +173,98 @@ impl Pump {
         dirty
     }
 
+    /// Open the live input again through voice processing or without it, as
+    /// the user's Mic Mode now asks, carrying on the same analysis (and any
+    /// recording) when the new capture can be shown in the same format.
+    /// Otherwise the app is asked to start the input afresh.
+    fn follow_mic_mode(&mut self, app: &mut App, source: &mut Source) {
+        let mut new = match crate::source::open(&self.cli, false, false) {
+            Ok(s) => s,
+            Err(e) => {
+                app.input_warning = Some(format!("Mic Mode changed; could not reopen: {e:#}"));
+                return;
+            }
+        };
+        if !new.keep_format(&source.info) {
+            app.input_warning = Some("Mic Mode changed".into());
+            app.restart_input = true;
+            return;
+        }
+        new.control.paused.store(app.paused(), Ordering::Relaxed);
+        app.control = new.control.clone();
+        app.info.name = new.info.name.clone();
+        app.input_warning = None;
+        app.flash(format!("input: {}", new.info.name));
+        // The old capture stops when dropped here.
+        *source = new;
+        self.clock = None;
+        self.watch.reset();
+        self.attempts = 0;
+    }
+
+    /// Try now and then to claim an input that is waiting to be shared,
+    /// showing why it waits; returns whether it is running.
+    fn wait_for_input(&mut self, app: &mut App, source: &mut Source) -> bool {
+        if self.last_claim.is_some_and(|t| t.elapsed() < CLAIM_EVERY) {
+            return false;
+        }
+        self.last_claim = Some(Instant::now());
+        match source.claim() {
+            Ok(true) => {
+                app.input_warning = None;
+                app.flash(format!("{}: started", source.info.name));
+                self.clock = None;
+                self.watch.reset();
+                true
+            }
+            Ok(false) => {
+                app.input_warning = Some(format!(
+                    "waiting for {}: {}",
+                    source.info.name,
+                    source.waiting.as_deref().unwrap_or("")
+                ));
+                false
+            }
+            Err(e) => {
+                app.restart_input |= e.is::<RateChanged>();
+                app.input_warning = Some(format!("input lost: {e:#}"));
+                false
+            }
+        }
+    }
+
+    /// Whether a live input has delivered more audio than real time allows
+    /// (counting `frames` just received): a device whose clock or rate
+    /// changed under it, which would otherwise race the timeline ahead. The
+    /// excess is dropped; if the device's rate did change, the app is asked to
+    /// restart the input.
+    fn too_fast(&mut self, app: &mut App, source: &Source, frames: usize) -> bool {
+        let (start, received) = self.clock.get_or_insert((Instant::now(), 0));
+        let allowed =
+            (start.elapsed().as_secs_f64() * FAST_RATIO + FAST_SLACK_SECS) * self.sample_rate;
+        if (*received + frames as u64) as f64 > allowed {
+            if !self.fast {
+                self.fast = true;
+                let from = self.sample_rate as u32;
+                app.input_warning = Some(match source.device_rate().filter(|&r| r != from) {
+                    Some(to) => {
+                        app.restart_input = true;
+                        RateChanged { from, to }.to_string()
+                    }
+                    None => "input running faster than real time; dropping the excess".into(),
+                });
+            }
+            return true;
+        }
+        *received += frames as u64;
+        // Clear the warning once comfortably back within real time.
+        if self.fast && (*received as f64) < allowed - FAST_SLACK_SECS / 2.0 * self.sample_rate {
+            self.fast = false;
+            app.input_warning = None;
+        }
+        false
+    }
+
     /// Reopen a live input that has gone digitally silent, a few times.
     fn watch_input(&mut self, app: &mut App, source: &mut Source, chunk: &[f32]) {
         let stalled = self.watch.feed(chunk);
@@ -146,6 +276,16 @@ impl Pump {
         if !stalled {
             return;
         }
+        if source.bluetooth {
+            // Reopening would pull it back from the phone or computer that
+            // took it; wait for it instead.
+            app.input_warning = Some(
+                "input is silent: the Bluetooth device may be in use by another device \
+                 (choose the input again to take it back)"
+                    .into(),
+            );
+            return;
+        }
         if self.attempts < MAX_REOPENS {
             self.attempts += 1;
             app.reopens += 1;
@@ -153,8 +293,14 @@ impl Pump {
                 "input silent (all zeros), reopening ({}/{MAX_REOPENS})",
                 self.attempts
             ));
-            if let Err(e) = source.reopen() {
-                app.input_warning = Some(format!("input lost: {e:#}"));
+            match source.reopen() {
+                Ok(()) if source.waiting.is_some() => self.last_claim = Some(Instant::now()),
+                Ok(()) => self.clock = None,
+                Err(e) if e.is::<RateChanged>() => {
+                    app.restart_input = true;
+                    app.input_warning = Some(e.to_string());
+                }
+                Err(e) => app.input_warning = Some(format!("input lost: {e:#}")),
             }
             self.watch.reset();
         } else {
@@ -169,19 +315,69 @@ impl Pump {
 pub fn finish(app: &mut App, source: &Source) -> Result<()> {
     let finished = app.stop_recording();
     for p in &app.saved_recordings {
-        eprintln!("vu: recorded {}", p.display());
+        eprintln!("vu-meter: recorded {}", p.display());
     }
     if let Some(e) = source.control.take_error() {
-        eprintln!("vu: {e}");
+        eprintln!("vu-meter: {e}");
     }
     if app.reopens > 0 {
         eprintln!(
-            "vu: the input went digitally silent; reopened it {} time(s)",
+            "vu-meter: the input went digitally silent; reopened it {} time(s)",
             app.reopens
         );
     }
     if let Some(n) = source.dropped_chunks() {
-        eprintln!("vu: {n} audio buffers were dropped because the UI fell behind");
+        eprintln!("vu-meter: {n} audio buffers were dropped because the UI fell behind");
     }
     finished
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::source::Control;
+    use crate::ui::colormap::ColorMode;
+    use clap::Parser;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    /// A live input delivering audio far faster than real time (here an
+    /// unpaced generator posing as one) cannot run the timeline ahead.
+    #[test]
+    fn a_fast_live_input_is_held_to_real_time() {
+        let cli = Cli::try_parse_from(["vu-meter", "-g", "sine"]).unwrap();
+        let mut source = crate::source::open(&cli, true, false).unwrap();
+        let mut analyzer = Analyzer::new(analyzer_config(&cli, &source.info).unwrap());
+        let mut app = App::new(
+            &cli,
+            source.info.clone(),
+            &analyzer,
+            Arc::new(Control::default()),
+            ColorMode::TrueColor,
+        );
+        let mut pump = Pump::new(&cli, &source.info);
+        pump.live = true;
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_millis(300) {
+            pump.run(
+                &mut app,
+                &mut analyzer,
+                &mut source,
+                Instant::now() + Duration::from_millis(5),
+            );
+        }
+        let secs = analyzer.samples() as f64 / source.info.sample_rate as f64;
+        let limit = start.elapsed().as_secs_f64() * FAST_RATIO + FAST_SLACK_SECS;
+        assert!(
+            secs <= limit + 0.2,
+            "{secs} s of audio in {:?}",
+            start.elapsed()
+        );
+        assert!(app
+            .input_warning
+            .as_deref()
+            .unwrap_or("")
+            .contains("faster than real time"));
+        assert!(!app.restart_input, "the rate did not change");
+    }
 }

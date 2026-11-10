@@ -1,4 +1,4 @@
-//! vu — terminal sound meter.
+//! vu-meter — terminal sound meter (`vu-meter --gui` for the window).
 
 use anyhow::Result;
 use clap::{CommandFactory, FromArgMatches};
@@ -21,17 +21,20 @@ use vu::{recorder, report, source, ui};
 
 #[cfg(feature = "gui")]
 fn gui(cli: Cli, matches: &clap::ArgMatches) -> Result<()> {
+    if !cli.foreground {
+        return vu::gui::detach();
+    }
     vu::gui::run(cli, vu::gui::explicit_args(matches))
 }
 
 #[cfg(not(feature = "gui"))]
 fn gui(_cli: Cli, _matches: &clap::ArgMatches) -> Result<()> {
-    anyhow::bail!("this vu was built without the window (cargo feature \"gui\")")
+    anyhow::bail!("this vu-meter was built without the window (cargo feature \"gui\")")
 }
 
 fn main() {
     if let Err(e) = run() {
-        eprintln!("vu: {e:#}");
+        eprintln!("vu-meter: {e:#}");
         std::process::exit(1);
     }
 }
@@ -132,6 +135,45 @@ fn run_tui(cli: &Cli, mut source: Source, mut analyzer: Analyzer) -> Result<()> 
     res.and(finished)
 }
 
+/// Open the live input again (its rate or the Mic Mode changed), keeping
+/// the view. A recording in progress ends.
+fn restart(
+    app: &mut App,
+    analyzer: &mut Analyzer,
+    source: &mut Source,
+    pump: &mut Pump,
+    cli: &Cli,
+) {
+    let why = app.input_warning.take().unwrap_or_default();
+    let opened = source::open(cli, false, false)
+        .and_then(|s| Ok((Analyzer::new(pump::analyzer_config(cli, &s.info)?), s)));
+    let (new_analyzer, new_source) = match opened {
+        Ok(o) => o,
+        Err(e) => {
+            app.input_warning = Some(format!("{why}; could not restart the input: {e:#}"));
+            return;
+        }
+    };
+    let mut new = App::new(
+        cli,
+        new_source.info.clone(),
+        &new_analyzer,
+        new_source.control.clone(),
+        app.display.color_mode,
+    );
+    new.keep_view(app);
+    if let Err(e) = app.stop_recording() {
+        new.flash(format!("record error: {e:#}"));
+    } else {
+        new.flash(format!("{why}; input restarted"));
+    }
+    new.saved_recordings = std::mem::take(&mut app.saved_recordings);
+    new.reopens = app.reopens;
+    // The old source stops when dropped here.
+    *pump = Pump::new(cli, &new_source.info);
+    (*app, *analyzer, *source) = (new, new_analyzer, new_source);
+}
+
 fn event_loop(
     term: &mut Term,
     app: &mut App,
@@ -146,6 +188,10 @@ fn event_loop(
     loop {
         let budget = Instant::now() + frame_dt.mul_f32(0.7);
         dirty |= pump.run(app, analyzer, source, budget);
+        if std::mem::take(&mut app.restart_input) {
+            restart(app, analyzer, source, &mut pump, cli);
+            dirty = true;
+        }
 
         let now = Instant::now();
         if app.cycle_tick(now) {

@@ -4379,6 +4379,8 @@ version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
+ "coreaudio-rs",
+ "coreaudio-sys",
  "cpal",
  "eframe",
  "hound",

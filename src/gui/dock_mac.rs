@@ -4,8 +4,9 @@
 //! second when they change.
 
 use super::color::c32;
-use super::icon::{self, Canvas, Column, SEGMENTS};
+use super::icon::{self, Canvas, Column, Gauge, ARC_STEPS, SEGMENTS};
 use crate::app::{App, MeterMode};
+use crate::cli::DockStyle;
 use crate::ui::colormap::{LU_M_COLOR, LU_OVER_COLOR, LU_S_COLOR};
 use crate::ui::meter::{mode_scale, Scale};
 use objc2::rc::Retained;
@@ -24,9 +25,15 @@ const MAX_COLUMNS: usize = 8;
 
 pub struct DockMeter {
     canvas: Canvas,
-    /// Columns on the Dock icon now; `None` while it shows the still icon.
-    shown: Option<Vec<Column>>,
+    /// What the Dock icon shows now; `None` while it shows the still icon.
+    shown: Option<Shown>,
     last: Instant,
+}
+
+#[derive(PartialEq)]
+enum Shown {
+    Bars(Vec<Column>),
+    Gauge(Gauge),
 }
 
 impl DockMeter {
@@ -41,7 +48,7 @@ impl DockMeter {
 
     /// Redraw the Dock icon from the newest frame, if due and changed; when
     /// not `live`, put the still icon back.
-    pub fn update(&mut self, app: &App, live: bool) {
+    pub fn update(&mut self, app: &App, live: bool, style: DockStyle) {
         if !live {
             if self.shown.is_some() && set_icon(&icon::png(&icon::icon())) {
                 self.shown = None;
@@ -52,12 +59,19 @@ impl DockMeter {
         if now.duration_since(self.last) < INTERVAL {
             return;
         }
-        let cols = columns(app);
-        if self.shown.as_ref() == Some(&cols) {
+        let next = match style {
+            DockStyle::Bars => Shown::Bars(columns(app)),
+            DockStyle::Needle => Shown::Gauge(gauge(app)),
+        };
+        if self.shown.as_ref() == Some(&next) {
             return;
         }
-        if set_icon(&icon::png(&self.canvas.render(&cols))) {
-            self.shown = Some(cols);
+        let image = match &next {
+            Shown::Bars(cols) => self.canvas.render(cols),
+            Shown::Gauge(g) => self.canvas.render_gauge(g),
+        };
+        if set_icon(&icon::png(&image)) {
+            self.shown = Some(next);
             self.last = now;
         }
     }
@@ -188,6 +202,63 @@ fn columns(app: &App) -> Vec<Column> {
         .collect()
 }
 
+/// The current mode as an analogue meter: the needle on the loudest channel
+/// (RMS or VU) or on momentary loudness (LUFS), its peak hold or max M, the
+/// integrated loudness as a pointer, and the scale's zones along the arc in
+/// the bars' colours.
+fn gauge(app: &App) -> Gauge {
+    let scale = mode_scale(app);
+    let target = app.display.lufs_target;
+    let rgb = |c: Color| {
+        let c = c32(c);
+        [c.r(), c.g(), c.b()]
+    };
+    let zones = std::array::from_fn(|i| {
+        let db = scale.db_at((i as f32 + 0.5) / ARC_STEPS as f32);
+        match scale {
+            Scale::Lu { target } if db < target => rgb(LU_M_COLOR),
+            Scale::Lu { .. } => rgb(LU_OVER_COLOR),
+            _ => rgb(scale.colors(db).0),
+        }
+    });
+    let mut g = Gauge {
+        needle: 0.0,
+        hold: None,
+        zones,
+        marker: None,
+    };
+    let Some(f) = app.history.last().and_then(|i| app.history.get(i)) else {
+        return g;
+    };
+    let loudest = |v: &[f32]| v.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let (needle, hold) = match app.display.mode {
+        MeterMode::Rms => {
+            let rms: Vec<f32> = f
+                .rms_avg
+                .iter()
+                .map(|r| r + app.display.rms_offset)
+                .collect();
+            (loudest(&rms), loudest(&f.hold))
+        }
+        MeterMode::Vu => (loudest(&f.vu), loudest(&f.vu_hold)),
+        MeterMode::Lufs => {
+            let pointer = if f.lufs_i >= target {
+                LU_OVER_COLOR
+            } else {
+                Color::Black
+            };
+            g.marker = Some((scale.frac(f.lufs_i), rgb(pointer)));
+            (f.lufs_m, app.session.max_lufs_m)
+        }
+    };
+    // Quantized, so the icon is redrawn only when the needle visibly moves.
+    let q = |x: f32| (x * 400.0).round() / 400.0;
+    g.needle = q(scale.frac(needle));
+    g.hold = Some(q(scale.frac(hold)));
+    g.marker = g.marker.map(|(m, c)| (q(m), c));
+    g
+}
+
 /// A meter bar's readings, as the window draws it.
 struct Bar {
     fill: f32,
@@ -296,6 +367,29 @@ mod tests {
         assert!(
             seg < SEGMENTS && color == rgb(Color::White),
             "below target: white"
+        );
+    }
+
+    #[test]
+    fn gauge_follows_the_mode() {
+        let rms = gauge(&app("--panels=meter"));
+        let vu = gauge(&app("--vu"));
+        let lufs = gauge(&app("--lufs"));
+        // A -18 dBFS sine reads 0 VU: the needle near 71% of the VU scale,
+        // at the start of the red zone.
+        assert!((0.65..0.78).contains(&vu.needle), "{vu:?}");
+        assert_eq!(vu.zones[ARC_STEPS - 1], rgb(Color::Red));
+        assert_eq!(vu.zones[0], rgb(Color::Green));
+        assert!(rms.needle > 0.0 && rms.hold.unwrap() >= rms.needle);
+        assert!(rms.marker.is_none() && vu.marker.is_none());
+        let (m, _) = lufs.marker.expect("integrated pointer");
+        assert!(m > 0.0 && lufs.needle > 0.0);
+        assert_eq!(lufs.zones[0], rgb(LU_M_COLOR));
+        assert_eq!(lufs.zones[ARC_STEPS - 1], rgb(LU_OVER_COLOR));
+        let canvas = Canvas::new(64);
+        assert_ne!(
+            canvas.render_gauge(&rms).rgba,
+            canvas.render_gauge(&vu).rgba
         );
     }
 

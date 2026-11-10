@@ -81,6 +81,8 @@ pub enum Cmd {
     Aes17,
     Cycle,
     DockMeter,
+    DockNeedle,
+    Reset,
     Help,
     Quit,
 }
@@ -109,6 +111,7 @@ pub struct MenuState {
     pub current: Option<Choice>,
     default_name: Option<String>,
     pub dock_live: bool,
+    pub dock_style: crate::cli::DockStyle,
 }
 
 impl MenuState {
@@ -118,6 +121,7 @@ impl MenuState {
             current,
             default_name: None,
             dock_live,
+            dock_style: Default::default(),
         };
         s.set_devices(Vec::new(), None);
         s
@@ -171,6 +175,9 @@ pub enum Request {
     Open(Choice),
     /// Turn the live Dock icon on or off.
     ToggleDockMeter,
+    /// Put every setting and the window size back to the defaults.
+    Reset,
+    SetDockStyle(crate::cli::DockStyle),
 }
 
 /// One entry of a menu.
@@ -253,8 +260,13 @@ pub fn menus(native: bool, sources: &MenuState) -> Vec<(&'static str, Vec<Entry>
     ]);
     // The Dock exists only on macOS, where the menu bar is native.
     if native {
-        view.extend([Sep, check("Live Dock Icon", Cmd::DockMeter, "")]);
+        view.extend([
+            Sep,
+            check("Live Dock Icon", Cmd::DockMeter, ""),
+            check("Dock Icon as Needle Meter", Cmd::DockNeedle, ""),
+        ]);
     }
+    view.extend([Sep, item("Reset to Defaults", Cmd::Reset, "")]);
     // Devices, then test signals, in one list.
     let mut choose = Vec::new();
     for (i, c) in sources.list.iter().enumerate() {
@@ -341,6 +353,14 @@ pub fn apply(app: &mut App, cmd: Cmd, sources: &MenuState) -> Option<Request> {
         }
         Cmd::Help => app.show_help = !app.show_help,
         Cmd::DockMeter => return Some(Request::ToggleDockMeter),
+        Cmd::Reset => return Some(Request::Reset),
+        Cmd::DockNeedle => {
+            use crate::cli::DockStyle;
+            return Some(Request::SetDockStyle(match sources.dock_style {
+                DockStyle::Bars => DockStyle::Needle,
+                DockStyle::Needle => DockStyle::Bars,
+            }));
+        }
         Cmd::Quit => return Some(Request::Quit),
     }
     None
@@ -373,6 +393,7 @@ pub fn is_on(app: &App, cmd: Cmd, sources: &MenuState) -> bool {
         Cmd::Aes17 => d.rms_offset != 0.0,
         Cmd::Cycle => app.cycle.is_some(),
         Cmd::DockMeter => sources.dock_live,
+        Cmd::DockNeedle => sources.dock_style == crate::cli::DockStyle::Needle,
         _ => false,
     }
 }

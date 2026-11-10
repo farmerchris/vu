@@ -1,7 +1,8 @@
 //! The window and Dock icon: a segmented LED level meter on a dark rounded
 //! square, laid out on the macOS icon grid (the body is about 80% of the
 //! canvas, leaving room for its shadow). The static icon shows a still
-//! meter; on macOS the Dock icon is redrawn from the live levels.
+//! meter; on macOS the Dock icon is redrawn from the live levels, as LED
+//! columns or as an analogue meter with a needle.
 
 use eframe::egui::IconData;
 
@@ -32,6 +33,30 @@ const RED: Rgba = [0.94, 0.31, 0.24, 1.0];
 const CAP: Rgba = [0.95, 0.95, 0.97, 1.0];
 const BODY_TOP: Rgba = [0.17, 0.19, 0.26, 1.0];
 const BODY_BOTTOM: Rgba = [0.07, 0.08, 0.12, 1.0];
+
+/// Needle meter geometry (512 canvas): the cream face, the needle's pivot,
+/// the scale arc's radius and width, and the swing either side of centre.
+const FACE: (f32, f32, f32, f32) = (72.0, 92.0, 440.0, 420.0);
+const PIVOT: (f32, f32) = (256.0, 382.0);
+const ARC_R: f32 = 236.0;
+const ARC_W: f32 = 40.0;
+const SWING: f32 = 0.74;
+/// Colour samples along the scale arc.
+pub const ARC_STEPS: usize = 48;
+const FACE_TOP: Rgba = [0.98, 0.94, 0.82, 1.0];
+const FACE_BOTTOM: Rgba = [0.90, 0.83, 0.66, 1.0];
+const INK: Rgba = [0.12, 0.11, 0.10, 1.0];
+
+/// An analogue meter's reading: the needle and peak hold as fractions of
+/// the scale, the scale's colours along the arc (sRGB, left to right), and a
+/// pointer on the arc (integrated loudness) with its colour.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Gauge {
+    pub needle: f32,
+    pub hold: Option<f32>,
+    pub zones: [[u8; 3]; ARC_STEPS],
+    pub marker: Option<(f32, [u8; 3])>,
+}
 
 /// One meter column, like a meter bar: lit segments from the bottom, a dim
 /// envelope above them up to `envelope` (the peak envelope of an RMS bar),
@@ -159,12 +184,149 @@ impl Canvas {
                 );
             }
         }
+        self.finish(px)
+    }
+
+    /// The icon as an analogue meter: a cream face, the scale arc in its
+    /// zone colours with ticks, the hold mark and pointer outside the arc,
+    /// and the needle swinging from a pivot at the bottom.
+    pub fn render_gauge(&self, g: &Gauge) -> IconData {
+        let size = self.size;
+        let k = size as f32 / 512.0;
+        let mut px = self.bg.clone();
+        let (l, t, r, b) = (FACE.0 * k, FACE.1 * k, FACE.2 * k, FACE.3 * k);
+        // The face, shaded top to bottom.
+        let c = ((l + r) / 2.0, (t + b) / 2.0);
+        let half = ((r - l) / 2.0, (b - t) / 2.0);
+        for y in (t.floor() as usize)..(b.ceil() as usize).min(size) {
+            for x in (l.floor() as usize)..(r.ceil() as usize).min(size) {
+                let p = (x as f32 + 0.5, y as f32 + 0.5);
+                let d = round_rect(p, c, half, 44.0 * k);
+                let shade = mix(FACE_TOP, FACE_BOTTOM, ((p.1 - t) / (b - t)).clamp(0.0, 1.0));
+                over(&mut px[y * size + x], shade, coverage(d));
+            }
+        }
+        let pivot = (PIVOT.0 * k, PIVOT.1 * k);
+        let at = |frac: f32, radius: f32| {
+            let a = (frac.clamp(0.0, 1.0) * 2.0 - 1.0) * SWING;
+            (pivot.0 + radius * a.sin(), pivot.1 - radius * a.cos())
+        };
+        let rgba = |c: [u8; 3]| [c[0], c[1], c[2], 255].map(|v| v as f32 / 255.0);
+        // The scale arc, coloured by zone.
+        let (r0, r1) = ((ARC_R - ARC_W / 2.0) * k, (ARC_R + ARC_W / 2.0) * k);
+        for y in 0..size {
+            for x in 0..size {
+                let (dx, dy) = (x as f32 + 0.5 - pivot.0, y as f32 + 0.5 - pivot.1);
+                let rad = (dx * dx + dy * dy).sqrt();
+                if rad < r0 - 1.0 || rad > r1 + 1.0 {
+                    continue;
+                }
+                let a = dx.atan2(-dy);
+                let edge = (SWING - a.abs()) * rad;
+                let cov = coverage(r0 - rad)
+                    .min(coverage(rad - r1))
+                    .min(coverage(-edge));
+                if cov > 0.0 {
+                    let frac = (a / SWING + 1.0) / 2.0;
+                    let i = ((frac * ARC_STEPS as f32) as usize).min(ARC_STEPS - 1);
+                    over(&mut px[y * size + x], rgba(g.zones[i]), cov);
+                }
+            }
+        }
+        // A few heavy ticks inside the arc, readable at Dock size.
+        for i in 0..=4 {
+            let f = i as f32 / 4.0;
+            let len = if i % 2 == 0 { 44.0 } else { 30.0 };
+            fill_segment(
+                &mut px,
+                size,
+                at(f, r0 - 6.0 * k),
+                at(f, r0 - len * k),
+                10.0 * k,
+                INK,
+                0.85,
+            );
+        }
+        // Hold mark and pointer just outside the arc.
+        if let Some(h) = g.hold.filter(|h| *h > 0.0) {
+            fill_segment(
+                &mut px,
+                size,
+                at(h, r1 + 4.0 * k),
+                at(h, r1 + 30.0 * k),
+                12.0 * k,
+                INK,
+                0.9,
+            );
+        }
+        if let Some((m, c)) = g.marker.filter(|(m, _)| *m > 0.0) {
+            let a = (m.clamp(0.0, 1.0) * 2.0 - 1.0) * SWING;
+            let tip = at(m, r1 + 2.0 * k);
+            let base = at(m, r1 + 34.0 * k);
+            let side = (a.cos() * 20.0 * k, a.sin() * 20.0 * k);
+            fill_triangle(
+                &mut px,
+                size,
+                [
+                    tip,
+                    (base.0 - side.0, base.1 - side.1),
+                    (base.0 + side.0, base.1 + side.1),
+                ],
+                rgba(c),
+            );
+        }
+        // The needle, its shadow, and the hub.
+        let tip = at(g.needle, (ARC_R + 14.0) * k);
+        fill_segment(
+            &mut px,
+            size,
+            (pivot.0 + 5.0 * k, pivot.1 + 5.0 * k),
+            (tip.0 + 5.0 * k, tip.1 + 5.0 * k),
+            20.0 * k,
+            [0.0, 0.0, 0.0, 1.0],
+            0.22,
+        );
+        fill_segment(&mut px, size, pivot, tip, 18.0 * k, INK, 1.0);
+        fill_circle(&mut px, size, pivot, 32.0 * k, INK);
+        self.finish(px)
+    }
+
+    fn finish(&self, px: Vec<Rgba>) -> IconData {
         IconData {
             rgba: px.iter().flat_map(|p| unpremultiply(*p)).collect(),
-            width: size as u32,
-            height: size as u32,
+            width: self.size as u32,
+            height: self.size as u32,
         }
     }
+}
+
+/// Draw a line from `a` to `b`, `width` wide with round ends.
+fn fill_segment(
+    px: &mut [Rgba],
+    size: usize,
+    a: (f32, f32),
+    b: (f32, f32),
+    width: f32,
+    color: Rgba,
+    alpha: f32,
+) {
+    let pad = width;
+    let (lx, hx) = (a.0.min(b.0) - pad, a.0.max(b.0) + pad);
+    let (ly, hy) = (a.1.min(b.1) - pad, a.1.max(b.1) + pad);
+    let (ex, ey) = (b.0 - a.0, b.1 - a.1);
+    let len2 = (ex * ex + ey * ey).max(1e-6);
+    for y in (ly.max(0.0) as usize)..(hy.ceil() as usize).min(size) {
+        for x in (lx.max(0.0) as usize)..(hx.ceil() as usize).min(size) {
+            let p = (x as f32 + 0.5 - a.0, y as f32 + 0.5 - a.1);
+            let t = ((p.0 * ex + p.1 * ey) / len2).clamp(0.0, 1.0);
+            let d = ((p.0 - ex * t).powi(2) + (p.1 - ey * t).powi(2)).sqrt() - width / 2.0;
+            over(&mut px[y * size + x], color, alpha * coverage(d));
+        }
+    }
+}
+
+fn fill_circle(px: &mut [Rgba], size: usize, c: (f32, f32), r: f32, color: Rgba) {
+    fill_segment(px, size, c, c, r * 2.0, color, 1.0);
 }
 
 /// Signed distance from `p` to a rounded rectangle (negative inside).

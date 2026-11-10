@@ -20,6 +20,10 @@ pub struct NativeMenu {
     items: Vec<(MenuItem, Cmd, String, String)>,
 }
 
+/// The application's name in its menu (macOS titles the menu itself from
+/// `CFBundleName` in `macos/Info.plist`, embedded by `build.rs`).
+const APP_NAME: &str = "VU Meter";
+
 fn cmd_key(code: Code) -> Option<Accelerator> {
     Some(Accelerator::new(Some(Modifiers::SUPER), code))
 }
@@ -38,23 +42,23 @@ impl NativeMenu {
 
         // Quit through the app, not the system's terminate:, so a recording
         // in progress is finalized.
-        let quit = MenuItem::new("Quit vu", true, cmd_key(Code::KeyQ));
+        let quit = MenuItem::new(format!("Quit {APP_NAME}"), true, cmd_key(Code::KeyQ));
         nm.cmds.insert(quit.id().clone(), Cmd::Quit);
         let about = AboutMetadata {
-            name: Some("vu".into()),
+            name: Some(APP_NAME.into()),
             version: Some(env!("CARGO_PKG_VERSION").into()),
             comments: Some(env!("CARGO_PKG_DESCRIPTION").into()),
             ..Default::default()
         };
         let app_menu = Submenu::with_items(
-            "vu",
+            APP_NAME,
             true,
             &[
-                &PredefinedMenuItem::about(Some("About vu"), Some(about)),
+                &PredefinedMenuItem::about(Some(&format!("About {APP_NAME}")), Some(about)),
                 &PredefinedMenuItem::separator(),
                 &PredefinedMenuItem::services(None),
                 &PredefinedMenuItem::separator(),
-                &PredefinedMenuItem::hide(Some("Hide vu")),
+                &PredefinedMenuItem::hide(Some(&format!("Hide {APP_NAME}"))),
                 &PredefinedMenuItem::hide_others(None),
                 &PredefinedMenuItem::show_all(None),
                 &PredefinedMenuItem::separator(),

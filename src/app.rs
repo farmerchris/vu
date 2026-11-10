@@ -439,6 +439,29 @@ pub struct Display {
 }
 
 impl Display {
+    /// The display options given on `cli`; `frame_dt` sets the clip hold.
+    pub fn new(cli: &Cli, color_mode: ColorMode, frame_dt: f64) -> Self {
+        Display {
+            panels: crate::cli::panel_set(&cli.panels, cli.piano),
+            db_min: cli.db_min,
+            db_max: cli.db_max,
+            spec_floor: cli.spec_floor,
+            rms_offset: if cli.rms_aes17 { 3.01 } else { 0.0 },
+            meter_floor: cli.meter_floor,
+            colormap: cli.colormap,
+            freq_scale: cli.freq_scale,
+            color_mode,
+            clip_frames: ((CLIP_SECS / frame_dt).round() as usize).max(1),
+            mode: match (cli.vu, cli.lufs) {
+                (true, _) => MeterMode::Vu,
+                (_, true) => MeterMode::Lufs,
+                _ => MeterMode::Rms,
+            },
+            vu_ref: cli.vu_ref,
+            lufs_target: cli.lufs_target,
+        }
+    }
+
     pub fn shown(&self, p: Panel) -> bool {
         self.panels.get(p as usize).copied().unwrap_or(false)
     }
@@ -469,6 +492,9 @@ pub struct App {
     pub message: Option<(String, Instant)>,
     /// Persistent problem with a live input (e.g. it went digitally silent).
     pub input_warning: Option<String>,
+    /// Set when a live input's sample rate changed under it: a front end that
+    /// can should open it again from scratch.
+    pub restart_input: bool,
     pub readout: Readout,
     pub session: Session,
     /// Times the live input was reopened after going silent.
@@ -503,7 +529,6 @@ impl App {
         if let Some(d) = cli.duration {
             cap = cap.max((d / frame_dt).ceil() as usize + 2);
         }
-        let panels = crate::cli::panel_set(&cli.panels, cli.piano);
         App {
             history: History::new(cap),
             view: View {
@@ -528,25 +553,7 @@ impl App {
                 weighting: format!("{:?}", cfg.weighting),
                 window: format!("{:?}", cfg.window).to_lowercase(),
             },
-            display: Display {
-                panels,
-                db_min: cli.db_min,
-                db_max: cli.db_max,
-                spec_floor: cli.spec_floor,
-                rms_offset: if cli.rms_aes17 { 3.01 } else { 0.0 },
-                meter_floor: cli.meter_floor,
-                colormap: cli.colormap,
-                freq_scale: cli.freq_scale,
-                color_mode,
-                clip_frames: ((CLIP_SECS / frame_dt).round() as usize).max(1),
-                mode: match (cli.vu, cli.lufs) {
-                    (true, _) => MeterMode::Vu,
-                    (_, true) => MeterMode::Lufs,
-                    _ => MeterMode::Rms,
-                },
-                vu_ref: cli.vu_ref,
-                lufs_target: cli.lufs_target,
-            },
+            display: Display::new(cli, color_mode, frame_dt),
             info,
             control,
             show_help: false,
@@ -559,6 +566,7 @@ impl App {
             ingest_done: false,
             message: None,
             input_warning: None,
+            restart_input: false,
             readout: Readout::default(),
             session: Session::default(),
             reopens: 0,
@@ -570,6 +578,19 @@ impl App {
             chart_rects: Vec::new(),
             spec_cache: SpecCache::default(),
         }
+    }
+
+    /// Take over the view of the app this one replaces (on another input,
+    /// or the same one opened again): display settings, span, help and view
+    /// cycling. Display timing follows this app's input.
+    pub fn keep_view(&mut self, old: &App) {
+        self.display = Display {
+            clip_frames: self.display.clip_frames,
+            ..old.display.clone()
+        };
+        self.view.span_secs = old.view.span_secs;
+        self.show_help = old.show_help;
+        self.cycle = old.cycle;
     }
 
     pub fn sync_view(&mut self) {

@@ -1,13 +1,13 @@
-//! End-to-end tests of the built `vu` binary (headless modes only).
+//! End-to-end tests of the built `vu-meter` binary (headless modes only).
 
 use std::path::PathBuf;
 use std::process::{Command, Output};
 
 fn vu(args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_vu"))
+    Command::new(env!("CARGO_BIN_EXE_vu-meter"))
         .args(args)
         .output()
-        .expect("run vu")
+        .expect("run vu-meter")
 }
 
 fn out(o: &Output) -> String {
@@ -61,7 +61,7 @@ fn help_succeeds_and_mentions_keys() {
 fn version_succeeds() {
     let o = vu(&["--version"]);
     assert!(o.status.success());
-    assert!(out(&o).starts_with("vu "));
+    assert!(out(&o).starts_with("vu-meter "));
 }
 
 #[test]

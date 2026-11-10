@@ -4,21 +4,22 @@ version = "0.2.0"
 edition = "2021"
 description = "Sound level meter with timeline, spectrogram and graphic equalizer, in the terminal or a window"
 license = "MIT"
-default-run = "vu"
+default-run = "vu-meter"
 
 [[bin]]
-name = "vu"
+name = "vu-meter"
 path = "src/main.rs"
 
 [[bin]]
-name = "vu-gui"
-path = "src/bin/vu-gui.rs"
+name = "vu-meter-gui"
+path = "src/bin/vu-meter-gui.rs"
 required-features = ["gui"]
 
 [features]
 default = ["gui"]
-# The window front end (vu --gui, vu-gui). Without it vu is terminal-only.
-gui = ["dep:eframe", "dep:muda", "dep:objc2", "dep:objc2-app-kit", "dep:objc2-foundation"]
+# The window front end (vu-meter --gui, vu-meter-gui). Without it vu-meter is
+# terminal-only.
+gui = ["dep:eframe", "dep:muda", "dep:objc2-app-kit", "dep:objc2-foundation"]
 
 [dependencies]
 anyhow = "1"
@@ -32,8 +33,13 @@ realfft = "3.4"
 # The native menu bar and live Dock icon on macOS; other systems use a menu
 # bar in the window.
 [target.'cfg(target_os = "macos")'.dependencies]
+# Who else is using an input device, so it is shared rather than taken.
+coreaudio-sys = { version = "0.2", default-features = false, features = ["core_audio"] }
+# Voice-processing input, used when the user picks a Mic Mode other than
+# Standard (read through objc2) so that the mode applies.
+coreaudio-rs = { version = "0.11", default-features = false, features = ["audio_unit", "core_audio"] }
 muda = { version = "0.15", optional = true }
-objc2 = { version = "0.6", optional = true }
+objc2 = "0.6"
 objc2-app-kit = { version = "0.3", optional = true, default-features = false, features = ["std", "NSApplication", "NSImage", "NSResponder"] }
 objc2-foundation = { version = "0.3", optional = true, default-features = false, features = ["std", "NSData"] }
 

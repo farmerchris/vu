@@ -1,4 +1,4 @@
-//! vu-gui — the vu sound meter in a window; the same as `vu --gui`.
+//! vu-meter-gui — the sound meter in a window; the same as `vu-meter --gui`.
 
 use clap::{CommandFactory, FromArgMatches};
 use vu::cli::Cli;
@@ -10,10 +10,16 @@ fn main() {
         vu::source::list_devices()
     } else {
         let explicit = vu::gui::explicit_args(&matches);
-        cli.validate().and_then(|_| vu::gui::run(cli, explicit))
+        cli.validate().and_then(|_| {
+            if cli.foreground {
+                vu::gui::run(cli, explicit)
+            } else {
+                vu::gui::detach()
+            }
+        })
     };
     if let Err(e) = res {
-        eprintln!("vu: {e:#}");
+        eprintln!("vu-meter: {e:#}");
         std::process::exit(1);
     }
 }

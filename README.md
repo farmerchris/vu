@@ -1,6 +1,6 @@
-# vu
+# vu-meter
 
-A sound meter written in Rust, full-screen in the terminal or in a window (`vu --gui`). It shows:
+A sound meter written in Rust, full-screen in the terminal or in a window (`vu-meter --gui`). It shows:
 
 - **Levels**, in one of three meter modes (`v` cycles RMS → VU → LUFS; `--vu` or `--lufs` picks the starting one). Each mode shows only its own measure, in both the meters and the timeline:
   - **RMS** (default): per-channel RMS bars (300 ms sliding window) with a peak envelope falling at 20 dB per 1.7 s (IEC 60268-18) and a peak-hold marker (held 1.5 s, then falling at 20 dB/s), on a dBFS scale. Readouts: `peak hold rms avg`.
@@ -17,32 +17,34 @@ By default it reads the default audio input. It can also read a WAV file or a bu
 ## Build
 
 ```sh
-cargo build --release      # binaries: target/release/vu and target/release/vu-gui (cargo run starts vu)
+cargo build --release      # binaries: target/release/vu-meter and target/release/vu-meter-gui (cargo run starts vu-meter)
 cargo test                 # unit + integration tests
 cargo build --release --no-default-features   # terminal only, without the window's dependencies
 ```
 
 On macOS, the terminal needs microphone permission (System Settings → Privacy & Security → Microphone). Without it the input is silent.
 
-If a live input starts delivering pure digital silence (every sample exactly zero, which a working microphone never does) for 1.5 s, `vu` reopens the device, up to three times, and shows a yellow warning in the status bar. If it stays silent, the warning says so: the microphone is probably muted or in use by another device.
+If a live input starts delivering pure digital silence (every sample exactly zero, which a working microphone never does) for 1.5 s, `vu-meter` reopens the device, up to three times, and shows a yellow warning in the status bar. If it stays silent, the warning says so: the microphone is probably muted or in use by another device. If a live input's sample rate changes under it (a Bluetooth headset switching profiles, say), it is never forced back: the window starts the input again at the new rate, and the terminal shows a warning. Audio arriving faster than real time is dropped, so the timeline never runs ahead of the clock.
+
+The input is shared, never taken: it is opened the ordinary way, alongside any other apps using it (never in exclusive "hog" mode), and its sample rate and buffer size are left alone unless `--sample-rate` or `--buffer-size` ask for them. On macOS, if another app holds the device exclusively, or `--sample-rate` would change the rate another app is recording at, the status bar says so and the meter waits, starting as soon as the device can be shared. A silent Bluetooth input (AirPods taken over by a phone, say) is not reopened, as that would take it back; choose it again from the Input menu, or restart, to do that.
 
 ## Usage
 
 ```sh
-vu                                   # meter the default input
-vu -l                                # list input devices
-vu -d "USB"                          # pick a device by name substring (or index)
-vu -f song.wav                       # play a WAV file through the meters in real time
-vu -f song.wav --fast                # analyse the whole file at once, then browse it
-vu -f song.wav --loop
-vu -r take.wav                       # record the input while metering
-vu -r take.wav -t 30                 # record 30 seconds, then stop
-vu -g sweep:20:20000:10              # test signal
-vu -p spectrogram,eq                 # only some panels
-vu -p all --cycle-views              # demo: every panel, meter modes stepping every 3 s
-vu -f song.wav --report              # print statistics, no UI
-vu -g sine:997:-20 -t 3 --report     # check the loudness meter
-vu --gui                             # the same meters in a window (or: vu-gui)
+vu-meter                                # meter the default input
+vu-meter -l                             # list input devices
+vu-meter -d "USB"                       # pick a device by name substring (or index)
+vu-meter -f song.wav                    # play a WAV file through the meters in real time
+vu-meter -f song.wav --fast             # analyse the whole file at once, then browse it
+vu-meter -f song.wav --loop
+vu-meter -r take.wav                    # record the input while metering
+vu-meter -r take.wav -t 30              # record 30 seconds, then stop
+vu-meter -g sweep:20:20000:10           # test signal
+vu-meter -p spectrogram,eq              # only some panels
+vu-meter -p all --cycle-views           # demo: every panel, meter modes stepping every 3 s
+vu-meter -f song.wav --report           # print statistics, no UI
+vu-meter -g sine:997:-20 -t 3 --report  # check the loudness meter
+vu-meter --gui                          # the same meters in a window (or: vu-meter-gui)
 ```
 
 Test signals for `-g`: `sine[:FREQ[:DB]]`, `square[:FREQ[:DB]]`, `noise[:DB]`, `pink[:DB]`, `sweep[:F0[:F1[:SECS[:DB[:END_DB]]]]]` (with `END_DB` the level also ramps from `DB` to `END_DB` across each sweep, e.g. `sweep:100:800:5:-20:-10`), `silence`. Every field is optional, and an empty one also takes its default, so you can set a later field alone:
@@ -55,14 +57,14 @@ Test signals for `-g`: `sine[:FREQ[:DB]]`, `square[:FREQ[:DB]]`, `noise[:DB]`, `
 | `END_DB` (sweep) | none: constant level |
 
 ```sh
-vu -g                    # 1 kHz sine at -6 dBFS
-vu -g sweep              # 20 Hz - 20 kHz over 10 s
-vu -g sine::-20          # 1 kHz at -20 dBFS
-vu -g sweep:100::5       # 100 Hz - 20 kHz over 5 s
-vu -g sweep::::-30:-6    # full sweep, level rising from -30 to -6 dBFS
+vu-meter -g                  # 1 kHz sine at -6 dBFS
+vu-meter -g sweep            # 20 Hz - 20 kHz over 10 s
+vu-meter -g sine::-20        # 1 kHz at -20 dBFS
+vu-meter -g sweep:100::5     # 100 Hz - 20 kHz over 5 s
+vu-meter -g sweep::::-30:-6  # full sweep, level rising from -30 to -6 dBFS
 ```
 
-Other options (see `vu --help`): `--fft-size`, `--hop`, `--window`, `-w/--weighting a|c|z`, `-b/--bands`, `--min-freq`, `--max-freq`, `--freq-scale`, `--db-min`, `--db-max`, `--spec-floor` (spectrogram colour floor, default −90 dB: each FFT bin holds only a small share of broadband energy, so a −70 floor would hide quiet high-frequency content), `--meter-floor`, `--rms-time`, `--rms-aes17` (show RMS 3 dB higher, so a sine's RMS reads its peak, the AES17 convention VU mode already uses), `--vu`, `--lufs`, `--lufs-target`, `--vu-ref`, `--cycle-views[=SECS]` (step through the meter modes every SECS seconds, default 3), `--piano`, `--gui`, `--no-dock-meter`, `--peak-decay`, `--peak-hold`, `--colormap`, `--color auto|truecolor|256`, `--fps`, `-z/--span SECONDS` (time shown across the charts, default 10), `--history`, `--channel`, `--channels`, `--sample-rate`, `--buffer-size`, `--record-format int16|int24|float32`, `--no-mouse`.
+Other options (see `vu-meter --help`): `--fft-size`, `--hop`, `--window`, `-w/--weighting a|c|z`, `-b/--bands`, `--min-freq`, `--max-freq`, `--freq-scale`, `--db-min`, `--db-max`, `--spec-floor` (spectrogram colour floor, default −90 dB: each FFT bin holds only a small share of broadband energy, so a −70 floor would hide quiet high-frequency content), `--meter-floor`, `--rms-time`, `--rms-aes17` (show RMS 3 dB higher, so a sine's RMS reads its peak, the AES17 convention VU mode already uses), `--vu`, `--lufs`, `--lufs-target`, `--vu-ref`, `--cycle-views[=SECS]` (step through the meter modes every SECS seconds, default 3), `--piano`, `--gui`, `--foreground`, `--no-dock-meter`, `--dock-style bars|needle`, `--peak-decay`, `--peak-hold`, `--colormap`, `--color auto|truecolor|256`, `--fps`, `-z/--span SECONDS` (time shown across the charts, default 10), `--history`, `--channel`, `--channels`, `--sample-rate`, `--buffer-size`, `--record-format int16|int24|float32`, `--no-mouse`.
 
 ### Loudness targets
 
@@ -82,7 +84,7 @@ Broadcast targets are delivery specs, measured as integrated loudness. Streaming
 
 ## Window
 
-`vu --gui` (or `vu-gui`, which takes the same options) shows the same panels in a resizable window, drawn on the GPU with [egui](https://github.com/emilk/egui). Both front ends share the analysis, the app state and the key bindings below, so every key works in both.
+`vu-meter --gui` (or `vu-meter-gui`, which takes the same options) shows the same panels in a resizable window, drawn on the GPU with [egui](https://github.com/emilk/egui). It starts in the background and gives the terminal back (errors on startup are still shown there); `--foreground` keeps it attached, so Ctrl-C closes it and its messages, such as where a recording was saved, print in the terminal. Both front ends share the analysis, the app state and the key bindings below, so every key works in both.
 
 On macOS the menus are in the system menu bar; elsewhere they are a menu bar in the window. Both are built from one description and set the same state as the keys:
 
@@ -98,9 +100,13 @@ On macOS the Dock icon is a live level meter, as Activity Monitor's is, mirrorin
 - **VU**: a column per channel, green below 0 VU and red above, with the hold cap.
 - **LUFS**: M in soft blue with its max-M cap, and S in sage green with the integrated-loudness pointer, both yellow above the target.
 
-View → Live Dock Icon (or `--no-dock-meter`) keeps the icon still instead.
+View → Live Dock Icon (or `--no-dock-meter`) keeps the icon still instead. View → Dock Icon as Needle Meter (or `--dock-style needle`) draws it as an analogue meter instead: a cream face with the scale arc in the mode's colours, the needle on the loudest channel (or momentary loudness in LUFS mode), a hold mark, and in LUFS mode the integrated-loudness pointer.
 
-The window remembers its settings between sessions: the panels, meter mode, colour map, frequency scale, chart floors and ceiling, loudness target, VU reference, RMS as AES17, zoom, and the Dock icon setting, as well as its position and size. The input is not remembered: it starts on the default input unless the command line names one (`-d`, `-g` or `-f`). Options given on the command line override the saved values for that run. They are kept in the app's data directory (`~/Library/Application Support/vu/` on macOS).
+vu-meter follows the Mic Mode chosen under the orange microphone indicator in the menu bar (macOS). With Standard, the default, the input is the microphone's own signal. Voice Isolation and Wide Spectrum apply only to audio that goes through Apple's voice processing, so with either one chosen the input is captured through it, and its levels are the processed signal's (echo cancellation, noise suppression, automatic gain), not the microphone's. The input's name (and the window title) shows the mode in effect. Changing the mode switches the capture within a second, and the charts, statistics and any recording carry on through the switch (voice processing's mono signal is spread over the microphone's channels); only if the sample rate differs does the input start afresh. `--sample-rate`, `--channels` and `--buffer-size` need the device itself, so with any of them the mode is not followed. The menu is attributed to the app vu-meter was started from (Terminal, iTerm…).
+
+View → Reset to Defaults puts every setting, the zoom, the Dock icon and the window size back to the built-in defaults (ignoring the command line); the input and any recording carry on.
+
+The window remembers its settings between sessions: the panels, meter mode, colour map, frequency scale, chart floors and ceiling, loudness target, VU reference, RMS as AES17, zoom, and the Dock icon setting, as well as its position and size. The input is not remembered: it starts on the default input unless the command line names one (`-d`, `-g` or `-f`). Options given on the command line override the saved values for that run. They are kept in the app's data directory (`~/Library/Application Support/vu-meter/` on macOS).
 
 Click or drag on the spectrogram or timeline to place the cursor; scroll to move it.
 

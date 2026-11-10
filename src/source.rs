@@ -8,7 +8,7 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use std::io::Read;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -59,7 +59,20 @@ pub struct Source {
     pub rx: Receiver<Vec<f32>>,
     pub control: Arc<Control>,
     _stream: Option<cpal::Stream>,
+    /// Another kind of running input, kept alive while the source is.
+    _input: Option<Box<dyn std::any::Any>>,
     device: Option<DeviceParams>,
+    /// A live input not yet claimed, and why: taking it now would take it
+    /// from another app (see [`blocked`]). [`Source::claim`] tries again.
+    pub waiting: Option<String>,
+    /// A Bluetooth input, which another device (a phone) can take over.
+    pub bluetooth: bool,
+    /// A live input that follows the user's Mic Mode: whether it was opened
+    /// through voice processing. `None` for other inputs.
+    voice: Option<bool>,
+    /// The channel count the input delivers, when it is shown as another
+    /// (see [`Source::keep_format`]).
+    delivered: Option<usize>,
 }
 
 /// What is needed to reopen a device stream into the same channel.
@@ -68,7 +81,30 @@ struct DeviceParams {
     config: cpal::StreamConfig,
     format: cpal::SampleFormat,
     tx: SyncSender<Vec<f32>>,
+    /// The rate was asked for (`--sample-rate`), so it may be set on the
+    /// device; otherwise the device's own rate is left alone.
+    fixed_rate: bool,
 }
+
+/// A live input's sample rate changed under it (a Bluetooth headset
+/// switching profiles, say): the analysis must start again at the new rate.
+#[derive(Debug)]
+pub struct RateChanged {
+    pub from: u32,
+    pub to: u32,
+}
+
+impl std::fmt::Display for RateChanged {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(
+            f,
+            "the input's sample rate changed from {} to {} Hz",
+            self.from, self.to
+        )
+    }
+}
+
+impl std::error::Error for RateChanged {}
 
 /// Watches a live input for digital silence: a run of samples that are all
 /// exactly zero, which a real microphone never produces (even a quiet room has
@@ -119,23 +155,88 @@ impl SilenceWatch {
 }
 
 impl Source {
+    /// Show this input in the format of `old`, the one it replaces, so an
+    /// analysis can carry on across the change: its channels are spread
+    /// over (or folded into) the old count. Returns false if the sample
+    /// rates differ, which this cannot bridge.
+    pub fn keep_format(&mut self, old: &SourceInfo) -> bool {
+        if self.info.sample_rate != old.sample_rate {
+            return false;
+        }
+        if self.info.channels != old.channels {
+            self.delivered = Some(self.info.channels);
+            self.info.channels = old.channels;
+        }
+        true
+    }
+
+    /// The next chunk of audio if one is waiting, in the channel layout
+    /// shown.
+    pub fn try_recv(&self) -> Result<Vec<f32>, TryRecvError> {
+        let chunk = self.rx.try_recv()?;
+        Ok(match self.delivered {
+            Some(from) => remap(&chunk, from, self.info.channels),
+            None => chunk,
+        })
+    }
+
+    /// The user's Mic Mode has changed so that this live input should be
+    /// opened again, through voice processing or without it.
+    pub fn mic_mode_changed(&self) -> bool {
+        self.voice.is_some_and(|v| v != mic_mode_wants_voice())
+    }
+
     /// Whether this source can be reopened (live devices only).
     pub fn can_reopen(&self) -> bool {
         self.device.is_some()
     }
 
+    /// Claim a waiting input if it can now be shared; returns whether it is
+    /// running. See [`Source::waiting`].
+    pub fn claim(&mut self) -> Result<bool> {
+        if self.waiting.is_some() {
+            self.reopen()?;
+        }
+        Ok(self.waiting.is_none())
+    }
+
+    /// The live device's sample rate now, if it can be read.
+    pub fn device_rate(&self) -> Option<u32> {
+        let p = self.device.as_ref()?;
+        p.device
+            .default_input_config()
+            .ok()
+            .map(|c| c.sample_rate().0)
+    }
+
     /// Close and reopen the device stream, looking the device up again by name
-    /// in case it reconnected. Data keeps arriving on the same channel.
+    /// in case it reconnected. Data keeps arriving on the same channel. Fails
+    /// with [`RateChanged`] if the device now runs at another rate, rather
+    /// than forcing the old rate back on it (and on every other app using it).
     pub fn reopen(&mut self) -> Result<()> {
         let Some(p) = &mut self.device else {
             bail!("not a live input")
         };
         self._stream = None;
+        let rate = p.fixed_rate.then_some(p.config.sample_rate.0);
+        if let Some(why) = blocked(&self.info.name, rate) {
+            // Release it and wait, rather than take it.
+            self.waiting = Some(why);
+            return Ok(());
+        }
+        self.waiting = None;
         let host = cpal::default_host();
         if let Some(d) = host.input_devices().ok().and_then(|mut it| {
             it.find(|d| d.name().ok().as_deref() == Some(self.info.name.as_str()))
         }) {
             p.device = d;
+        }
+        if !p.fixed_rate {
+            let from = p.config.sample_rate.0;
+            let now = p.device.default_input_config().map(|c| c.sample_rate().0);
+            if let Some(to) = now.ok().filter(|&r| r != from) {
+                return Err(RateChanged { from, to }.into());
+            }
         }
         let stream = build_any(
             &p.device,
@@ -162,6 +263,56 @@ impl Drop for Source {
     }
 }
 
+/// Why the named input cannot be opened now without taking it from another
+/// app, if so: another app holds it exclusively, or `rate` (asked for with
+/// `--sample-rate`) would change the rate another app is capturing at.
+/// Plain sharing is fine: macOS mixes any number of apps on one input.
+pub fn blocked(name: &str, rate: Option<u32>) -> Option<String> {
+    #[cfg(target_os = "macos")]
+    {
+        use crate::device_mac::{process_name, usage};
+        let u = usage(name)?;
+        if let Some(pid) = u.hog {
+            return Some(format!("in exclusive use by {}", process_name(pid)));
+        }
+        if !u.alive {
+            return Some("not available".into());
+        }
+        if let (Some(want), Some(now), Some(&pid)) = (rate, u.rate, u.capturing.first()) {
+            if want != now {
+                return Some(format!("{} is using it at {now} Hz", process_name(pid)));
+            }
+        }
+        None
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (name, rate);
+        None
+    }
+}
+
+/// The rate the named device runs at now, where it can be read.
+fn nominal_rate(name: &str) -> Option<u32> {
+    #[cfg(target_os = "macos")]
+    return crate::device_mac::usage(name).and_then(|u| u.rate);
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = name;
+        None
+    }
+}
+
+fn is_bluetooth(name: &str) -> bool {
+    #[cfg(target_os = "macos")]
+    return crate::device_mac::usage(name).is_some_and(|u| u.bluetooth);
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = name;
+        false
+    }
+}
+
 /// Open the source selected on the command line. `fast` disables real-time pacing.
 pub fn open(cli: &Cli, fast: bool, looping: bool) -> Result<Source> {
     if let Some(path) = &cli.file {
@@ -174,8 +325,87 @@ pub fn open(cli: &Cli, fast: bool, looping: bool) -> Result<Source> {
             fast,
         )
     } else {
-        open_device(cli)
+        open_live(cli)
     }
+}
+
+/// Interleaved audio from `from` channels to `to`: output channel `i` takes
+/// input channel `i`, or the last one if there are fewer (so mono fills all).
+fn remap(chunk: &[f32], from: usize, to: usize) -> Vec<f32> {
+    chunk
+        .chunks_exact(from)
+        .flat_map(|frame| (0..to).map(move |i| frame[i.min(from - 1)]))
+        .collect()
+}
+
+/// Whether the user's Mic Mode (macOS) needs voice processing to apply.
+fn mic_mode_wants_voice() -> bool {
+    #[cfg(target_os = "macos")]
+    return crate::mic_mode_mac::wants_voice();
+    #[cfg(not(target_os = "macos"))]
+    false
+}
+
+/// A live input. With the user's Mic Mode set to Voice Isolation or Wide
+/// Spectrum it goes through voice processing, as the mode applies only there;
+/// otherwise (and if voice processing fails) it is the device's own signal.
+/// A rate, channel count or buffer size asked for needs the device itself.
+fn open_live(cli: &Cli) -> Result<Source> {
+    if cli.sample_rate.is_some() || cli.channels.is_some() || cli.buffer_size.is_some() {
+        return open_device(cli);
+    }
+    let voice = mic_mode_wants_voice();
+    #[cfg(target_os = "macos")]
+    let opened = if voice { open_voice(cli).ok() } else { None };
+    #[cfg(not(target_os = "macos"))]
+    let opened = None;
+    let mut source = match opened {
+        Some(s) => s,
+        None => open_device(cli)?,
+    };
+    source.voice = Some(voice);
+    Ok(source)
+}
+
+/// A live input through voice processing, so the user's Mic Mode applies.
+#[cfg(target_os = "macos")]
+fn open_voice(cli: &Cli) -> Result<Source> {
+    let host = cpal::default_host();
+    let device = match &cli.device {
+        Some(name) => Some(find_device(&host, name)?.name()?),
+        None => None,
+    };
+    let shown = match &device {
+        Some(n) => n.clone(),
+        None => host
+            .default_input_device()
+            .and_then(|d| d.name().ok())
+            .unwrap_or_else(|| "input".into()),
+    };
+    let (tx, rx) = sync_channel(1024);
+    let control = Arc::new(Control::default());
+    let input = crate::voice_mac::open(device.as_deref(), tx, control.clone())?;
+    Ok(Source {
+        info: SourceInfo {
+            name: format!(
+                "{shown} ({})",
+                crate::mic_mode_mac::active().unwrap_or("voice processing")
+            ),
+            sample_rate: input.sample_rate,
+            channels: input.channels,
+            total_frames: None,
+            kind: SourceKind::Device,
+        },
+        rx,
+        control,
+        _stream: None,
+        _input: Some(Box::new(input)),
+        device: None,
+        waiting: None,
+        bluetooth: false,
+        voice: None,
+        delivered: None,
+    })
 }
 
 /// Sends chunks timed to the real-time position of the stream.
@@ -282,7 +512,12 @@ fn open_file(path: &Path, fast: bool, looping: bool) -> Result<Source> {
         rx,
         control,
         _stream: None,
+        _input: None,
         device: None,
+        waiting: None,
+        bluetooth: false,
+        voice: None,
+        delivered: None,
     })
 }
 
@@ -354,7 +589,12 @@ fn open_generator(spec: &str, sample_rate: u32, channels: usize, fast: bool) -> 
         rx,
         control,
         _stream: None,
+        _input: None,
         device: None,
+        waiting: None,
+        bluetooth: false,
+        voice: None,
+        delivered: None,
     })
 }
 
@@ -423,21 +663,26 @@ fn open_device_inner(cli: &Cli) -> Result<Source> {
             .max_by_key(|c| c.sample_format() == cpal::SampleFormat::F32)
             .map(|c| c.with_sample_rate(cpal::SampleRate(sr)))
             .with_context(|| format!("'{name}' does not support {sr} Hz"))?,
-        None => match cli.channels {
-            Some(ch) => {
-                let def = device.default_input_config()?;
+        // The device's own rate: opening at any other would change it for
+        // every app using the device (cpal sets it to match).
+        None => {
+            let def = device.default_input_config()?;
+            let rate = nominal_rate(&name).map_or(def.sample_rate(), cpal::SampleRate);
+            let ch = cli.channels.unwrap_or(def.channels() as usize);
+            if rate == def.sample_rate() && ch == def.channels() as usize {
+                def
+            } else {
                 device
                     .supported_input_configs()?
                     .filter(|c| c.channels() as usize == ch)
-                    .find(|c| {
-                        c.min_sample_rate() <= def.sample_rate()
-                            && def.sample_rate() <= c.max_sample_rate()
-                    })
-                    .map(|c| c.with_sample_rate(def.sample_rate()))
-                    .with_context(|| format!("'{name}' does not support {ch} channels"))?
+                    .filter(|c| c.min_sample_rate() <= rate && rate <= c.max_sample_rate())
+                    .max_by_key(|c| c.sample_format() == def.sample_format())
+                    .map(|c| c.with_sample_rate(rate))
+                    .with_context(|| {
+                        format!("'{name}' does not support {ch} channels at {} Hz", rate.0)
+                    })?
             }
-            None => device.default_input_config()?,
-        },
+        }
     };
     let format = supported.sample_format();
     let mut config: cpal::StreamConfig = supported.config();
@@ -453,20 +698,34 @@ fn open_device_inner(cli: &Cli) -> Result<Source> {
     };
     let (tx, rx) = sync_channel(1024);
     let control = Arc::new(Control::default());
-    let stream = build_any(&device, &config, format, tx.clone(), control.clone())?;
-    stream.play().context("starting input stream")?;
+    let waiting = blocked(&info.name, cli.sample_rate);
+    let stream = match waiting {
+        Some(_) => None,
+        None => {
+            let stream = build_any(&device, &config, format, tx.clone(), control.clone())?;
+            stream.play().context("starting input stream")?;
+            Some(stream)
+        }
+    };
+    let bluetooth = is_bluetooth(&info.name);
     let device = Some(DeviceParams {
         device,
         config,
         format,
         tx,
+        fixed_rate: cli.sample_rate.is_some(),
     });
     Ok(Source {
         info,
         rx,
         control,
-        _stream: Some(stream),
+        _stream: stream,
+        _input: None,
         device,
+        waiting,
+        bluetooth,
+        voice: None,
+        delivered: None,
     })
 }
 
