@@ -33,6 +33,7 @@ fn config(fft_size: usize, hop: usize) -> AnalyzerConfig {
         peak_hold_s: 1.5,
         band_floor_db: -70.0,
         spectrum_channel: None,
+        surround: false,
     }
 }
 

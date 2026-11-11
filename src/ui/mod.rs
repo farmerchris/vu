@@ -4,6 +4,7 @@ pub mod colormap;
 pub mod eq;
 pub mod meter;
 pub mod piano;
+pub mod scope;
 pub mod spectrogram;
 pub mod timeline;
 
@@ -339,11 +340,45 @@ pub fn top_height(body: u16, min: u16, charts: u16) -> u16 {
         .max(body / 3)
 }
 
+/// Width of the scope in a top row `r`: the whole row when alone, else
+/// what makes its plot about square (cells are twice as tall as wide),
+/// within a third of the row.
+pub fn scope_width(r: Rect, shared: bool) -> u16 {
+    if !shared {
+        return r.width;
+    }
+    (r.height.saturating_sub(3) * 2 + 2)
+        .min(r.width / 3)
+        .max(scope::MIN_W)
+        .min(r.width)
+}
+
+/// Mark the visible markers (`m`) along the top row of a chart.
+pub fn draw_markers(buf: &mut Buffer, app: &App, chart: Rect) {
+    if chart.height == 0 {
+        return;
+    }
+    for m in app.live_markers() {
+        if let Some(c) = app
+            .view
+            .frame_column(m.frame)
+            .filter(|&c| c < chart.width as usize)
+        {
+            buf[(chart.x + c as u16, chart.y)]
+                .set_char('◆')
+                .set_fg(MARKER_COLOR);
+        }
+    }
+}
+
+/// Colour of markers on the charts.
+pub const MARKER_COLOR: Color = Color::LightMagenta;
+
 pub fn draw(f: &mut Frame, app: &mut App) {
     let area = f.area();
     let [status, body] = Layout::vertical([Constraint::Length(1), Constraint::Fill(1)]).areas(area);
     let d = &app.display;
-    let top = d.shown(Panel::Meter) || d.shown(Panel::Eq);
+    let top = d.shown(Panel::Meter) || d.shown(Panel::Eq) || d.shown(Panel::Scope);
     let (spec, tl) = (d.shown(Panel::Spectrogram), d.shown(Panel::Timeline));
     let piano = d.shown(Panel::Piano);
     let mut cons = Vec::new();
@@ -389,6 +424,16 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             app.display.shown(Panel::Meter),
             app.display.shown(Panel::Eq),
         );
+        // The scope takes the right of the row (all of it when alone).
+        let r = if app.display.shown(Panel::Scope) {
+            let sw = scope_width(r, m || e);
+            let [rest, sr] =
+                Layout::horizontal([Constraint::Fill(1), Constraint::Length(sw)]).areas(r);
+            scope::render(app, sr, buf);
+            rest
+        } else {
+            r
+        };
         let (mr, er) = match (m, e) {
             (true, true) => {
                 let mw = meter::width(app.analysis.channels, r.width);
@@ -397,7 +442,8 @@ pub fn draw(f: &mut Frame, app: &mut App) {
                 (Some(a), Some(b))
             }
             (true, false) => (Some(r), None),
-            _ => (None, Some(r)),
+            (false, true) => (None, Some(r)),
+            (false, false) => (None, None),
         };
         if let Some(mr) = mr {
             meter::render(app, mr, buf);
@@ -421,6 +467,15 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     if app.show_help {
         render_help(area, buf);
     }
+}
+
+/// Length of a file input in seconds, when it is known.
+pub fn file_length(app: &App) -> Option<f64> {
+    let total = app
+        .info
+        .total_frames
+        .filter(|_| app.info.kind == SourceKind::File)?;
+    Some(total as f64 / app.info.sample_rate.max(1) as f64)
 }
 
 fn render_status(app: &mut App, area: Rect, buf: &mut Buffer) {
@@ -475,12 +530,26 @@ fn render_status(app: &mut App, area: Rect, buf: &mut Buffer) {
             format!(" t {}", fmt_time(fr.time)),
             Style::default().fg(Color::White),
         ));
+        if let Some(total) = file_length(app) {
+            spans.push(Span::styled(
+                format!(" / {}", fmt_time(total)),
+                Style::default().fg(Color::Gray),
+            ));
+        }
         if !app.view.follow {
             spans.push(Span::styled(
                 format!(" (-{:.2}s)", latest - fr.time),
                 Style::default().fg(Color::Yellow),
             ));
         }
+    }
+    if app.monitor {
+        spans.push(Span::styled(
+            "  ♪ MON",
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        ));
     }
     if let Some(r) = &app.recorder {
         let secs = r.samples as f64 / (a.channels.max(1) as f64 * a.sample_rate as f64);
@@ -568,15 +637,21 @@ pub const HELP: &[(&str, &str)] = &[
     ("click / wheel", "place the cursor / scroll"),
     ("+ / -  ↑ / ↓", "zoom the time axis in / out"),
     ("p", "pause / resume the input"),
+    ("o", "listen to a file or test signal (monitor output)"),
     ("R", "start / stop recording"),
+    (
+        "m / M",
+        "set or remove a marker at the cursor / clear them all",
+    ),
+    ("n / N", "jump to the next / previous marker"),
     ("x", "reset the max level and clip count"),
     (
         "r",
         "reset the loudness measurement (integrated, LRA, max M, max TP)",
     ),
     (
-        "1 2 3 4 5",
-        "show / hide levels, equalizer, spectrogram, timeline, piano",
+        "1 2 3 4 5 6",
+        "show / hide levels, equalizer, spectrogram, timeline, piano, scope",
     ),
     ("c / s", "cycle colour map / frequency scale"),
     ("v", "meter mode: RMS, VU, LUFS (meters and timeline)"),
@@ -610,6 +685,10 @@ pub const LEGEND: &[(&str, &str)] = &[
     (
         "max/TP  clips",
         "highest sample peak (true peak, dBTP, in LUFS) and clip events (x resets)",
+    ),
+    (
+        "corr  bal",
+        "stereo: phase correlation (+1 mono, 0 wide, below 0 out of phase); louder side",
     ),
     (
         "tone",

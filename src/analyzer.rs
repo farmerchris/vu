@@ -2,7 +2,7 @@
 
 use crate::dsp::bands::BandLayout;
 use crate::dsp::level::{amp_to_db, peak_decay, power_to_db, FLOOR_DB};
-use crate::dsp::loudness::LoudnessMeter;
+use crate::dsp::loudness::{channel_weights, LoudnessMeter};
 use crate::dsp::quant::db_to_q;
 use crate::dsp::spectrum::{peak_frequency, prominence_db, Spectrum};
 use crate::dsp::truepeak::TruePeak;
@@ -43,6 +43,12 @@ const VU_OVERSHOOT: f64 = 0.01;
 /// Scales the rectified average so a sine reads its level in dBFS as AES17
 /// defines it (its peak), so a -18 dBFS alignment tone reads -18 (π / 2).
 const VU_CAL: f32 = std::f32::consts::FRAC_PI_2;
+/// Sample frames kept per hop for the scope panel: left/right pairs spread
+/// across the hop (stereo), or twice as many consecutive samples (mono).
+pub const SCOPE_POINTS: usize = 128;
+/// Mean-square level below which a channel is too quiet for its phase
+/// correlation to mean anything (-100 dBFS).
+const CORR_MIN_POWER: f64 = 1e-10;
 
 #[derive(Clone, Debug)]
 pub struct AnalyzerConfig {
@@ -67,6 +73,9 @@ pub struct AnalyzerConfig {
     pub band_floor_db: f32,
     /// Channel feeding the spectrum (0-based); `None` mixes all channels.
     pub spectrum_channel: Option<usize>,
+    /// Measure loudness with the BS.1770 surround weights when there are
+    /// five or six channels (see [`crate::dsp::loudness::channel_weights`]).
+    pub surround: bool,
 }
 
 impl AnalyzerConfig {
@@ -111,8 +120,18 @@ pub struct Frame {
     pub lufs_i: f32,
     /// Loudness range so far (EBU Tech 3342), LU; NaN before 3 s of signal.
     pub lufs_lra: f32,
+    /// Phase correlation of the first two channels over the RMS window:
+    /// +1 in phase (mono), 0 unrelated, -1 out of phase. NaN with one
+    /// channel, or while either is silent.
+    pub correlation: f32,
     pub peak_freq: Option<(f32, f32)>,
     pub clipped: bool,
+    /// Waveform for the scope panel, as fractions of `scope_scale` in
+    /// 1/127ths: interleaved left/right pairs spread across the hop when
+    /// there are two channels or more, else the hop's last samples.
+    pub scope: Box<[i8]>,
+    /// Amplitude (linear) of a `scope` value of 127.
+    pub scope_scale: f32,
     /// Quantized power spectrum (see [`crate::dsp::quant`]).
     pub spectrum: Box<[u8]>,
     /// Quantized equalizer band levels, with rise/fall smoothing.
@@ -139,6 +158,45 @@ impl Frame {
             .copied()
             .fold(FLOOR_DB, f32::max)
     }
+
+    /// Level of the right channel over the left (300 ms RMS), dB: positive
+    /// leans right. `None` unless both of two channels carry signal.
+    pub fn balance(&self) -> Option<f32> {
+        let (l, r) = (self.rms_avg[0], self.rms_avg[1]);
+        (self.n() == 2 && l > FLOOR_DB && r > FLOOR_DB).then_some(r - l)
+    }
+}
+
+/// A frame with every level at the floor and nothing else in it, to build
+/// test frames from.
+impl Default for Frame {
+    fn default() -> Self {
+        let floor = [FLOOR_DB; MAX_CHANNELS];
+        Frame {
+            time: 0.0,
+            channels: 1,
+            peak: floor,
+            true_peak: floor,
+            peak_decay: floor,
+            rms: floor,
+            rms_avg: floor,
+            hold: floor,
+            vu: floor,
+            vu_hold: floor,
+            lufs_m: f32::NEG_INFINITY,
+            lufs_s: f32::NEG_INFINITY,
+            lufs_i: f32::NEG_INFINITY,
+            lufs_lra: f32::NAN,
+            correlation: f32::NAN,
+            peak_freq: None,
+            clipped: false,
+            scope: Box::new([]),
+            scope_scale: 0.0,
+            spectrum: Box::new([]),
+            bands: Box::new([]),
+            band_caps: Box::new([]),
+        }
+    }
 }
 
 /// Whole-stream statistics for reports.
@@ -149,6 +207,10 @@ pub struct Stats {
     /// True peak (linear) of each metered channel.
     pub true_peak: Vec<f32>,
     pub sumsq: Vec<f64>,
+    /// Sum of the samples of each channel, for the DC offset.
+    pub sum: Vec<f64>,
+    /// Sum of left × right over the first two channels, for the correlation.
+    pub cross: f64,
     pub clipped: Vec<u64>,
     pub spectrum_sum: Vec<f64>,
     pub spectra: u64,
@@ -161,6 +223,8 @@ impl Stats {
             peak: vec![0.0; channels],
             true_peak: vec![0.0; channels],
             sumsq: vec![0.0; channels],
+            sum: vec![0.0; channels],
+            cross: 0.0,
             clipped: vec![0; channels],
             spectrum_sum: vec![0.0; bins],
             spectra: 0,
@@ -172,6 +236,24 @@ impl Stats {
             return 0.0;
         }
         (self.sumsq[ch] / self.frames as f64).sqrt() as f32
+    }
+
+    /// Mean of channel `ch`'s samples (its DC offset), linear.
+    pub fn dc(&self, ch: usize) -> f32 {
+        if self.frames == 0 {
+            return 0.0;
+        }
+        (self.sum[ch] / self.frames as f64) as f32
+    }
+
+    /// Phase correlation of the first two channels over the whole stream;
+    /// `None` with one channel or when either is silent.
+    pub fn correlation(&self) -> Option<f32> {
+        if self.sumsq.len() < 2 || self.frames == 0 {
+            return None;
+        }
+        let n = self.frames as f64;
+        correlation(self.cross / n, self.sumsq[0] / n, self.sumsq[1] / n)
     }
 
     pub fn mean_spectrum(&self) -> Vec<f32> {
@@ -199,6 +281,13 @@ pub struct Analyzer {
     /// Per-hop mean squares of the last `rms_win.len()` hops (a ring).
     rms_win: Vec<[f32; MAX_CHANNELS]>,
     rms_pos: usize,
+    /// Left × right summed over the hop, and its per-hop means over the same
+    /// window as `rms_win`.
+    hop_cross: f64,
+    cross_win: Vec<f32>,
+    /// Left/right pairs picked every `scope_stride` sample frames this hop.
+    scope_buf: Vec<f32>,
+    scope_stride: usize,
     peak_hold: [f32; MAX_CHANNELS],
     hold: [f32; MAX_CHANNELS],
     hold_age: [f32; MAX_CHANNELS],
@@ -286,7 +375,7 @@ impl Analyzer {
             None => BandLayout::third_octave(cfg.min_freq, top, bin_hz, bins),
         };
         let peak_bins = (
-            ((cfg.min_freq / bin_hz).floor() as usize).max(1),
+            ((cfg.min_freq / bin_hz).ceil() as usize).max(1),
             ((top / bin_hz).ceil() as usize).min(bins - 1),
         );
         Analyzer {
@@ -307,6 +396,10 @@ impl Analyzer {
                 ((cfg.rms_tau as f64 / cfg.frame_dt()).round() as usize).max(1)
             ],
             rms_pos: 0,
+            hop_cross: 0.0,
+            cross_win: vec![0.0; ((cfg.rms_tau as f64 / cfg.frame_dt()).round() as usize).max(1)],
+            scope_buf: Vec::with_capacity(2 * SCOPE_POINTS),
+            scope_stride: (cfg.hop / SCOPE_POINTS).max(1),
             peak_hold: [FLOOR_DB; MAX_CHANNELS],
             hold: [FLOOR_DB; MAX_CHANNELS],
             hold_age: [0.0; MAX_CHANNELS],
@@ -335,7 +428,10 @@ impl Analyzer {
                     dt as f32,
                 )
             },
-            loudness: LoudnessMeter::new(cfg.sample_rate, cfg.channels),
+            loudness: LoudnessMeter::with_weights(
+                cfg.sample_rate,
+                channel_weights(cfg.channels, cfg.surround),
+            ),
             samples: 0,
             peak_bins,
             quant: PowerQuant::new(),
@@ -391,7 +487,18 @@ impl Analyzer {
                     self.stats.peak[c] = a;
                 }
                 self.stats.sumsq[c] += (s as f64) * (s as f64);
+                self.stats.sum[c] += s as f64;
                 mix += s;
+            }
+            if nch >= 2 {
+                let cross = frame[0] as f64 * frame[1] as f64;
+                self.hop_cross += cross;
+                self.stats.cross += cross;
+                if self.hop_count.is_multiple_of(self.scope_stride)
+                    && self.scope_buf.len() < 2 * SCOPE_POINTS
+                {
+                    self.scope_buf.extend_from_slice(&frame[..2]);
+                }
             }
             let mono = match self.cfg.spectrum_channel {
                 Some(c) => frame[c],
@@ -518,6 +625,35 @@ impl Analyzer {
                 dt,
             );
         }
+        // Phase correlation over the RMS window.
+        self.cross_win[slot] = (self.hop_cross / n) as f32;
+        let correlation = if self.cfg.channels >= 2 {
+            let sum = |c: usize| self.rms_win.iter().map(|w| w[c] as f64).sum::<f64>();
+            let k = self.rms_win.len() as f64;
+            let cross = self.cross_win.iter().map(|&x| x as f64).sum::<f64>();
+            correlation(cross / k, sum(0) / k, sum(1) / k).unwrap_or(f32::NAN)
+        } else {
+            f32::NAN
+        };
+        // With one channel the scope shows the newest samples of the hop.
+        if self.cfg.channels < 2 {
+            let from = self.lin.len().saturating_sub(2 * SCOPE_POINTS);
+            self.scope_buf.extend_from_slice(&self.lin[from..]);
+        }
+        let scope_scale = self.scope_buf.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        let scope: Box<[i8]> = self
+            .scope_buf
+            .iter()
+            .map(|&v| {
+                if scope_scale > 0.0 {
+                    (v / scope_scale * 127.0).round() as i8
+                } else {
+                    0
+                }
+            })
+            .collect();
+        self.scope_buf.clear();
+        self.hop_cross = 0.0;
         let frame = Frame {
             time: self.samples as f64 / self.cfg.sample_rate as f64,
             channels: metered as u8,
@@ -533,8 +669,11 @@ impl Analyzer {
             lufs_s: self.loudness.short_term(),
             lufs_i: self.loudness.integrated(),
             lufs_lra: self.loudness.loudness_range(),
+            correlation,
             peak_freq,
             clipped: self.hop_clip,
+            scope,
+            scope_scale,
             spectrum,
             bands,
             band_caps,
@@ -547,6 +686,13 @@ impl Analyzer {
         self.hop_clip = false;
         frame
     }
+}
+
+/// Correlation coefficient from the mean of left × right and the mean
+/// squares of each; `None` when either channel is all but silent.
+pub fn correlation(cross: f64, left: f64, right: f64) -> Option<f32> {
+    (left > CORR_MIN_POWER && right > CORR_MIN_POWER)
+        .then(|| (cross / (left * right).sqrt()).clamp(-1.0, 1.0) as f32)
 }
 
 /// Damping ratio and natural frequency (rad/s) of the VU needle: ζ gives the
@@ -605,6 +751,7 @@ pub mod tests {
             peak_hold_s: 1.5,
             band_floor_db: -70.0,
             spectrum_channel: None,
+            surround: false,
         }
     }
 
@@ -957,5 +1104,76 @@ pub mod tests {
         assert!((c.frame_dt() - 512.0 / 48000.0).abs() < 1e-12);
         c.max_freq = 30000.0;
         assert_eq!(c.top_freq(), 24000.0);
+    }
+
+    #[test]
+    fn phase_correlation_and_balance() {
+        let last = |l: f32, r: f32| {
+            let (a, frames) = run(config(2), &stereo_sine(1000.0, l, r, 48000));
+            (a.stats.correlation(), frames.last().unwrap().clone())
+        };
+        let (whole, f) = last(0.5, 0.25);
+        assert!((f.correlation - 1.0).abs() < 1e-3, "{}", f.correlation);
+        assert!((whole.unwrap() - 1.0).abs() < 1e-3);
+        assert!(
+            (f.balance().unwrap() + 6.02).abs() < 0.05,
+            "right 6 dB down"
+        );
+        let (whole, f) = last(0.5, -0.5);
+        assert!((f.correlation + 1.0).abs() < 1e-3, "{}", f.correlation);
+        assert!((whole.unwrap() + 1.0).abs() < 1e-3);
+        // A silent channel has no correlation or balance to speak of.
+        let (whole, f) = last(0.5, 0.0);
+        assert!(f.correlation.is_nan() && whole.is_none() && f.balance().is_none());
+        // Quadrature (sine against cosine): unrelated.
+        let data: Vec<f32> = (0..48000)
+            .flat_map(|i| {
+                let p = 2.0 * std::f32::consts::PI * 1000.0 * i as f32 / 48000.0;
+                [0.5 * p.sin(), 0.5 * p.cos()]
+            })
+            .collect();
+        let (a, frames) = run(config(2), &data);
+        assert!(frames.last().unwrap().correlation.abs() < 0.01);
+        assert!(a.stats.correlation().unwrap().abs() < 0.01);
+        // Mono has none.
+        let (a, frames) = run(config(1), &data);
+        assert!(frames[0].correlation.is_nan() && a.stats.correlation().is_none());
+        assert!(frames[0].balance().is_none());
+    }
+
+    #[test]
+    fn scope_samples() {
+        // Stereo: pairs spread across the hop, scaled to the larger channel.
+        let (_, frames) = run(config(2), &stereo_sine(1000.0, 0.5, -0.25, 4096));
+        let f = &frames[3];
+        assert_eq!(f.scope.len(), 2 * SCOPE_POINTS);
+        assert!((f.scope_scale - 0.5).abs() < 0.01, "{}", f.scope_scale);
+        for pair in f.scope.chunks(2) {
+            // Right is the left inverted at half the level.
+            assert!((pair[1] as i32 + pair[0] as i32 / 2).abs() <= 1, "{pair:?}");
+        }
+        assert!(f.scope.iter().any(|&v| v == 127 || v == -127));
+        // Mono: the hop's last samples, consecutive.
+        let (_, frames) = run(config(1), &stereo_sine(1000.0, 0.5, 0.5, 2048)[..4096]);
+        let f = frames.last().unwrap();
+        assert_eq!(f.scope.len(), 2 * SCOPE_POINTS);
+        let crossings = f.scope.windows(2).filter(|w| w[0] < 0 && w[1] >= 0).count();
+        // 256 samples of 500 Hz (1 kHz stereo read as mono) at 48 kHz: 2.7 cycles.
+        assert!((2..=3).contains(&crossings), "{crossings}");
+        // Silence scales to nothing rather than dividing by zero.
+        let (_, frames) = run(config(2), &[0.0; 4096]);
+        assert_eq!(frames[0].scope_scale, 0.0);
+        assert!(frames[0].scope.iter().all(|&v| v == 0));
+    }
+
+    #[test]
+    fn dc_offset_in_stats() {
+        let data: Vec<f32> = stereo_sine(1000.0, 0.2, 0.2, 48000)
+            .chunks(2)
+            .flat_map(|f| [f[0] + 0.05, f[1]])
+            .collect();
+        let (a, _) = run(config(2), &data);
+        assert!((a.stats.dc(0) - 0.05).abs() < 1e-4, "{}", a.stats.dc(0));
+        assert!(a.stats.dc(1).abs() < 1e-4);
     }
 }

@@ -125,6 +125,7 @@ pub fn render(app: &mut App, area: Rect, buf: &mut Buffer) -> Rect {
             }
         }
     }
+    super::draw_markers(buf, app, chart);
     super::draw_time_axis(buf, app, area, chart);
     chart
 }

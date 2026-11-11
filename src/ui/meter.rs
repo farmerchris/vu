@@ -415,7 +415,8 @@ pub fn render(app: &mut App, area: Rect, buf: &mut Buffer) {
     let rows = if mode == MeterMode::Lufs { 1 } else { n };
     // Blank separator rows only when there is room for them.
     let rows = rows + (mode == MeterMode::Lufs) as usize;
-    let needed = 1 + rows + 1 + 1 + clipped as usize;
+    let stereo = n == 2;
+    let needed = 1 + rows + 1 + 1 + stereo as usize + clipped as usize;
     let spacious = inner.height as usize >= needed + 2;
     let mut y = inner.y;
     // Writes a readout line; returns its row, if it fitted.
@@ -498,6 +499,15 @@ pub fn render(app: &mut App, area: Rect, buf: &mut Buffer) {
         session_text(label, &fmt_db(max), unit, s.clips),
         clip_style,
     );
+    // Stereo: phase correlation and which side is louder.
+    if stereo {
+        let st = if f.correlation < 0.0 {
+            Style::default().fg(Color::LightRed)
+        } else {
+            head
+        };
+        line(buf, stereo_text(f.correlation, f.balance()), st);
+    }
     if spacious {
         line(buf, String::new(), val);
     }
@@ -550,6 +560,18 @@ pub fn target_text(to_target: f32, lra: f32) -> String {
         row("tgt", &[lu(to_target, true)]),
         lu(lra, false)
     )
+}
+
+/// Stereo line: phase correlation and the balance between the channels,
+/// with dashes while either is silent.
+pub fn stereo_text(correlation: f32, balance: Option<f32>) -> String {
+    let corr = if correlation.is_nan() {
+        "—".to_string()
+    } else {
+        format!("{correlation:+.2}")
+    };
+    let bal = super::scope::balance_text(balance);
+    format!("{}   {bal}", row("corr", &[corr]))
 }
 
 /// Width of each readout column; values are right-aligned under their headers.
@@ -773,6 +795,9 @@ mod tests {
             "TP      0.0 dBTP    1 clip"
         );
         assert_eq!(target_text(-2.34, 6.25), "tgt    -2.3 LU   LRA   6.2 LU");
+        assert_eq!(stereo_text(0.97, Some(-1.26)), "corr  +0.97   bal L 1.3 dB");
+        assert_eq!(stereo_text(f32::NAN, None), "corr      —   bal —");
+        assert!(stereo_text(-1.0, Some(-60.0)).chars().count() <= TEXT_W as usize);
         assert_eq!(
             target_text(f32::NEG_INFINITY, f32::NAN),
             "tgt       — LU   LRA     — LU"

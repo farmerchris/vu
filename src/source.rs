@@ -1,5 +1,6 @@
-//! Audio sources: the default/selected input device, a WAV file, or a generator.
-//! Each delivers interleaved f32 chunks over a channel.
+//! Audio sources: the default/selected input device, an audio file (or
+//! standard input), or a generator. Each delivers interleaved f32 chunks
+//! over a channel.
 
 use crate::cli::Cli;
 use crate::generator::{parse_spec, Generator};
@@ -335,7 +336,7 @@ fn is_bluetooth(name: &str) -> bool {
 
 /// Open the source selected on the command line. `fast` disables real-time pacing.
 pub fn open(cli: &Cli, fast: bool, looping: bool) -> Result<Source> {
-    if let Some(path) = &cli.file {
+    if let Some(path) = cli.inputs().first() {
         open_file(path, fast, looping)
     } else if let Some(spec) = &cli.generate {
         open_generator(
@@ -499,9 +500,37 @@ pub fn read_wav_chunk<R: Read>(
     Ok(())
 }
 
+/// Open an audio file. WAV goes through hound; other formats, WAV files
+/// hound cannot read, and standard input (`-`) through symphonia's decoders.
 fn open_file(path: &Path, fast: bool, looping: bool) -> Result<Source> {
-    let reader =
-        hound::WavReader::open(path).with_context(|| format!("opening {}", path.display()))?;
+    if Cli::is_stdin(path) {
+        let input = symphonia::core::io::ReadOnlySource::new(std::io::stdin());
+        return open_decoded(Box::new(input), None, "stdin".into(), fast, false)
+            .context("reading standard input");
+    }
+    let opening = || format!("opening {}", path.display());
+    let file = std::fs::File::open(path).with_context(opening)?;
+    let ext = path
+        .extension()
+        .map(|e| e.to_string_lossy().to_ascii_lowercase());
+    if matches!(ext.as_deref(), Some("wav" | "wave")) {
+        if let Ok(reader) = hound::WavReader::open(path) {
+            return open_wav(reader, path, fast, looping);
+        }
+    }
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    open_decoded(Box::new(file), ext.as_deref(), name, fast, looping).with_context(opening)
+}
+
+fn open_wav(
+    reader: hound::WavReader<std::io::BufReader<std::fs::File>>,
+    path: &Path,
+    fast: bool,
+    looping: bool,
+) -> Result<Source> {
     let spec = reader.spec();
     if spec.channels == 0 {
         bail!("{} has no channels", path.display());
@@ -571,6 +600,191 @@ fn file_thread(
         }
         if tx.send(buf).is_err() {
             return Ok(());
+        }
+    }
+}
+
+/// The formats files can be in, for error messages.
+const FORMATS: &str = "it reads WAV, AIFF, FLAC, MP3, Ogg Vorbis, AAC and ALAC";
+
+/// A compressed (or otherwise non-WAV) stream being decoded.
+struct Decoded {
+    format: Box<dyn symphonia::core::formats::FormatReader>,
+    decoder: Box<dyn symphonia::core::codecs::Decoder>,
+    track_id: u32,
+    sample_rate: u32,
+    channels: usize,
+}
+
+impl Decoded {
+    /// Probe `input` for a format (`ext` is a hint) and set up its first
+    /// audio track. Returns the decoder, the track's length in sample
+    /// frames if known, and its first decoded audio, which fixes the format.
+    fn open(
+        input: Box<dyn symphonia::core::io::MediaSource>,
+        ext: Option<&str>,
+    ) -> Result<(Decoded, Option<u64>, Vec<f32>)> {
+        use symphonia::core::codecs::CODEC_TYPE_NULL;
+        let stream = symphonia::core::io::MediaSourceStream::new(input, Default::default());
+        let mut hint = symphonia::core::probe::Hint::new();
+        if let Some(ext) = ext {
+            hint.with_extension(ext);
+        }
+        // Gapless: leave out the padding MP3 and AAC encoders add.
+        let options = symphonia::core::formats::FormatOptions {
+            enable_gapless: true,
+            ..Default::default()
+        };
+        let format = symphonia::default::get_probe()
+            .format(&hint, stream, &options, &Default::default())
+            .map_err(|_| anyhow::anyhow!("not an audio file vu-meter can read ({FORMATS})"))?
+            .format;
+        let track = format
+            .tracks()
+            .iter()
+            .find(|t| t.codec_params.codec != CODEC_TYPE_NULL)
+            .context("no audio track")?;
+        let decoder = symphonia::default::get_codecs()
+            .make(&track.codec_params, &Default::default())
+            .map_err(|_| anyhow::anyhow!("its audio codec is not supported ({FORMATS})"))?;
+        let total = track.codec_params.n_frames;
+        let mut d = Decoded {
+            track_id: track.id,
+            format,
+            decoder,
+            sample_rate: 0,
+            channels: 0,
+        };
+        let first = d.next()?.context("no audio in it")?;
+        Ok((d, total, first))
+    }
+
+    /// The next packet's audio, interleaved; `None` at the end.
+    fn next(&mut self) -> Result<Option<Vec<f32>>> {
+        use symphonia::core::errors::Error as E;
+        loop {
+            let packet = match self.format.next_packet() {
+                Ok(p) => p,
+                Err(E::IoError(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                    return Ok(None)
+                }
+                Err(E::ResetRequired) => return Ok(None),
+                Err(e) => return Err(e.into()),
+            };
+            if packet.track_id() != self.track_id {
+                continue;
+            }
+            let decoded = match self.decoder.decode(&packet) {
+                Ok(d) => d,
+                // A damaged packet is skipped, as players do.
+                Err(E::DecodeError(_)) => continue,
+                Err(e) => return Err(e.into()),
+            };
+            if decoded.frames() == 0 {
+                continue;
+            }
+            let spec = *decoded.spec();
+            let (rate, channels) = (spec.rate, spec.channels.count());
+            if self.channels == 0 {
+                (self.sample_rate, self.channels) = (rate, channels);
+            } else if (rate, channels) != (self.sample_rate, self.channels) {
+                bail!("the audio format changes part way through");
+            }
+            let mut buf =
+                symphonia::core::audio::SampleBuffer::<f32>::new(decoded.capacity() as u64, spec);
+            buf.copy_interleaved_ref(decoded);
+            return Ok(Some(buf.samples().to_vec()));
+        }
+    }
+
+    /// Go back to the start, for looping; false if the input cannot seek.
+    fn rewind(&mut self) -> bool {
+        use symphonia::core::formats::{SeekMode, SeekTo};
+        let to = SeekTo::Time {
+            time: Default::default(),
+            track_id: Some(self.track_id),
+        };
+        let ok = self.format.seek(SeekMode::Accurate, to).is_ok();
+        self.decoder.reset();
+        ok
+    }
+}
+
+fn open_decoded(
+    input: Box<dyn symphonia::core::io::MediaSource>,
+    ext: Option<&str>,
+    name: String,
+    fast: bool,
+    looping: bool,
+) -> Result<Source> {
+    let (decoded, total_frames, first) = Decoded::open(input, ext)?;
+    if decoded.channels == 0 || decoded.sample_rate == 0 {
+        bail!("no audio in it");
+    }
+    let info = SourceInfo {
+        name,
+        sample_rate: decoded.sample_rate,
+        channels: decoded.channels,
+        total_frames,
+        kind: SourceKind::File,
+    };
+    let (tx, rx) = sync_channel(64);
+    let control = Arc::new(Control::default());
+    let ctl = control.clone();
+    thread::Builder::new()
+        .name("vu-file".into())
+        .spawn(move || {
+            if let Err(e) = decoded_thread(decoded, first, tx, &ctl, fast, looping) {
+                ctl.set_error(format!("file read error: {e:#}"));
+            }
+        })?;
+    Ok(Source {
+        info,
+        rx,
+        control,
+        _stream: None,
+        _input: None,
+        device: None,
+        waiting: None,
+        bluetooth: false,
+        voice: None,
+        delivered: None,
+    })
+}
+
+fn decoded_thread(
+    mut decoded: Decoded,
+    first: Vec<f32>,
+    tx: SyncSender<Vec<f32>>,
+    ctl: &Control,
+    fast: bool,
+    looping: bool,
+) -> Result<()> {
+    // Packets can hold a tenth of a second; smaller pieces keep the meters
+    // moving smoothly.
+    const CHUNK: usize = 1024;
+    let channels = decoded.channels;
+    let mut pacer = Pacer::new(decoded.sample_rate);
+    let mut next = Some(first);
+    loop {
+        let buf = match next.take() {
+            Some(b) => b,
+            None => match decoded.next()? {
+                Some(b) => b,
+                None if looping && decoded.rewind() => continue,
+                None => return Ok(()),
+            },
+        };
+        for piece in buf.chunks(CHUNK * channels) {
+            if !wait_unpaused(ctl, &mut pacer) {
+                return Ok(());
+            }
+            if !fast {
+                pacer.wait(piece.len() / channels);
+            }
+            if tx.send(piece.to_vec()).is_err() {
+                return Ok(());
+            }
         }
     }
 }

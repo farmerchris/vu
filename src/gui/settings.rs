@@ -10,7 +10,7 @@
 
 use super::input::MenuState;
 use crate::app::{App, MeterMode};
-use crate::cli::{Cli, Panel};
+use crate::cli::{Cli, Panel, PANELS};
 use crate::dsp::scale::FreqScale;
 use crate::ui::colormap::ColorMap;
 use clap::ValueEnum;
@@ -21,14 +21,6 @@ use std::path::PathBuf;
 pub const APP_ID: &str = "vu-meter";
 
 pub type Map = BTreeMap<String, String>;
-
-const PANELS: [Panel; 5] = [
-    Panel::Meter,
-    Panel::Eq,
-    Panel::Spectrogram,
-    Panel::Timeline,
-    Panel::Piano,
-];
 
 fn path() -> Option<PathBuf> {
     eframe::storage_dir(APP_ID).map(|d| d.join("settings.txt"))

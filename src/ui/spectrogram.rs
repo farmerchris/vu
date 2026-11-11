@@ -237,6 +237,7 @@ pub fn render(app: &mut App, area: Rect, buf: &mut Buffer) -> Rect {
         let x = chart.x + cc as u16;
         buf[(x, chart.y)].set_char('▼').set_fg(Color::White);
     }
+    super::draw_markers(buf, app, chart);
 
     // Frequency axis.
     let style = Style::default().fg(Color::DarkGray);

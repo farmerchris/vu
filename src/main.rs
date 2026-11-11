@@ -17,7 +17,7 @@ use vu::app::{Action, App};
 use vu::cli::Cli;
 use vu::pump::{self, Pump};
 use vu::source::Source;
-use vu::{recorder, report, source, ui};
+use vu::{report, source, ui};
 
 #[cfg(feature = "gui")]
 fn gui(cli: Cli, matches: &clap::ArgMatches) -> Result<()> {
@@ -32,42 +32,45 @@ fn gui(_cli: Cli, _matches: &clap::ArgMatches) -> Result<()> {
     anyhow::bail!("this vu-meter was built without the window (cargo feature \"gui\")")
 }
 
+/// Exit status when `--check` fails (1 is an error, 2 a command line that
+/// could not be understood).
+const CHECK_FAILED: i32 = 3;
+
 fn main() {
-    if let Err(e) = run() {
-        eprintln!("vu-meter: {e:#}");
-        std::process::exit(1);
+    match run() {
+        Ok(code) => std::process::exit(code),
+        Err(e) => {
+            eprintln!("vu-meter: {e:#}");
+            std::process::exit(1);
+        }
     }
 }
 
-fn run() -> Result<()> {
+fn run() -> Result<i32> {
     let matches = Cli::command().get_matches();
     let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
+    if let Some(shell) = cli.completions {
+        clap_complete::generate(shell, &mut Cli::command(), "vu-meter", &mut stdout());
+        return Ok(0);
+    }
     if cli.list_devices {
-        return source::list_devices();
+        return source::list_devices().map(|()| 0);
     }
     cli.validate()?;
-    let fast = cli.fast || cli.report;
-    let looping = cli.looping && !cli.report;
     if cli.gui {
-        return gui(cli, &matches);
+        return gui(cli, &matches).map(|()| 0);
     }
-    let source = source::open(&cli, fast, looping)?;
-    let acfg = pump::analyzer_config(&cli, &source.info)?;
-    let info = &source.info;
-    let mut analyzer = Analyzer::new(acfg);
     if cli.report {
-        let rec = match &cli.record {
-            Some(p) => Some(recorder::Recorder::create(
-                p,
-                info.channels,
-                info.sample_rate,
-                cli.record_format,
-            )?),
-            None => None,
-        };
-        return report::run(source, &mut analyzer, cli.duration, rec);
+        return Ok(match report::run(&cli)? {
+            report::Outcome::Ok => 0,
+            report::Outcome::CheckFailed => CHECK_FAILED,
+            report::Outcome::InputFailed => 1,
+        });
     }
-    run_tui(&cli, source, analyzer)
+    let source = source::open(&cli, cli.fast, cli.looping)?;
+    let acfg = pump::analyzer_config(&cli, &source.info)?;
+    let analyzer = Analyzer::new(acfg);
+    run_tui(&cli, source, analyzer).map(|()| 0)
 }
 
 type Term = Terminal<CrosstermBackend<Stdout>>;
@@ -125,6 +128,9 @@ fn run_tui(cli: &Cli, mut source: Source, mut analyzer: Analyzer) -> Result<()> 
     if cli.record.is_some() {
         app.start_recording()?;
     }
+    if let Some(path) = &cli.log {
+        app.start_log(path, cli.log_interval)?;
+    }
     let mouse = !cli.no_mouse;
     let res = setup_terminal(mouse).and_then(|mut term| {
         let r = event_loop(&mut term, &mut app, &mut analyzer, &mut source, cli);
@@ -168,6 +174,8 @@ fn restart(
         new.flash(format!("{why}; input restarted"));
     }
     new.saved_recordings = std::mem::take(&mut app.saved_recordings);
+    // The log carries on; markers belong to the history that is going.
+    new.log = app.log.take();
     new.reopens = app.reopens;
     // The old source stops when dropped here.
     *pump = Pump::new(cli, &new_source.info);

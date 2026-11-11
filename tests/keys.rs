@@ -30,6 +30,7 @@ fn make_app(args: &[&str], channels: usize, secs: f64) -> App {
         peak_hold_s: cli.peak_hold,
         band_floor_db: cli.db_min,
         spectrum_channel: cli.channel.map(|c| c - 1),
+        surround: false,
     });
     let info = SourceInfo {
         name: "test-gen".into(),
@@ -244,7 +245,7 @@ fn panel_toggles() {
 
 #[test]
 fn last_visible_panel_survives_every_order() {
-    for first in ['1', '2', '3', '4'] {
+    for first in ['1', '2', '3', '4', '5', '6'] {
         let mut app = ready(&["-p", "eq,timeline"]);
         let _ = first;
         key(&mut app, KeyCode::Char('2'));
@@ -497,4 +498,91 @@ fn keys_on_empty_history_do_not_panic() {
         key(&mut app, code);
     }
     assert!(app.view.follow);
+}
+
+#[test]
+fn six_toggles_the_scope() {
+    let mut app = ready(&[]);
+    assert!(!app.display.shown(Panel::Scope));
+    key(&mut app, KeyCode::Char('6'));
+    assert!(app.display.shown(Panel::Scope));
+    key(&mut app, KeyCode::Char('6'));
+    assert!(!app.display.shown(Panel::Scope));
+    // It counts as a panel: alone, it cannot be hidden.
+    let mut app = ready(&["-p", "scope"]);
+    key(&mut app, KeyCode::Char('6'));
+    assert!(app.display.shown(Panel::Scope));
+}
+
+#[test]
+fn markers_set_jump_and_clear() {
+    let mut app = ready(&[]);
+    let last = app.history.last().unwrap();
+    // n with no markers only says so.
+    key(&mut app, KeyCode::Char('n'));
+    assert!(app.view.follow && app.message.as_ref().unwrap().0.contains("no markers"));
+    key(&mut app, KeyCode::Char('m'));
+    assert_eq!(app.markers.len(), 1);
+    assert_eq!(app.markers[0].frame, last);
+    assert!((app.markers[0].time - app.history.get(last).unwrap().time).abs() < 1e-9);
+    mod_key(&mut app, KeyCode::Left, KeyModifiers::SHIFT);
+    mod_key(&mut app, KeyCode::Left, KeyModifiers::SHIFT);
+    key(&mut app, KeyCode::Char('m'));
+    key(&mut app, KeyCode::Left);
+    // Kept in time order, whatever order they were set in.
+    let frames: Vec<usize> = app.markers.iter().map(|m| m.frame).collect();
+    assert_eq!(frames, [last - 20, last]);
+    assert_eq!(app.view.cursor, last - 21);
+    key(&mut app, KeyCode::Char('n'));
+    assert_eq!(app.view.cursor, last - 20);
+    key(&mut app, KeyCode::Char('n'));
+    assert_eq!(app.view.cursor, last);
+    assert!(!app.view.follow, "a marker holds the display");
+    key(&mut app, KeyCode::Char('n'));
+    assert_eq!(app.view.cursor, last, "no later marker");
+    assert!(app.message.as_ref().unwrap().0.contains("no later"));
+    key(&mut app, KeyCode::Char('N'));
+    assert_eq!(app.view.cursor, last - 20);
+    key(&mut app, KeyCode::Char('N'));
+    assert_eq!(app.view.cursor, last - 20, "no earlier marker");
+    // m on a marker removes it; M clears the rest.
+    key(&mut app, KeyCode::Char('m'));
+    assert_eq!(app.markers.len(), 1);
+    key(&mut app, KeyCode::Char('M'));
+    assert!(app.markers.is_empty());
+    assert!(app.message.as_ref().unwrap().0.contains("1 marker cleared"));
+}
+
+#[test]
+fn markers_follow_the_history() {
+    // A history of 1 s: markers that scroll out of it are no longer jumped to.
+    let mut app = make_app(&["--history", "1"], 2, 0.5);
+    let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+    term.draw(|f| vu::ui::draw(f, &mut app)).unwrap();
+    key(&mut app, KeyCode::Char('m'));
+    assert_eq!(app.live_markers().count(), 1);
+    let old = app.markers[0].frame;
+    for f in make_app(&[], 2, 2.0).history.range(0, usize::MAX) {
+        app.push_frame(f.clone());
+    }
+    assert!(app.history.first() > old);
+    assert_eq!(app.live_markers().count(), 0);
+    assert_eq!(app.markers.len(), 1, "still reported on exit");
+    key(&mut app, KeyCode::Char('N'));
+    assert!(app.message.as_ref().unwrap().0.contains("no earlier"));
+}
+
+#[test]
+fn o_toggles_monitoring_except_for_a_live_input() {
+    let mut app = ready(&[]);
+    assert!(!app.monitor);
+    key(&mut app, KeyCode::Char('o'));
+    assert!(app.monitor);
+    key(&mut app, KeyCode::Char('o'));
+    assert!(!app.monitor);
+    assert!(make_app(&["--monitor"], 2, 0.1).monitor);
+    app.info.kind = vu::source::SourceKind::Device;
+    key(&mut app, KeyCode::Char('o'));
+    assert!(!app.monitor, "a live input would feed back");
+    assert!(app.message.as_ref().unwrap().0.contains("feed back"));
 }

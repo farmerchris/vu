@@ -4,7 +4,7 @@
 //! either as the native macOS menu bar or as a menu bar in the window.
 
 use crate::app::{Action, App, MeterMode};
-use crate::cli::{Panel, LUFS_TARGETS};
+use crate::cli::{LUFS_TARGETS, PANELS};
 use crate::dsp::scale::FreqScale;
 use crate::ui::colormap::ColorMap;
 use eframe::egui::{self, Button, Event, Key, Modifiers, Ui};
@@ -94,6 +94,8 @@ pub enum Choice {
     Device(String),
     /// A `--generate` spec.
     Signal(String),
+    /// An audio file, dropped on the window.
+    File(std::path::PathBuf),
 }
 
 /// Test signals offered in the menu: label and `--generate` spec.
@@ -130,7 +132,7 @@ impl MenuState {
     /// The input matching a command line: a device, a test signal, the
     /// default input, or none (a file).
     pub fn from_cli(cli: &crate::cli::Cli) -> Option<Choice> {
-        match (&cli.file, &cli.generate, &cli.device) {
+        match (cli.inputs().first(), &cli.generate, &cli.device) {
             (Some(_), _, _) => None,
             (_, Some(g), _) => Some(Choice::Signal(g.clone())),
             (_, _, Some(d)) => Some(Choice::Device(d.clone())),
@@ -160,6 +162,10 @@ impl MenuState {
                 None => "Default Input".into(),
             },
             Choice::Device(n) => n.clone(),
+            Choice::File(p) => p.file_name().map_or_else(
+                || p.display().to_string(),
+                |n| n.to_string_lossy().into_owned(),
+            ),
             Choice::Signal(spec) => SIGNALS.iter().find(|(_, s)| s == spec).map_or_else(
                 || format!("Test Signal {spec}"),
                 |(l, _)| format!("Test: {l}"),
@@ -216,6 +222,7 @@ pub fn menus(native: bool, sources: &MenuState) -> Vec<(&'static str, Vec<Entry>
         ("Spectrogram", '3'),
         ("Timeline", '4'),
         ("Piano", '5'),
+        ("Scope", '6'),
     ];
     let mut view: Vec<Entry> = panels
         .iter()
@@ -223,7 +230,7 @@ pub fn menus(native: bool, sources: &MenuState) -> Vec<(&'static str, Vec<Entry>
             check(
                 name,
                 key(k),
-                ["1", "2", "3", "4", "5"][k as usize - '1' as usize],
+                ["1", "2", "3", "4", "5", "6"][k as usize - '1' as usize],
             )
         })
         .collect();
@@ -281,10 +288,16 @@ pub fn menus(native: bool, sources: &MenuState) -> Vec<(&'static str, Vec<Entry>
         Entry::Sub("Source".into(), choose),
         Sep,
         check("Pause Input", key('p'), "p"),
+        check("Monitor Output", key('o'), "o"),
         check("Hold Display", key(' '), "space"),
         Sep,
         item("Back to Live", Cmd::Key(KeyCode::End), "End"),
         item("Oldest Data", Cmd::Key(KeyCode::Home), "Home"),
+        Sep,
+        item("Set or Remove Marker", key('m'), "m"),
+        item("Next Marker", key('n'), "n"),
+        item("Previous Marker", key('N'), "N"),
+        item("Clear Markers", key('M'), "M"),
     ];
     let mut meter: Vec<Entry> = [MeterMode::Rms, MeterMode::Vu, MeterMode::Lufs]
         .into_iter()
@@ -373,17 +386,9 @@ pub fn is_on(app: &App, cmd: Cmd, sources: &MenuState) -> bool {
         Cmd::Source(i) => {
             sources.current.is_some() && sources.list.get(i) == sources.current.as_ref()
         }
-        Cmd::Key(KeyCode::Char(c @ '1'..='5')) => {
-            let p = [
-                Panel::Meter,
-                Panel::Eq,
-                Panel::Spectrogram,
-                Panel::Timeline,
-                Panel::Piano,
-            ];
-            d.shown(p[c as usize - '1' as usize])
-        }
+        Cmd::Key(KeyCode::Char(c @ '1'..='6')) => d.shown(PANELS[c as usize - '1' as usize]),
         Cmd::Key(KeyCode::Char('p')) => app.paused(),
+        Cmd::Key(KeyCode::Char('o')) => app.monitor,
         Cmd::Key(KeyCode::Char(' ')) => !app.view.follow,
         Cmd::Mode(m) => d.mode == m,
         Cmd::ColorMap(m) => d.colormap == m,

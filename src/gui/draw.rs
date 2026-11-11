@@ -12,8 +12,9 @@ use crate::ui::colormap::{
     LU_TARGET_LINE,
 };
 use crate::ui::meter::{
-    channel_label, mode_scale, note_name, row, session_text, target_text, Scale,
+    channel_label, mode_scale, note_name, row, session_text, stereo_text, target_text, Scale,
 };
+use crate::ui::scope::{self, Trace};
 use crate::ui::spectrogram::{fold_column, freq_labels};
 use crate::ui::timeline::{bucket_levels, bucket_momentary, bucket_vu};
 use crate::ui::{fmt_db, fmt_freq, fmt_tick, fmt_time, piano, time_ticks, view_range_text, Clock};
@@ -458,6 +459,14 @@ pub fn meter(p: &Painter, rect: Rect, app: &mut App) {
         &session_text(label, &fmt_db(max), unit, s.clips),
         clip_color,
     );
+    if n == 2 {
+        let color = if f.correlation < 0.0 {
+            c32(Color::LightRed)
+        } else {
+            head
+        };
+        line(&stereo_text(f.correlation, f.balance()), color);
+    }
     y.set(y.get() + lh / 2.0);
     let tone = match f.peak_freq {
         Some((hz, db)) if db > -100.0 => {
@@ -939,6 +948,7 @@ pub fn timeline(p: &Painter, rect: Rect, app: &App) {
 
 /// The cursor column as a thin line, with a marker on top of the spectrogram.
 fn draw_cursor(p: &Painter, plot: Rect, app: &App, marker: bool) {
+    draw_markers(p, plot, app);
     let Some(cc) = app.view.cursor_column() else {
         return;
     };
@@ -964,6 +974,181 @@ fn draw_cursor(p: &Painter, plot: Rect, app: &App, marker: bool) {
             Stroke::NONE,
         ));
     }
+}
+
+/// Markers (`m`) in view: a faint line down the chart with a diamond on top.
+fn draw_markers(p: &Painter, plot: Rect, app: &App) {
+    let cw = plot.width() / app.view.width.max(1) as f32;
+    let color = c32(crate::ui::MARKER_COLOR);
+    for m in app.live_markers() {
+        let Some(c) = app.view.frame_column(m.frame) else {
+            continue;
+        };
+        let x = plot.left() + (c as f32 + 0.5) * cw;
+        p.line_segment(
+            [Pos2::new(x, plot.top()), Pos2::new(x, plot.bottom())],
+            Stroke::new(1.0, color.gamma_multiply(0.45)),
+        );
+        p.add(Shape::convex_polygon(
+            vec![
+                Pos2::new(x, plot.top()),
+                Pos2::new(x + 4.5, plot.top() + 4.5),
+                Pos2::new(x, plot.top() + 9.0),
+                Pos2::new(x - 4.5, plot.top() + 4.5),
+            ],
+            color,
+            Stroke::NONE,
+        ));
+    }
+}
+
+/// Height of the correlation meter under the vectorscope.
+const CORR_H: f32 = 24.0;
+const SCOPE_TRACE: Color32 = Color32::from_rgb(120, 225, 150);
+
+/// The scope panel: a vectorscope over a correlation meter for two channels
+/// or more, an oscilloscope for one (see `crate::ui::scope`).
+pub fn scope(p: &Painter, rect: Rect, app: &App) {
+    let cursor = app.view.cursor;
+    let frame = app.history.get(cursor);
+    let stereo = app.analysis.channels >= 2;
+    let shown = scope::trace(
+        app.history
+            .range(cursor.saturating_sub(scope::TRAIL_FRAMES - 1), cursor),
+        stereo,
+    );
+    let title = match (&shown, frame) {
+        (Some(_), Some(f)) if stereo => format!("Scope  {}", scope::stereo_summary(f)),
+        (Some((_, scale)), _) => format!("Scope  {:.0} dB", crate::dsp::level::amp_to_db(*scale)),
+        _ => "Scope".to_string(),
+    };
+    let inner = panel(p, rect, &title);
+    let plot = if stereo {
+        Rect::from_min_max(inner.min, inner.max - Vec2::new(0.0, CORR_H))
+    } else {
+        inner
+    };
+    if plot.width() < 20.0 || plot.height() < 20.0 {
+        return;
+    }
+    let c = plot.center();
+    let grid = Stroke::new(1.0, GRID);
+    match &shown {
+        Some((Trace::Vector(points), _)) => {
+            let half = plot.width().min(plot.height()) / 2.0 - 2.0;
+            // Mid and side axes, and the left and right ones on the diagonals.
+            p.line_segment([c - Vec2::new(0.0, half), c + Vec2::new(0.0, half)], grid);
+            p.line_segment([c - Vec2::new(half, 0.0), c + Vec2::new(half, 0.0)], grid);
+            let d = half / 2.0;
+            for sx in [-1.0, 1.0] {
+                p.line_segment([c - Vec2::new(sx * d, -d), c + Vec2::new(sx * d, -d)], grid);
+            }
+            p.rect_stroke(
+                Rect::from_center_size(c, Vec2::splat(2.0 * half)),
+                0.0,
+                grid,
+                egui::StrokeKind::Inside,
+            );
+            for (label, sx) in [("L", -1.0), ("R", 1.0)] {
+                p.text(
+                    c + Vec2::new(sx * (d + 9.0), -d - 9.0),
+                    Align2::CENTER_CENTER,
+                    label,
+                    mono(11.0),
+                    LABEL,
+                );
+            }
+            // Older frames first and fainter, so the newest stands out.
+            let per = points.len().div_ceil(scope::TRAIL_FRAMES).max(1);
+            for (i, &(x, y)) in points.iter().enumerate() {
+                let age = (points.len() - 1 - i) / per;
+                let alpha = 0.85 - 0.18 * age as f32;
+                p.rect_filled(
+                    Rect::from_center_size(c + Vec2::new(x, -y) * half, Vec2::splat(2.0)),
+                    0.0,
+                    SCOPE_TRACE.gamma_multiply(alpha),
+                );
+            }
+        }
+        Some((Trace::Wave(wave), _)) => {
+            p.line_segment(
+                [Pos2::new(plot.left(), c.y), Pos2::new(plot.right(), c.y)],
+                grid,
+            );
+            let half = plot.height() / 2.0 - 2.0;
+            let step = plot.width() / (wave.len() - 1).max(1) as f32;
+            let line: Vec<Pos2> = wave
+                .iter()
+                .enumerate()
+                .map(|(i, &v)| Pos2::new(plot.left() + i as f32 * step, c.y - v * half))
+                .collect();
+            p.add(Shape::line(line, Stroke::new(1.5, SCOPE_TRACE)));
+        }
+        None => {
+            let msg = if frame.is_some() {
+                "silence"
+            } else {
+                "waiting for audio…"
+            };
+            p.text(
+                plot.left_top() + Vec2::new(4.0, 2.0),
+                Align2::LEFT_TOP,
+                msg,
+                mono(12.0),
+                LABEL,
+            );
+        }
+    }
+    if stereo {
+        let bar = Rect::from_min_max(
+            Pos2::new(inner.left() + 22.0, inner.bottom() - 11.0),
+            Pos2::new(inner.right() - 22.0, inner.bottom() - 5.0),
+        );
+        correlation_bar(p, bar, frame.map_or(f32::NAN, |f| f.correlation));
+    }
+}
+
+/// The phase correlation meter: -1 on the left, +1 on the right, filled
+/// from the middle to the reading.
+fn correlation_bar(p: &Painter, bar: Rect, corr: f32) {
+    if bar.width() < 30.0 {
+        return;
+    }
+    p.rect_filled(bar, 2.0, TRACK);
+    let mid = bar.center().x;
+    for (label, x, align) in [
+        ("-1", bar.left() - 4.0, Align2::RIGHT_CENTER),
+        ("+1", bar.right() + 4.0, Align2::LEFT_CENTER),
+    ] {
+        p.text(
+            Pos2::new(x, bar.center().y),
+            align,
+            label,
+            mono(10.0),
+            LABEL,
+        );
+    }
+    if !corr.is_nan() {
+        let x = mid + corr.clamp(-1.0, 1.0) * bar.width() / 2.0;
+        let fill = Rect::from_x_y_ranges(mid.min(x)..=mid.max(x), bar.y_range());
+        let color = c32(scope::correlation_color(corr));
+        p.rect_filled(fill, 0.0, color.gamma_multiply(0.55));
+        p.rect_filled(
+            Rect::from_center_size(
+                Pos2::new(x, bar.center().y),
+                Vec2::new(3.0, bar.height() + 4.0),
+            ),
+            1.0,
+            color,
+        );
+    }
+    p.line_segment(
+        [
+            Pos2::new(mid, bar.top() - 2.0),
+            Pos2::new(mid, bar.bottom() + 2.0),
+        ],
+        Stroke::new(1.0, LABEL),
+    );
 }
 
 /// Time ticks and labels under a chart.
@@ -1073,8 +1258,11 @@ pub fn status(ui: &mut Ui, app: &App) {
         };
         badge(ui, mark, mode, c32(color));
         if let Some(fr) = app.history.get(app.view.cursor) {
+            let total = crate::ui::file_length(app)
+                .map(|t| format!(" / {}", fmt_time(t)))
+                .unwrap_or_default();
             ui.label(
-                RichText::new(format!("t {}", fmt_time(fr.time)))
+                RichText::new(format!("t {}{total}", fmt_time(fr.time)))
                     .monospace()
                     .color(TEXT),
             );
@@ -1088,6 +1276,9 @@ pub fn status(ui: &mut Ui, app: &App) {
                     RichText::new(format!("(-{:.2}s)", latest - fr.time)).color(c32(Color::Yellow)),
                 );
             }
+        }
+        if app.monitor {
+            badge(ui, Mark::Play, "MON", c32(Color::Green));
         }
         if let Some(r) = &app.recorder {
             let secs = r.samples as f64 / (a.channels.max(1) as f64 * a.sample_rate as f64);
@@ -1169,14 +1360,23 @@ mod tests {
             .chain(crate::ui::LEGEND)
             .map(|(k, _)| *k)
             .collect();
-        assert_eq!(missing(&FontId::monospace(14.0), &keys), Vec::<char>::new());
+        assert_eq!(
+            missing(
+                &FontId::monospace(14.0),
+                &(keys + "silence waiting for audio… —")
+            ),
+            Vec::<char>::new()
+        );
         let text: String = crate::ui::HELP
             .iter()
             .chain(crate::ui::LEGEND)
             .map(|(_, v)| *v)
             .collect();
         assert_eq!(
-            missing(&FontId::proportional(14.0), &(text + "⚠✔")),
+            missing(
+                &FontId::proportional(14.0),
+                &(text + "⚠✔ Scope  corr — · bal — +0.25")
+            ),
             Vec::<char>::new()
         );
     }

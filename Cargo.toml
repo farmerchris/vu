@@ -1,8 +1,8 @@
 [package]
 name = "vu"
-version = "0.2.0"
+version = "2.0.0"
 edition = "2021"
-description = "Sound level meter with timeline, spectrogram and graphic equalizer, in the terminal or a window"
+description = "Sound level and loudness meter with spectrogram, equalizer, timeline and stereo scope, in the terminal or a window"
 license = "MIT"
 default-run = "vu-meter"
 
@@ -24,11 +24,17 @@ gui = ["dep:eframe", "dep:muda", "dep:objc2-app-kit", "dep:objc2-foundation"]
 [dependencies]
 anyhow = "1"
 clap = { version = "4.5", features = ["derive"] }
+clap_complete = "4"
 cpal = "0.15"
+# The same crossterm ratatui uses, reading keys from the terminal itself
+# rather than stdin, so `-f -` can take audio on stdin (macOS cannot poll
+# /dev/tty the default way).
+crossterm = { version = "0.28", features = ["use-dev-tty"] }
 eframe = { version = "0.31", optional = true, features = ["persistence"] }
 hound = "3.5"
 ratatui = "0.29"
 realfft = "3.4"
+symphonia = { version = "0.5", default-features = false, features = ["mp3", "flac", "vorbis", "aac", "isomp4", "pcm", "wav", "aiff", "ogg", "adpcm", "alac"] }
 
 # The native menu bar and live Dock icon on macOS; other systems use a menu
 # bar in the window.

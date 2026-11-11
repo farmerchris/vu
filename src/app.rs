@@ -4,6 +4,7 @@ use crate::analyzer::Analyzer;
 use crate::cli::{Cli, Panel};
 use crate::dsp::scale::FreqScale;
 use crate::history::History;
+use crate::levellog::LevelLog;
 use crate::recorder::{record_path, RecordFormat, Recorder};
 use crate::source::{Control, SourceInfo, SourceKind};
 use crate::ui::colormap::{ColorMap, ColorMode};
@@ -35,6 +36,15 @@ pub struct View {
     pub width: usize,
 }
 
+/// A point in the history marked with `m`, to come back to.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct Marker {
+    /// Absolute frame index.
+    pub frame: usize,
+    /// Stream time of that frame, seconds.
+    pub time: f64,
+}
+
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub enum Nav {
     Left(usize),
@@ -47,6 +57,8 @@ pub enum Nav {
     ZoomIn,
     ZoomOut,
     Column(usize),
+    /// Put the cursor on a frame, scrolling it into view.
+    Frame(usize),
 }
 
 /// Zoom levels (seconds across the chart) stepped through by + and -.
@@ -194,6 +206,10 @@ impl View {
                 if let Some(&s) = ZOOM_SPANS.iter().find(|&&s| s > self.span_secs + EPS) {
                     self.span_secs = s;
                 }
+            }
+            Nav::Frame(f) => {
+                self.unfollow(last);
+                self.cursor = f.clamp(first, last);
             }
             Nav::Column(col) => {
                 if let Some(f) = self.column_frame(col.min(self.width.saturating_sub(1))) {
@@ -442,7 +458,7 @@ impl Display {
     /// The display options given on `cli`; `frame_dt` sets the clip hold.
     pub fn new(cli: &Cli, color_mode: ColorMode, frame_dt: f64) -> Self {
         Display {
-            panels: crate::cli::panel_set(&cli.panels, cli.piano),
+            panels: crate::cli::panel_set(&cli.panels, cli.piano, cli.scope),
             db_min: cli.db_min,
             db_max: cli.db_max,
             spec_floor: cli.spec_floor,
@@ -504,6 +520,13 @@ pub struct App {
     pub record_base: Option<PathBuf>,
     record_format: RecordFormat,
     record_count: usize,
+    /// Points marked with `m`, oldest first.
+    pub markers: Vec<Marker>,
+    /// `--log`: the level log being written.
+    pub log: Option<LevelLog>,
+    /// Whether the input should be played through the output (`--monitor`,
+    /// `o`); the pump opens and closes the output to match.
+    pub monitor: bool,
     /// Chart rectangles (spectrogram, timeline) for mouse hit-testing.
     pub chart_rects: Vec<Rect>,
     pub spec_cache: SpecCache,
@@ -575,6 +598,9 @@ impl App {
             record_base: cli.record.clone(),
             record_format: cli.record_format,
             record_count: 0,
+            markers: Vec::new(),
+            log: None,
+            monitor: cli.monitor,
             chart_rects: Vec::new(),
             spec_cache: SpecCache::default(),
         }
@@ -591,6 +617,13 @@ impl App {
         self.view.span_secs = old.view.span_secs;
         self.show_help = old.show_help;
         self.cycle = old.cycle;
+        self.monitor = old.monitor;
+    }
+
+    /// Start writing the `--log` file.
+    pub fn start_log(&mut self, path: &std::path::Path, interval: f64) -> Result<()> {
+        self.log = Some(LevelLog::create(path, interval)?);
+        Ok(())
     }
 
     pub fn sync_view(&mut self) {
@@ -609,7 +642,62 @@ impl App {
     /// Store a new analysis frame and fold it into the session statistics.
     pub fn push_frame(&mut self, f: crate::analyzer::Frame) {
         self.session.add(&f);
+        if let Some(Err(e)) = self.log.as_mut().map(|l| l.add(&f)) {
+            self.log = None;
+            self.flash(format!("log error: {e:#}"));
+        }
         self.history.push(f);
+    }
+
+    /// Markers still within the history, oldest first.
+    pub fn live_markers(&self) -> impl Iterator<Item = &Marker> {
+        let first = self.history.first();
+        self.markers.iter().filter(move |m| m.frame >= first)
+    }
+
+    /// Mark the cursor's frame, or take its marker away.
+    fn toggle_marker(&mut self) {
+        let frame = self.view.cursor;
+        let Some(time) = self.history.get(frame).map(|f| f.time) else {
+            return;
+        };
+        match self.markers.iter().position(|m| m.frame == frame) {
+            Some(i) => {
+                self.markers.remove(i);
+                self.flash("marker removed");
+            }
+            None => {
+                let at = self.markers.partition_point(|m| m.frame < frame);
+                self.markers.insert(at, Marker { frame, time });
+                self.flash(format!(
+                    "marker {} at {}",
+                    at + 1,
+                    crate::ui::fmt_time(time)
+                ));
+            }
+        }
+    }
+
+    /// Move the cursor to the nearest marker after it, or before it.
+    fn jump_marker(&mut self, forward: bool) {
+        let cursor = self.view.cursor;
+        let target = if forward {
+            self.live_markers().find(|m| m.frame > cursor)
+        } else {
+            self.live_markers().filter(|m| m.frame < cursor).last()
+        };
+        match target.copied() {
+            Some(m) => {
+                self.nav(Nav::Frame(m.frame));
+                self.flash(format!("marker at {}", crate::ui::fmt_time(m.time)));
+            }
+            None if self.markers.is_empty() => self.flash("no markers (m sets one)"),
+            None => self.flash(if forward {
+                "no later marker"
+            } else {
+                "no earlier marker"
+            }),
+        }
     }
 
     pub fn flash(&mut self, msg: impl Into<String>) {
@@ -778,6 +866,32 @@ impl App {
             KeyCode::Char('3') => self.toggle_panel(Panel::Spectrogram),
             KeyCode::Char('4') => self.toggle_panel(Panel::Timeline),
             KeyCode::Char('5') => self.toggle_panel(Panel::Piano),
+            KeyCode::Char('6') => self.toggle_panel(Panel::Scope),
+            KeyCode::Char('m') => self.toggle_marker(),
+            KeyCode::Char('n') => self.jump_marker(true),
+            KeyCode::Char('N') => self.jump_marker(false),
+            KeyCode::Char('M') => {
+                let n = self.markers.len();
+                self.markers.clear();
+                self.flash(format!(
+                    "{n} marker{} cleared",
+                    if n == 1 { "" } else { "s" }
+                ));
+            }
+            KeyCode::Char('o') => {
+                if self.info.kind == SourceKind::Device {
+                    self.flash(
+                        "monitoring is for files and test signals (a live input would feed back)",
+                    );
+                } else {
+                    self.monitor = !self.monitor;
+                    self.flash(if self.monitor {
+                        "monitoring on"
+                    } else {
+                        "monitoring off"
+                    });
+                }
+            }
             KeyCode::Char('c') => {
                 self.display.colormap = self.display.colormap.next();
                 self.flash(format!("colormap: {:?}", self.display.colormap).to_lowercase());
@@ -1109,11 +1223,8 @@ mod tests {
                 lufs_s: floor,
                 lufs_i: floor,
                 lufs_lra: f32::NAN,
-                peak_freq: None,
                 clipped,
-                spectrum: Box::new([]),
-                bands: Box::new([]),
-                band_caps: Box::new([]),
+                ..Frame::default()
             }
         };
         let mut s = Session::default();
@@ -1183,5 +1294,19 @@ mod tests {
         assert!((m.draw_ms - 0.8).abs() < 1e-9);
         m.tick(t + Duration::from_secs(10), Duration::ZERO);
         assert_eq!(m.fps, 1);
+    }
+
+    #[test]
+    fn jump_to_a_frame() {
+        let mut v = view(10);
+        v.sync(0, Some(99));
+        v.apply(Nav::Frame(42), 0, Some(99));
+        assert!(!v.follow);
+        assert_eq!(v.cursor, 42);
+        assert!(v.cursor_column().is_some(), "scrolled into view");
+        v.apply(Nav::Frame(500), 0, Some(99));
+        assert_eq!(v.cursor, 99, "clamped to the newest frame");
+        v.apply(Nav::Frame(3), 20, Some(99));
+        assert_eq!(v.cursor, 20, "clamped to the oldest frame");
     }
 }

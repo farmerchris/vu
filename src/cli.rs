@@ -31,8 +31,35 @@ pub enum Panel {
     Timeline,
     /// Piano keyboard lighting the strongest tone (not shown by default)
     Piano,
-    /// Every panel, the piano included
+    /// Stereo vectorscope with phase correlation, or an oscilloscope for a
+    /// mono input (not shown by default)
+    Scope,
+    /// Every panel, the piano and scope included
     All,
+}
+
+/// How `--report` prints its statistics.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, ValueEnum)]
+pub enum ReportFormat {
+    /// Aligned text, one block per input
+    #[default]
+    Text,
+    /// A JSON array with one object per input
+    Json,
+    /// A header line and one row per input
+    Csv,
+}
+
+/// Whether loudness is measured with the BS.1770 surround channel weights.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, ValueEnum)]
+pub enum Surround {
+    /// For files with five or six channels
+    #[default]
+    Auto,
+    /// For any input with five or six channels
+    On,
+    /// Never: every channel counts the same
+    Off,
 }
 
 /// Named loudness targets for `--lufs-target`, in LUFS.
@@ -66,10 +93,20 @@ fn parse_lufs_target(s: &str) -> std::result::Result<f32, String> {
 /// Panels shown by default.
 pub const ALL_PANELS: [Panel; 4] = [Panel::Meter, Panel::Eq, Panel::Spectrogram, Panel::Timeline];
 /// Number of real panels (everything but `All`).
-pub const PANEL_COUNT: usize = 5;
+pub const PANEL_COUNT: usize = 6;
+/// The real panels, indexed by `Panel as usize`; keys 1 to 6 toggle them in
+/// this order.
+pub const PANELS: [Panel; PANEL_COUNT] = [
+    Panel::Meter,
+    Panel::Eq,
+    Panel::Spectrogram,
+    Panel::Timeline,
+    Panel::Piano,
+    Panel::Scope,
+];
 
 /// Which panels `list` turns on, indexed by `Panel as usize`.
-pub fn panel_set(list: &[Panel], piano: bool) -> [bool; PANEL_COUNT] {
+pub fn panel_set(list: &[Panel], piano: bool, scope: bool) -> [bool; PANEL_COUNT] {
     let mut on = [false; PANEL_COUNT];
     for &p in list {
         match p {
@@ -78,6 +115,7 @@ pub fn panel_set(list: &[Panel], piano: bool) -> [bool; PANEL_COUNT] {
         }
     }
     on[Panel::Piano as usize] |= piano;
+    on[Panel::Scope as usize] |= scope;
     on
 }
 
@@ -85,16 +123,18 @@ pub fn panel_set(list: &[Panel], piano: bool) -> [bool; PANEL_COUNT] {
 #[command(
     name = "vu-meter",
     version,
-    about = "Terminal sound meter: levels, loudness, timeline, spectrogram and graphic equalizer",
+    about = "Sound meter: levels, loudness, timeline, spectrogram, equalizer and scope, in the terminal or a window",
     after_help = "KEYS: \u{2190}/\u{2192} scroll (shift = x10), PgUp/PgDn page, Home/End oldest/live, \
-space hold, p pause, R record, r reset loudness, +/- zoom, 1-5 toggle panels, c colormap, s freq scale, v meter mode, \
-[ ] floor, ? help, q quit\n\n\
+space hold, p pause, o monitor, R record, r reset loudness, +/- zoom, 1-6 toggle panels, c colormap, \
+s freq scale, v meter mode, m marker, n/N next/previous marker, [ ] floor, ? help, q quit\n\n\
 EXAMPLES:\n  vu-meter                        meter the default input\n  \
-vu-meter -f song.wav            play a file through the meters in real time\n  \
-vu-meter -f song.wav --fast     analyze the whole file instantly, then browse it\n  \
+vu-meter song.flac --monitor    play a file through the meters, and listen to it\n  \
+vu-meter song.mp3 --fast        analyze the whole file instantly, then browse it\n  \
 vu-meter -r take.wav            meter and record the default input\n  \
 vu-meter -g sweep:20:20000:10 -p spectrogram,eq\n  \
-vu-meter -f song.wav --report   print peak/RMS/LUFS statistics without the UI"
+vu-meter --report *.wav         print peak/RMS/LUFS statistics without the UI\n  \
+vu-meter --report --check --lufs-target podcast mix.wav   exit 3 unless it meets the target\n  \
+ffmpeg -i in.mkv -f wav - | vu-meter -f -                 meter another program's output"
 )]
 pub struct Cli {
     /// Input device: index or case-insensitive name substring (see --list-devices)
@@ -105,9 +145,14 @@ pub struct Cli {
     #[arg(short = 'l', long)]
     pub list_devices: bool,
 
-    /// Read audio from a WAV file instead of an input device
+    /// Read audio from a file instead of an input device: WAV, AIFF, FLAC,
+    /// MP3, Ogg Vorbis, AAC / ALAC (.m4a); `-` reads standard input
     #[arg(short = 'f', long, conflicts_with = "generate")]
     pub file: Option<PathBuf>,
+
+    /// Audio files, the same as --file; --report takes several
+    #[arg(value_name = "FILE", conflicts_with_all = ["generate", "file"])]
+    pub files: Vec<PathBuf>,
 
     /// Use a test signal: sine[:FREQ[:DB]], square[:FREQ[:DB]], noise[:DB], pink[:DB],
     /// sweep[:F0[:F1[:SECS[:DB[:END_DB]]]]], silence. Fields are optional (empty ones
@@ -124,7 +169,7 @@ pub struct Cli {
     #[arg(long = "loop")]
     pub looping: bool,
 
-    /// Record the input to a WAV file (press r in the UI to toggle)
+    /// Record the input to a WAV file (press R in the UI to stop and start)
     #[arg(short = 'r', long, value_name = "WAV")]
     pub record: Option<PathBuf>,
 
@@ -139,6 +184,39 @@ pub struct Cli {
     /// Print a statistics report (peak, RMS, LUFS, dominant frequency) and exit; no UI
     #[arg(long)]
     pub report: bool,
+
+    /// How --report prints
+    #[arg(long, value_enum, default_value = "text", requires = "report")]
+    pub format: ReportFormat,
+
+    /// With --report: check each input against --lufs-target (within
+    /// --tolerance) and --tp-limit, and exit with status 3 if any fails
+    #[arg(long, requires = "report")]
+    pub check: bool,
+
+    /// Highest true peak --check allows, dBTP
+    #[arg(long, default_value_t = -1.0, allow_hyphen_values = true, value_name = "DBTP")]
+    pub tp_limit: f32,
+
+    /// How far integrated loudness may be from the target for --check, LU
+    #[arg(long, default_value_t = 1.0, value_name = "LU")]
+    pub tolerance: f32,
+
+    /// Write levels and loudness over time to a CSV file, one row per --log-interval
+    #[arg(long, value_name = "CSV")]
+    pub log: Option<PathBuf>,
+
+    /// Seconds between --log rows
+    #[arg(long, default_value_t = 1.0, value_name = "SECS")]
+    pub log_interval: f64,
+
+    /// Play a file or test signal through the default output while metering (o toggles)
+    #[arg(short = 'm', long, conflicts_with_all = ["fast", "report"])]
+    pub monitor: bool,
+
+    /// Print a shell completion script and exit
+    #[arg(long, value_name = "SHELL", value_enum)]
+    pub completions: Option<clap_complete::Shell>,
 
     /// Open the meters in a window instead of the terminal (also: vu-meter-gui)
     #[arg(long, conflicts_with = "report")]
@@ -252,9 +330,18 @@ pub struct Cli {
     #[arg(long)]
     pub piano: bool,
 
+    /// Also show the scope panel (same as adding `scope` to -p)
+    #[arg(long)]
+    pub scope: bool,
+
     /// Start in loudness (LUFS) meter mode
     #[arg(long)]
     pub lufs: bool,
+
+    /// Measure loudness with the BS.1770 surround weights (L R C LFE Ls Rs:
+    /// surrounds +1.5 dB, LFE left out) when there are five or six channels
+    #[arg(long, value_enum, default_value = "auto")]
+    pub surround: Surround,
 
     /// Step through the meter modes every SECS seconds (default 3), for demos
     #[arg(long, value_name = "SECS", num_args = 0..=1, default_missing_value = "3", require_equals = true)]
@@ -353,7 +440,41 @@ impl Cli {
         if self.panels.is_empty() {
             bail!("--panels needs at least one panel");
         }
+        if self.files.len() > 1 && !self.report {
+            bail!("several files need --report (the meters show one input at a time)");
+        }
+        if self.files.len() > 1 && (self.record.is_some() || self.log.is_some()) {
+            bail!("--record and --log take one input");
+        }
+        if !(0.0..=20.0).contains(&self.tolerance) {
+            bail!("--tolerance must be between 0 and 20 LU");
+        }
+        if !(-40.0..=6.0).contains(&self.tp_limit) {
+            bail!("--tp-limit must be between -40 and 6 dBTP");
+        }
+        if !(0.05..=3600.0).contains(&self.log_interval) {
+            bail!("--log-interval must be between 0.05 and 3600 seconds");
+        }
         Ok(())
+    }
+
+    /// The files to read: `--file` or the positional ones.
+    pub fn inputs(&self) -> Vec<PathBuf> {
+        self.file.iter().chain(&self.files).cloned().collect()
+    }
+
+    /// This command line for one of its inputs, as `--file`.
+    pub fn for_input(&self, path: PathBuf) -> Cli {
+        Cli {
+            file: Some(path),
+            files: Vec::new(),
+            ..self.clone()
+        }
+    }
+
+    /// Whether `file` is standard input (`-f -`).
+    pub fn is_stdin(path: &std::path::Path) -> bool {
+        path.as_os_str() == "-"
     }
 
     pub fn hop(&self) -> usize {
@@ -417,16 +538,19 @@ mod tests {
         ]);
         assert_eq!(c.panels, vec![Panel::Spectrogram, Panel::Eq]);
         assert_eq!(
-            panel_set(&c.panels, false),
-            [false, true, true, false, false]
+            panel_set(&c.panels, false, false),
+            [false, true, true, false, false, false]
         );
         assert_eq!(
-            panel_set(&ALL_PANELS, false),
-            [true, true, true, true, false],
-            "no piano by default"
+            panel_set(&ALL_PANELS, false, false),
+            [true, true, true, true, false, false],
+            "no piano or scope by default"
         );
-        assert_eq!(panel_set(&ALL_PANELS, true), [true; PANEL_COUNT]);
-        assert_eq!(panel_set(&[Panel::All], false), [true; PANEL_COUNT]);
+        assert_eq!(panel_set(&ALL_PANELS, true, true), [true; PANEL_COUNT]);
+        assert_eq!(panel_set(&[Panel::All], false, false), [true; PANEL_COUNT]);
+        for (i, p) in PANELS.into_iter().enumerate() {
+            assert_eq!(p as usize, i);
+        }
         assert_eq!(c.db_min, -120.0);
         assert_eq!(c.hop(), 256);
         c.validate().unwrap();
@@ -452,6 +576,32 @@ mod tests {
             assert!(parse(args).validate().is_err(), "{args:?}");
         }
         assert!(Cli::try_parse_from(["vu", "-f", "a.wav", "-g", "noise"]).is_err());
+        assert!(Cli::try_parse_from(["vu", "a.wav", "-g", "noise"]).is_err());
+        assert!(Cli::try_parse_from(["vu", "a.wav", "-f", "b.wav"]).is_err());
+        assert!(Cli::try_parse_from(["vu", "a.wav", "--check"]).is_err());
+        assert!(Cli::try_parse_from(["vu", "a.wav", "--format", "json"]).is_err());
+        assert!(Cli::try_parse_from(["vu", "a.wav", "--fast", "--monitor"]).is_err());
+        // Several files are for reports only.
+        assert!(parse(&["a.wav", "b.wav"]).validate().is_err());
+        assert!(parse(&["a.wav", "b.wav", "--report"]).validate().is_ok());
+        assert!(parse(&["--tolerance", "30"]).validate().is_err());
+        assert!(parse(&["--log-interval", "0"]).validate().is_err());
         assert!(Cli::try_parse_from(["vu", "-p", "bogus"]).is_err());
+    }
+
+    #[test]
+    fn files_by_position_or_option() {
+        let c = parse(&["song.flac"]);
+        assert_eq!(c.inputs(), [PathBuf::from("song.flac")]);
+        assert_eq!(parse(&["-f", "a.wav"]).inputs(), [PathBuf::from("a.wav")]);
+        assert!(parse(&[]).inputs().is_empty());
+        let c = parse(&["--report", "a.wav", "b.mp3", "--format", "csv", "--check"]);
+        assert_eq!(c.inputs().len(), 2);
+        assert_eq!(c.format, ReportFormat::Csv);
+        let one = c.for_input("b.mp3".into());
+        assert_eq!(one.inputs(), [PathBuf::from("b.mp3")]);
+        assert!(Cli::is_stdin(&parse(&["-f", "-"]).inputs()[0]));
+        assert!(!Cli::is_stdin(std::path::Path::new("-.wav")));
+        assert_eq!(parse(&["--tp-limit", "-2"]).tp_limit, -2.0);
     }
 }

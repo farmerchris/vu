@@ -13,8 +13,10 @@ pub mod generator;
 #[cfg(feature = "gui")]
 pub mod gui;
 pub mod history;
+pub mod levellog;
 #[cfg(target_os = "macos")]
 mod mic_mode_mac;
+pub mod monitor;
 pub mod pump;
 pub mod recorder;
 pub mod report;

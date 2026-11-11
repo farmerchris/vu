@@ -34,6 +34,7 @@ fn make_app_with(args: &[&str], channels: usize, secs: f64, spec: &str) -> App {
         peak_hold_s: cli.peak_hold,
         band_floor_db: cli.db_min,
         spectrum_channel: cli.channel.map(|c| c - 1),
+        surround: false,
     });
     let info = SourceInfo {
         name: "test-gen".into(),
@@ -120,9 +121,9 @@ fn all_sizes_empty_history() {
 
 #[test]
 fn every_panel_subset() {
-    let names = ["meter", "eq", "spectrogram", "timeline"];
-    for mask in 1u8..16 {
-        let list: Vec<&str> = (0..4)
+    let names = ["meter", "eq", "spectrogram", "timeline", "piano", "scope"];
+    for mask in 1u8..64 {
+        let list: Vec<&str> = (0..6)
             .filter(|i| mask >> i & 1 == 1)
             .map(|i| names[i])
             .collect();
@@ -617,4 +618,163 @@ fn loudness_timeline_shows_momentary_in_the_m_bar_colours() {
     assert!(
         seen.contains(&LU_M_COLOR) && seen.contains(&LU_OVER_COLOR) && !seen.contains(&LU_S_COLOR)
     );
+}
+
+/// Whether `c` is a braille pattern with at least one dot.
+fn braille(c: char) -> bool {
+    ('\u{2801}'..='\u{28ff}').contains(&c)
+}
+
+#[test]
+fn scope_panel_is_a_vectorscope_for_stereo() {
+    // Not shown by default; `scope` in -p, --scope or -p all shows it.
+    let mut app = make_app(&[], 2, 1.0);
+    assert!(!text(&render(&mut app, 120, 40)).contains("Scope"));
+    for args in [&["-p", "meter,scope"][..], &["--scope"], &["-p", "all"]] {
+        let mut app = make_app(args, 2, 1.0);
+        assert!(
+            text(&render(&mut app, 150, 44)).contains("Scope"),
+            "{args:?}"
+        );
+    }
+    // The test signal is the same on both channels: fully correlated, so
+    // the dots are a vertical line and the marker sits at +1.
+    let mut app = make_app_with(&["-p", "scope"], 2, 1.0, "sine:440:-20");
+    let lines = render(&mut app, 60, 20);
+    let t = text(&lines);
+    assert!(t.contains("Scope  corr +1.00 · bal 0.0 dB"), "{t}");
+    let cols: std::collections::BTreeSet<usize> = lines
+        .iter()
+        .flat_map(|l| {
+            l.chars()
+                .enumerate()
+                .filter(|&(_, c)| braille(c))
+                .map(|(x, _)| x)
+        })
+        .collect();
+    assert_eq!(cols.len(), 1, "one column of dots: {t}");
+    let rows = lines.iter().filter(|l| l.chars().any(braille)).count();
+    assert!(rows >= 8, "{rows} rows of dots\n{t}");
+    let bar = lines
+        .iter()
+        .find(|l| l.contains("-1 "))
+        .expect("correlation bar");
+    assert!(bar.trim_end_matches('│').ends_with("● +1"), "{bar}");
+    assert!(t.contains("│L") && t.contains("R│"), "{t}");
+}
+
+#[test]
+fn scope_panel_is_an_oscilloscope_for_mono() {
+    let mut app = make_app_with(&["-p", "scope"], 1, 1.0, "sine:440:-20");
+    let lines = render(&mut app, 60, 20);
+    let t = text(&lines);
+    assert!(t.contains("Scope  -20 dB"), "{t}");
+    assert!(
+        !t.contains("corr") && !t.contains("+1"),
+        "no correlation meter: {t}"
+    );
+    // A waveform crosses the whole width and most of the height.
+    let cols: std::collections::BTreeSet<usize> = lines
+        .iter()
+        .flat_map(|l| {
+            l.chars()
+                .enumerate()
+                .filter(|&(_, c)| braille(c))
+                .map(|(x, _)| x)
+        })
+        .collect();
+    assert_eq!(cols.len(), 58, "{t}");
+    assert!(
+        lines.iter().filter(|l| l.chars().any(braille)).count() >= 16,
+        "{t}"
+    );
+    // Silence says so rather than drawing a flat line of noise.
+    let mut app = make_app_with(&["-p", "scope"], 1, 1.0, "silence");
+    assert!(text(&render(&mut app, 60, 20)).contains("silence"));
+    let mut app = make_app_with(&["-p", "scope"], 2, 0.0, "silence");
+    assert!(text(&render(&mut app, 60, 20)).contains("waiting for audio"));
+}
+
+#[test]
+fn scope_shares_the_top_row() {
+    let mut app = make_app(&["-p", "all"], 2, 1.0);
+    let lines = render(&mut app, 150, 44);
+    let top = &lines[1];
+    let (m, e, s) = (
+        top.find("Levels").unwrap(),
+        top.find("Equalizer").unwrap(),
+        top.find("Scope").unwrap(),
+    );
+    assert!(m < e && e < s, "{top}");
+    assert_eq!(top.chars().count(), 150);
+}
+
+#[test]
+fn meter_shows_correlation_and_balance_for_stereo() {
+    for args in [&[][..], &["--vu"], &["--lufs"]] {
+        let mut app = make_app_with(args, 2, 1.0, "sine:440:-20");
+        let t = text(&render(&mut app, 100, 30));
+        assert!(t.contains("corr  +1.00   bal 0.0 dB"), "{args:?}\n{t}");
+        // It still fits the smallest standard terminal with everything else.
+        let t = text(&render(&mut app, 80, 24));
+        assert!(
+            t.contains("corr  +1.00") && t.contains("tone"),
+            "{args:?}\n{t}"
+        );
+        let mut mono = make_app_with(args, 1, 1.0, "sine:440:-20");
+        assert!(!text(&render(&mut mono, 100, 30)).contains("corr"));
+    }
+}
+
+#[test]
+fn markers_show_on_the_charts() {
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    let mut app = make_app(&[], 2, 3.0);
+    render(&mut app, 100, 30);
+    let press = |app: &mut App, c: char| {
+        app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+    };
+    let count = |app: &mut App| text(&render(app, 100, 30)).matches('◆').count();
+    // The status bar's HOLD badge has one of its own once the cursor is placed.
+    app.nav(Nav::Left(20));
+    let before = count(&mut app);
+    press(&mut app, 'm');
+    assert_eq!(count(&mut app), before + 2, "spectrogram and timeline");
+    app.nav(Nav::Left(10));
+    press(&mut app, 'm');
+    assert_eq!(count(&mut app), before + 4);
+    // Scrolled out of view, they are not drawn.
+    app.view.span_secs = 0.5;
+    app.nav(Nav::End);
+    assert_eq!(count(&mut app), 0);
+}
+
+#[test]
+fn status_bar_shows_file_length_and_monitoring() {
+    let mut app = make_app(&[], 2, 1.0);
+    let t = render(&mut app, 120, 24)[0].clone();
+    assert!(!t.contains(" / ") && !t.contains("MON"), "{t}");
+    app.info.kind = SourceKind::File;
+    app.info.total_frames = Some(SR as u64 * 90);
+    app.monitor = true;
+    let t = render(&mut app, 120, 24)[0].clone();
+    assert!(t.contains("t 0:00.9") && t.contains(" / 1:30.000"), "{t}");
+    assert!(t.contains("♪ MON"), "{t}");
+}
+
+#[test]
+fn help_lists_the_new_keys() {
+    let mut app = make_app(&[], 2, 0.5);
+    app.show_help = true;
+    let t = text(&render(&mut app, 120, 50));
+    for needle in [
+        "1 2 3 4 5 6",
+        "scope",
+        "m / M",
+        "n / N",
+        "monitor",
+        "corr  bal",
+    ] {
+        assert!(t.contains(needle), "{needle}\n{t}");
+    }
 }

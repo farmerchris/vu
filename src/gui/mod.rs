@@ -59,6 +59,9 @@ impl Session {
         if cli.record.is_some() {
             app.start_recording()?;
         }
+        if let Some(path) = &cli.log {
+            app.start_log(path, cli.log_interval)?;
+        }
         Ok(Session {
             pump: Pump::new(cli, &source.info),
             app,
@@ -220,6 +223,7 @@ impl Drop for Gui {
 struct Layout {
     meter: Option<Rect>,
     eq: Option<Rect>,
+    scope: Option<Rect>,
     piano: Option<Rect>,
     spec: Option<Rect>,
     timeline: Option<Rect>,
@@ -231,12 +235,13 @@ impl Layout {
     fn new(area: Rect, app: &App, char_w: f32) -> Self {
         let d = &app.display;
         let (meter, eq) = (d.shown(Panel::Meter), d.shown(Panel::Eq));
+        let scope = d.shown(Panel::Scope);
         let (spec, tl, piano) = (
             d.shown(Panel::Spectrogram),
             d.shown(Panel::Timeline),
             d.shown(Panel::Piano),
         );
-        let top = meter || eq;
+        let top = meter || eq || scope;
         let charts = spec || tl;
         let gaps = (top as u8 + piano as u8 + spec as u8 + tl as u8).saturating_sub(1) as f32 * GAP;
         let piano_h = if piano { PIANO_H } else { 0.0 };
@@ -264,6 +269,20 @@ impl Layout {
         let piano = take(piano, piano_h);
         let spec = take(spec, spec_h);
         let timeline = take(tl, tl_h);
+        // The scope takes the right of the top row, about square (all of
+        // the row when alone).
+        let (top_r, scope) = match (top_r, scope) {
+            (Some(r), true) if meter || eq => {
+                let sw = r.height().min(r.width() * 0.3).max(160.0).min(r.width());
+                let (a, b) = r.split_left_right_at_x(r.right() - sw);
+                (
+                    Some(Rect::from_min_max(a.min, a.max - Vec2::new(GAP, 0.0))),
+                    Some(b),
+                )
+            }
+            (Some(r), true) => (None, Some(r)),
+            (r, _) => (r, None),
+        };
         let (meter, eq) = match (top_r, meter, eq) {
             (Some(r), true, true) => {
                 let mw = draw::meter_width(app.analysis.channels, char_w).min(r.width() * 0.6);
@@ -274,16 +293,39 @@ impl Layout {
                 )
             }
             (Some(r), true, false) => (Some(r), None),
-            (Some(r), false, _) => (None, Some(r)),
+            (Some(r), false, true) => (None, Some(r)),
             _ => (None, None),
         };
         Layout {
             meter,
             eq,
+            scope,
             piano,
             spec,
             timeline,
         }
+    }
+}
+
+/// Draw every panel of `layout`.
+fn paint(p: &egui::Painter, layout: &Layout, app: &mut App, spec: &mut draw::SpecView) {
+    if let Some(r) = layout.meter {
+        draw::meter(p, r, app);
+    }
+    if let Some(r) = layout.eq {
+        draw::equalizer(p, r, app);
+    }
+    if let Some(r) = layout.scope {
+        draw::scope(p, r, app);
+    }
+    if let Some(r) = layout.piano {
+        draw::piano_panel(p, r, app);
+    }
+    if let Some(r) = layout.spec {
+        draw::spectrogram(p, r, app, spec, layout.timeline.is_none());
+    }
+    if let Some(r) = layout.timeline {
+        draw::timeline(p, r, app);
     }
 }
 
@@ -317,6 +359,11 @@ impl eframe::App for Gui {
             if self.app.handle_key(k) == Action::Quit {
                 req = Some(Request::Quit);
             }
+        }
+        // An audio file dropped on the window is metered.
+        let dropped = ctx.input(|i| i.raw.dropped_files.iter().find_map(|f| f.path.clone()));
+        if let Some(path) = dropped {
+            req = Some(Request::Open(Choice::File(path)));
         }
         if let Some((names, default)) = self.devices.try_iter().last() {
             self.menu_stale |= self.sources.set_devices(names, default);
@@ -383,8 +430,6 @@ impl Gui {
         req
     }
 
-    /// Switch to another input, starting a fresh session with the same
-    /// display settings. On failure the current input carries on.
     /// Put the display, zoom, Dock icon and window size back to the built-in
     /// defaults (not the command line's), and save them. The input and any
     /// recording carry on.
@@ -406,13 +451,20 @@ impl Gui {
         self.app.flash("settings reset to defaults");
     }
 
+    /// Switch to another input, starting a fresh session with the same
+    /// display settings. On failure the current input carries on.
     fn switch(&mut self, choice: Choice) {
         let mut cli = self.cli.clone();
         (cli.file, cli.generate, cli.device, cli.record) = (None, None, None, None);
+        // The log, if any, carries on in the new session rather than
+        // starting again.
+        cli.files.clear();
+        cli.log = None;
         match &choice {
             Choice::Default => {}
             Choice::Device(name) => cli.device = Some(name.clone()),
             Choice::Signal(spec) => cli.generate = Some(spec.clone()),
+            Choice::File(path) => cli.file = Some(path.clone()),
         }
         let label = self.sources.label(&choice);
         let mut s = match Session::open(&cli) {
@@ -424,6 +476,7 @@ impl Gui {
         };
         s.app.keep_view(&self.app);
         s.app.flash(format!("input: {label}"));
+        s.app.log = self.app.log.take();
         if let Err(e) = pump::finish(&mut self.app, &self.source) {
             s.app.flash(format!("record error: {e:#}"));
         }
@@ -455,22 +508,7 @@ impl Gui {
             self.chart_mouse(ui, plot, &layout);
         }
 
-        let p = ui.painter().clone();
-        if let Some(r) = layout.meter {
-            draw::meter(&p, r, &mut self.app);
-        }
-        if let Some(r) = layout.eq {
-            draw::equalizer(&p, r, &self.app);
-        }
-        if let Some(r) = layout.piano {
-            draw::piano_panel(&p, r, &mut self.app);
-        }
-        if let Some(r) = layout.spec {
-            draw::spectrogram(&p, r, &self.app, &mut self.spec, time_on_spec);
-        }
-        if let Some(r) = layout.timeline {
-            draw::timeline(&p, r, &self.app);
-        }
+        paint(ui.painter(), &layout, &mut self.app, &mut self.spec);
     }
 
     /// Click or drag on a chart places the cursor; the wheel scrolls.
@@ -503,5 +541,134 @@ impl Gui {
                 self.scroll += SCROLL_STEP;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::source::{Control, SourceInfo, SourceKind};
+    use clap::Parser;
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use std::sync::Arc;
+
+    /// An app holding a second of audio: 440 Hz on the first channel and
+    /// 550 Hz on the others, so two channels are unrelated.
+    fn app(args: &[&str], channels: usize) -> App {
+        let cli = Cli::parse_from(std::iter::once("vu").chain(args.iter().copied()));
+        let info = SourceInfo {
+            name: "test".into(),
+            sample_rate: 48000,
+            channels,
+            total_frames: Some(48000),
+            kind: SourceKind::File,
+        };
+        let mut analyzer = Analyzer::new(pump::analyzer_config(&cli, &info).unwrap());
+        let mut app = App::new(
+            &cli,
+            info,
+            &analyzer,
+            Arc::new(Control::default()),
+            ColorMode::TrueColor,
+        );
+        let data: Vec<f32> = (0..48000)
+            .flat_map(|i| {
+                let t = 2.0 * std::f32::consts::PI * i as f32 / 48000.0;
+                (0..channels).map(move |c| 0.3 * (t * if c == 0 { 440.0 } else { 550.0 }).sin())
+            })
+            .collect();
+        analyzer.push(&data, |f| app.push_frame(f));
+        app
+    }
+
+    /// Lay out and draw `app` in a window of `size`, without a screen.
+    /// Returns the layout and the number of shapes drawn.
+    fn draw(app: &mut App, size: [f32; 2]) -> (Layout, usize) {
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, size.into())),
+            ..Default::default()
+        };
+        let mut layout = None;
+        let mut spec = draw::SpecView::default();
+        let out = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let l = Layout::new(ui.max_rect(), app, 8.0);
+                let plot = l
+                    .spec
+                    .map(|r| draw::chart_plot(r, l.timeline.is_none()))
+                    .or(l.timeline.map(|r| draw::chart_plot(r, true)));
+                app.view.width = plot.map_or(1, |p| p.width().round().max(1.0) as usize);
+                app.sync_view();
+                paint(ui.painter(), &l, app, &mut spec);
+                layout = Some(l);
+            });
+            draw::status(
+                &mut egui::Ui::new(
+                    ctx.clone(),
+                    "status".into(),
+                    egui::UiBuilder::new().max_rect(ctx.screen_rect()),
+                ),
+                app,
+            );
+            draw::help(ctx, app);
+        });
+        (layout.unwrap(), out.shapes.len())
+    }
+
+    #[test]
+    fn every_panel_draws_at_any_size() {
+        for channels in [1, 2, 6] {
+            for mode in [&[][..], &["--vu"], &["--lufs"]] {
+                let mut args = vec!["-p", "all"];
+                args.extend_from_slice(mode);
+                let mut a = app(&args, channels);
+                for size in [
+                    [1280.0, 800.0],
+                    [640.0, 420.0],
+                    [200.0, 120.0],
+                    [3000.0, 300.0],
+                ] {
+                    let (l, shapes) = draw(&mut a, size);
+                    assert!(l.scope.is_some() && l.meter.is_some() && l.piano.is_some());
+                    assert!(shapes > 50, "{channels} ch {mode:?} {size:?}: {shapes}");
+                }
+                // Scrolled back, with markers and the help open.
+                for code in ['m', 'h', 'h', 'm', 'N', '?'] {
+                    a.handle_key(KeyEvent::new(KeyCode::Char(code), KeyModifiers::NONE));
+                }
+                assert_eq!(a.markers.len(), 2);
+                draw(&mut a, [1280.0, 800.0]);
+            }
+        }
+        // Nothing to show yet.
+        let mut empty = app(&["-p", "all"], 2);
+        empty.history = crate::history::History::new(10);
+        draw(&mut empty, [1280.0, 800.0]);
+    }
+
+    #[test]
+    fn scope_sits_right_of_the_meters_and_draws_its_dots() {
+        let mut a = app(&["--scope"], 2);
+        let (l, with) = draw(&mut a, [1280.0, 800.0]);
+        let (m, e, s) = (l.meter.unwrap(), l.eq.unwrap(), l.scope.unwrap());
+        assert!(
+            m.right() <= e.left() && e.right() <= s.left(),
+            "{m:?} {e:?} {s:?}"
+        );
+        assert_eq!((m.top(), m.bottom()), (s.top(), s.bottom()));
+        assert!(
+            s.width() >= 160.0 && s.width() <= 1280.0 * 0.3 + 1.0,
+            "{s:?}"
+        );
+        // The vectorscope's dots: the frames in the trail, a pair each.
+        let (l, without) = draw(&mut app(&[], 2), [1280.0, 800.0]);
+        assert!(l.scope.is_none());
+        let dots = crate::ui::scope::TRAIL_FRAMES * crate::analyzer::SCOPE_POINTS;
+        assert!(with >= without + dots, "{with} vs {without}");
+        // Alone, it has the whole window.
+        let (l, _) = draw(&mut app(&["-p", "scope"], 2), [1280.0, 800.0]);
+        assert!(l.meter.is_none() && l.eq.is_none());
+        assert!(l.scope.unwrap().width() > 1200.0);
     }
 }

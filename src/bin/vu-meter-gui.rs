@@ -6,8 +6,16 @@ use vu::cli::Cli;
 fn main() {
     let matches = Cli::command().get_matches();
     let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
-    let res = if cli.list_devices {
+    let res = if let Some(shell) = cli.completions {
+        let out = &mut std::io::stdout();
+        clap_complete::generate(shell, &mut Cli::command(), "vu-meter-gui", out);
+        Ok(())
+    } else if cli.list_devices {
         vu::source::list_devices()
+    } else if cli.report {
+        Err(anyhow::anyhow!(
+            "--report prints to the terminal: use vu-meter --report"
+        ))
     } else {
         let explicit = vu::gui::explicit_args(&matches);
         cli.validate().and_then(|_| {

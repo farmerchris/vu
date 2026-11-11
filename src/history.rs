@@ -59,7 +59,8 @@ impl History {
     /// Frames with absolute indices in `[a, b]`, clipped to what is retained.
     pub fn range(&self, a: usize, b: usize) -> impl Iterator<Item = &Frame> {
         let lo = a.saturating_sub(self.base).min(self.frames.len());
-        let hi = (b + 1)
+        let hi = b
+            .saturating_add(1)
             .saturating_sub(self.base)
             .min(self.frames.len())
             .max(lo);
@@ -98,8 +99,11 @@ pub mod tests {
             lufs_s: f32::NEG_INFINITY,
             lufs_i: f32::NEG_INFINITY,
             lufs_lra: f32::NAN,
+            correlation: f32::NAN,
             peak_freq: None,
             clipped: peak >= 0.0,
+            scope: Box::new([]),
+            scope_scale: 0.0,
             spectrum: vec![0u8; 8].into_boxed_slice(),
             bands: bands.to_vec().into_boxed_slice(),
             band_caps: bands.to_vec().into_boxed_slice(),
@@ -134,6 +138,7 @@ pub mod tests {
         assert_eq!(h.range(8, 100).count(), 2);
         assert_eq!(h.range(20, 30).count(), 0);
         assert_eq!(h.range(5, 2).count(), 0);
+        assert_eq!(h.range(0, usize::MAX).count(), 10, "no overflow");
     }
 
     #[test]

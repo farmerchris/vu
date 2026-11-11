@@ -4,7 +4,8 @@
 
 use crate::analyzer::{Analyzer, AnalyzerConfig};
 use crate::app::App;
-use crate::cli::Cli;
+use crate::cli::{Cli, Surround};
+use crate::monitor::Monitor;
 use crate::report;
 use crate::source::{RateChanged, SilenceWatch, Source, SourceInfo, SourceKind};
 use anyhow::{bail, Result};
@@ -48,6 +49,11 @@ pub fn analyzer_config(cli: &Cli, info: &SourceInfo) -> Result<AnalyzerConfig> {
         peak_hold_s: cli.peak_hold,
         band_floor_db: cli.db_min,
         spectrum_channel: cli.channel.map(|c| c - 1),
+        surround: match cli.surround {
+            Surround::Auto => info.kind == SourceKind::File,
+            Surround::On => true,
+            Surround::Off => false,
+        },
     };
     if cfg.min_freq >= cfg.top_freq() {
         bail!(
@@ -76,6 +82,8 @@ pub struct Pump {
     sample_rate: f64,
     /// The options the input was opened with, to open it again.
     cli: Cli,
+    /// The output the input is played through, while monitoring.
+    monitor: Option<Monitor>,
 }
 
 impl Pump {
@@ -96,6 +104,7 @@ impl Pump {
             mic_mode_checked: Instant::now(),
             sample_rate: info.sample_rate as f64,
             cli: cli.clone(),
+            monitor: None,
         }
     }
 
@@ -124,6 +133,7 @@ impl Pump {
         if source.waiting.is_some() && !self.wait_for_input(app, source) {
             return false;
         }
+        self.sync_monitor(app, source);
         let ch = source.info.channels;
         let mut dirty = false;
         loop {
@@ -146,6 +156,9 @@ impl Pump {
                             app.recorder = None;
                             app.flash(format!("record error: {e:#}"));
                         }
+                    }
+                    if let Some(m) = self.monitor.as_mut() {
+                        m.push(&chunk);
                     }
                     analyzer.push(&chunk, |f| app.push_frame(f));
                     dirty = true;
@@ -174,6 +187,37 @@ impl Pump {
             }
         }
         dirty
+    }
+
+    /// Open or close the monitoring output to match `app.monitor`. Only a
+    /// file or test signal playing in real time is monitored: a live input
+    /// would feed back, and a fast scan is not listenable.
+    fn sync_monitor(&mut self, app: &mut App, source: &Source) {
+        if !app.monitor {
+            self.monitor = None;
+            return;
+        }
+        if self.monitor.is_some() {
+            return;
+        }
+        let why_not = if self.live {
+            Some("a live input would feed back".to_string())
+        } else if self.cli.fast {
+            Some("not with --fast".to_string())
+        } else {
+            match Monitor::open(source.info.sample_rate, source.info.channels) {
+                Ok(m) => {
+                    app.flash(format!("monitoring on {}", m.name));
+                    self.monitor = Some(m);
+                    None
+                }
+                Err(e) => Some(format!("{e:#}")),
+            }
+        };
+        if let Some(why) = why_not {
+            app.monitor = false;
+            app.flash(format!("cannot monitor: {why}"));
+        }
     }
 
     /// Open the live input again through voice processing or without it, as
@@ -319,6 +363,23 @@ pub fn finish(app: &mut App, source: &Source) -> Result<()> {
     let finished = app.stop_recording();
     for p in &app.saved_recordings {
         eprintln!("vu-meter: recorded {}", p.display());
+    }
+    if let Some(mut log) = app.log.take() {
+        match log.finish() {
+            Ok(()) => eprintln!(
+                "vu-meter: logged {} rows to {}",
+                log.rows,
+                log.path.display()
+            ),
+            Err(e) => eprintln!("vu-meter: log error: {e:#}"),
+        }
+    }
+    for (i, m) in app.markers.iter().enumerate() {
+        eprintln!(
+            "vu-meter: marker {} at {}",
+            i + 1,
+            crate::ui::fmt_time(m.time)
+        );
     }
     if let Some(e) = source.control.take_error() {
         eprintln!("vu-meter: {e}");
